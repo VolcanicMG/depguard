@@ -3,6 +3,10 @@
 Where everything lives, what calls what, and where to make which kind of change.
 Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md) (the *how to use*).
 
+> **Before you finish a change, update the docs.** [CLAUDE.md](../CLAUDE.md) maps every
+> `.md` file to what triggers an edit (change a flag → README; change a layer guarantee →
+> DESIGN + README; move a file → this code map).
+
 ## Layout
 
 ```
