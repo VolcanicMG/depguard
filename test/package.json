@@ -1,0 +1,13 @@
+{
+  "name": "depguard-tests",
+  "private": true,
+  "type": "module",
+  "description": "Black-box e2e suite for the guard binary — vitest drives the real compiled artifact against a mock npm registry.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "4.1.8"
+  }
+}

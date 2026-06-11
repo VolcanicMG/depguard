@@ -1,0 +1,42 @@
+# ── Compiled binaries ──────────────────────────────────────────────
+# The guard binary is built locally / in CI, never committed.
+/guard
+guard.exe
+test/.bin/
+
+# Generic Go build output (in case of other entrypoints)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# ── Go test / coverage / profiling ─────────────────────────────────
+*.test
+*.out
+coverage.txt
+coverage.html
+*.prof
+go.work
+go.work.sum
+
+# ── Node test harness (test/ uses vitest) ──────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Editor / OS cruft ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ── Local env / secrets ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
