@@ -66,6 +66,12 @@ own installs and later-flagged deps; the PR check stops a teammate's bad dep bef
 merge. The "a dep installed last month turns malicious next week" gap is closed at
 your **next commit / PR**, not by a background watcher.
 
+**Local escape hatch.** A commit/push hook can be bypassed for one action with
+`GUARD_SKIP=1 git push`. Unlike `git --no-verify` (which skips *every* hook) this
+skips depguard alone, so co-located lint/format hooks still run. The bypass lives
+in the shell shim, never in the binary — the CI gate calls `guard check` directly,
+so no contributor-set env var can weaken it. Local speed, unweakened merge gate.
+
 ---
 
 ## 4. Defense layers (overview)

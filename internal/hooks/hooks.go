@@ -14,12 +14,25 @@ import (
 // hookScript is the shim written to .git/hooks/. It re-checks the lockfile
 // against advisory feeds on every commit/push — that's how a dep that "goes
 // bad later" gets caught at your next action instead of by a daemon.
+//
+// GUARD_SKIP=1 bypasses just this check for one commit/push (e.g. an urgent
+// hotfix). Unlike git --no-verify it skips depguard ALONE, leaving any other
+// hooks intact. It lives in the shell shim on purpose: CI runs `guard check`
+// directly, so no env var a contributor sets can weaken the PR gate.
 const hookScript = `#!/bin/sh
 # depguard shim — installed by 'guard init'. Calls the global guard binary.
+# Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push
+# (Unlike git --no-verify, this skips depguard alone — your other hooks still run.
+# The bypass lives here in the local hook, NOT in the binary, so it can never
+# weaken the CI gate, which calls 'guard check' directly.)
+if [ -n "$GUARD_SKIP" ]; then
+  echo "depguard: check skipped (GUARD_SKIP set)." >&2
+  exit 0
+fi
 if command -v guard >/dev/null 2>&1; then
   guard check --quiet || {
     echo "depguard: advisory check failed. Run 'guard check' for details." >&2
-    echo "depguard: bypass once with --no-verify if you must." >&2
+    echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
     exit 1
   }
 fi
@@ -61,7 +74,12 @@ jobs:
 // one) instead of clobbering it — no shebang, because the file already has one.
 const hookAppend = `
 # depguard — appended by 'guard init' (chained onto your existing hook).
-command -v guard >/dev/null 2>&1 && { guard check --quiet || { echo "depguard: advisory check failed (bypass once with --no-verify)" >&2; exit 1; }; }
+# Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push
+if [ -n "$GUARD_SKIP" ]; then
+  echo "depguard: check skipped (GUARD_SKIP set)." >&2
+elif command -v guard >/dev/null 2>&1; then
+  guard check --quiet || { echo "depguard: advisory check failed (bypass once with GUARD_SKIP=1)" >&2; exit 1; }
+fi
 `
 
 // installHook writes the guard shim for hook phase h, or APPENDS to an existing

@@ -217,35 +217,70 @@ func WriteDefault(dir string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("%s already exists", FileName)
 	}
-	starter := `# depguard policy — committed with the repo so the whole team shares it.
-# See DESIGN.md in the depguard project for the full model.
+	starter := `# depguard policy (.guardrc) — committed with the repo so the whole team shares
+# one policy. Every option depguard understands is listed below with its allowed
+# values and default. Active lines are the defaults guard init applies; commented
+# lines show optional settings (uncomment + edit to override the default).
+# Full model: DESIGN.md in the depguard project.
 
-# Minimum age a published version must reach before installs can see it.
-# Most malicious versions are reported and yanked within days.
+# ── cooldown ──────────────────────────────────────────────────────────────────
+# Minimum age a published version must reach before installs can see it. Most
+# malicious versions are reported and yanked within days.
+#   values:  <N>d (days) | <N>h (hours) | any Go duration (e.g. 336h)
+#   default: 14d
 cooldown: 14d
 
-# Your own scopes bypass the cooldown (you publish them; waiting is pointless).
-# allow: ["@yourco/*"]
-
-# Never auto-run lifecycle scripts; script-bearing packages need approval.
+# ── ignore-scripts ────────────────────────────────────────────────────────────
+# Never auto-run lifecycle scripts (postinstall &c.) — the #1 npm attack vector.
+# Script-bearing packages go through the approval flow instead.
+#   values:  true | false
+#   default: true
 ignore-scripts: true
 
-# When an approved build script must run but no container runtime exists:
-# warn-approve = warn + ask (CI fails closed unless pre-approved) | fail = always skip
+# ── no-container-fallback ─────────────────────────────────────────────────────
+# What to do when an approved build script must run but no container runtime
+# (Docker/Podman) is available to sandbox it.
+#   values:  warn-approve  (warn + ask; CI fails closed unless pre-approved)
+#            fail          (always skip the script)
+#   default: warn-approve
 no-container-fallback: warn-approve
 
-# Diff signals surfaced by 'guard check'. new-deps reports packages a lockfile
-# change adds (on by default); new-maintainer flags publisher changes on
-# installed versions (account-takeover signal; one packument fetch per package);
-# new-network/new-fs turn on the per-version capability diff at approval time.
-# flag: [new-deps, new-maintainer]
+# ── registry ──────────────────────────────────────────────────────────────────
+# Upstream npm registry the ephemeral proxy fetches from. Must be https (http is
+# rejected except on loopback, so a malicious PR can't redirect installs).
+#   values:  any https:// URL
+#   default: https://registry.npmjs.org
+# registry: https://registry.npmjs.org
 
+# ── allow ─────────────────────────────────────────────────────────────────────
+# Package-name patterns that bypass the cooldown entirely — your own scopes (you
+# publish them; waiting is pointless). Supports a single trailing '*' glob.
+#   values:  list of names/patterns, e.g. ["@yourco/*", "internal-pkg"]
+#   default: []  (nothing bypasses the cooldown)
+# allow: ["@yourco/*"]
+
+# ── internal-scopes ───────────────────────────────────────────────────────────
 # Scopes that must come from a PRIVATE registry — the proxy blocks them from
-# resolving against the public one (dependency-confusion guard).
+# resolving against the public one (dependency-confusion guard). Same '*' glob.
+#   values:  list of names/patterns, e.g. ["@yourco/*"]
+#   default: []  (no names treated as private)
 # internal-scopes: ["@yourco/*"]
 
-# What to do when an approved build script can only run UNTRACED (no strace
-# image could be built): run (caged but unwatched) | fail (skip it).
+# ── flag ──────────────────────────────────────────────────────────────────────
+# Diff signals 'guard check' surfaces. An explicit flag: line REPLACES the default.
+#   values:  new-deps        packages a lockfile change ADDS (cheap, non-blocking)
+#            new-maintainer  publisher change on installed versions (account-
+#                            takeover signal; one packument fetch per package)
+#            new-network /   per-version capability diff surfaced at approval time
+#            new-fs
+#   default: [new-deps]
+# flag: [new-deps, new-maintainer]
+
+# ── untraced-boxed ────────────────────────────────────────────────────────────
+# What to do when an approved build script can only run UNTRACED (the strace
+# observation image couldn't be built) — run caged-but-unwatched, or skip it.
+#   values:  run | fail
+#   default: run
 # untraced-boxed: run
 `
 	return os.WriteFile(path, []byte(starter), 0o644)

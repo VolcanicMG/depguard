@@ -40,6 +40,7 @@ End users need only the compiled binary — never Go, never npm packages.
 ```sh
 cd your-project
 guard init            # drops .guardrc, .npmrc, pre-commit/pre-push hooks (--ci adds PR gate)
+#   bypass a hook once (depguard only, other hooks still run): GUARD_SKIP=1 git push
 guard install <pkg>   # instead of npm install
 guard ci              # instead of npm ci (lockfile-exact installs, same protections)
 guard check [--all] [--json]   # advisories + cooldown + integrity (hooks run this)
