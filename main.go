@@ -207,8 +207,20 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		}
 	}
 
-	// 5. Advisory re-check on the final lockfile (§3 layer 5).
-	return checkAdvisories(dir, false)
+	// 5. Re-check the FINAL lockfile (§3 layer 5): advisories AND cooldown.
+	// Both run so each prints its own findings; the advisory gate takes the
+	// exit code first (matching cmdCheck's precedence). Freshness is re-applied
+	// here so install-time enforcement matches `guard check`: a too-fresh
+	// version that entered via a pinned lockfile (guard ci, or npm honoring an
+	// existing pin) skips the proxy's packument filter and would otherwise only
+	// be caught later at commit/push. Scope is git-diff (all=false) like the
+	// hook, so only versions THIS install introduced are vetted.
+	advErr := checkAdvisories(dir, false)
+	freshErr := checkFreshness(dir, false, false)
+	if advErr != nil {
+		return advErr
+	}
+	return freshErr
 }
 
 // handleScripts finds every installed package that wanted to run a lifecycle
