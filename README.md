@@ -112,6 +112,15 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 HEAD** — each version is vetted once, at the commit that introduces it. `--all`
 forces a full-tree sweep.
 
+The OSV advisory and registry-cooldown lookups are **fail-open**: a network blip
+or an OSV outage must not block every commit, so the check never *gates* on them.
+But it is never silent about it — the prose output warns (`advisory check
+skipped: …`), and `guard check --json` (and the MCP `check_dependencies` tool)
+list what couldn't run in a **`degraded`** array. A `degraded` result with
+`ok: true` means *no findings were seen, but some layers didn't run* — treat it as
+"incomplete," not "proven clean." CI that wants to be strict can fail on a
+non-empty `degraded`.
+
 ## Tests
 
 Black-box e2e suite in `test/` — vitest spawns the **real compiled binary**
