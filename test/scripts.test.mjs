@@ -144,3 +144,32 @@ describe.skipIf(!hasDocker())('the box', () => {
     expect(approvals.packages['exfil-pkg@1.0.0'].note).toContain('auto-denied');
   });
 });
+
+
+describe.skipIf(!hasDocker())('prewarm + clean split', () => {
+  const imagePresent = () => {
+    try {
+      return execFileSync('docker', ['images', 'depguard-box:1', '--format', '{{.Repository}}'], { encoding: 'utf8' }).includes('depguard-box');
+    } catch {
+      return false;
+    }
+  };
+
+  it('prewarm builds the image, clean keeps it, clean --image reclaims it', async () => {
+    const { dir } = project();
+    const pre = await guard(dir, ['prewarm']);
+    expect(pre.code).toBe(0);
+    expect(imagePresent()).toBe(true);
+
+    // Routine clean keeps the (expensive) image so the next boxed run stays fast.
+    const kept = await guard(dir, ['clean']);
+    expect(kept.code).toBe(0);
+    expect(kept.stdout).toContain('image kept');
+    expect(imagePresent()).toBe(true);
+
+    // --image reclaims it.
+    const reclaimed = await guard(dir, ['clean', '--image']);
+    expect(reclaimed.code).toBe(0);
+    expect(imagePresent()).toBe(false);
+  });
+});

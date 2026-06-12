@@ -463,9 +463,12 @@ agents.
                                     that just spins is bounded).
    → box cleanup                    the run container is NAMED and force-removed
                                     on a wall-clock kill (--rm only fires on a
-                                    clean CLI exit); `guard clean` reclaims the
-                                    locally-built strace image + any stray
-                                    backup/obs leftovers a killed run left behind.
+                                    clean CLI exit). `guard prewarm` (or `guard
+                                    init --prebuild-box`) builds the strace image
+                                    ahead of the first boxed run. `guard clean`
+                                    sweeps stray containers + backup/obs leftovers
+                                    and KEEPS the image (next run stays instant);
+                                    `guard clean --image` also reclaims it.
    → more scan signals              wallet/clipboard paths, os.homedir, dynamic
                                     require/import, process.binding, bundled
                                     prebuilt binaries (.node/.wasm/.exe...).

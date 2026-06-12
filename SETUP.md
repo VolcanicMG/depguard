@@ -183,9 +183,14 @@ Tips:
 - **An uncontained run is still env-scrubbed** — even when you approve a bare run
   (no sandbox), the script inherits only `PATH`/`HOME`/`LANG`/`TMPDIR`, never the
   API tokens in your shell. It's damage limitation, not containment.
-- **Reclaim space with `guard clean`** — removes the locally-built strace image
-  (`depguard-box`) and any stray backup/trace leftovers from a hard-killed run.
-  Offline and idempotent; the image just rebuilds on the next boxed script.
+- **Skip the first-run wait with `guard prewarm`** — builds the sandbox (strace)
+  image ahead of time so the first approved native build isn't slow. Or pass
+  `--prebuild-box` to `guard init`. Needs docker + network; pure-JS installs
+  never touch it.
+- **Tidy up with `guard clean`** — sweeps stray containers + any backup/trace
+  leftovers from a hard-killed run, KEEPING the image so the next boxed run stays
+  instant. `guard clean --image` also removes the ~1.6 GB image (it rebuilds
+  lazily next time). Offline and idempotent.
 
 ---
 

@@ -73,6 +73,8 @@ func main() {
 		err = cmdStatus(os.Args[2:])
 	case "clean":
 		err = cmdClean(os.Args[2:])
+	case "prewarm":
+		err = cmdPrewarm(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
 	case "version", "--version", "-v":
@@ -103,7 +105,8 @@ func usage(w io.Writer) {
   guard ignore <issue-id>         waive a reviewed check finding (--reason, --expires, --list, --remove)
   guard allow <pattern>...        add a name/scope to .guardrc allow (bypass cooldown)
   guard config [get | set <k> <v>]  show or edit .guardrc policy
-  guard clean                     remove the sandbox image + stray run artifacts
+  guard prewarm                   build the sandbox image now (skip the first-run wait)
+  guard clean [--image]           sweep stray containers/artifacts (--image also reclaims the image)
   guard help                      show this message
   guard version
 `)
@@ -115,26 +118,60 @@ func usage(w io.Writer) {
 // idempotent — it removes nothing a future run can't rebuild, so it is always
 // safe to run.
 func cmdClean(args []string) error {
+	removeImage := false
+	for _, a := range args {
+		if a == "--image" {
+			removeImage = true
+		}
+	}
 	dir, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 	runtime := box.Runtime()
-	removedImage, rmErr := box.RemoveObsImage(runtime)
+
+	// Routine cleanup keeps the (expensive-to-rebuild) image so the next boxed
+	// run stays instant: sweep orphaned containers (the normal path --rm's them;
+	// this catches a crashed run) + on-disk leftovers.
+	containers := box.SweepContainers(runtime)
+	swept := box.SweepArtifacts(dir)
+	fmt.Printf("%s swept %d stray container(s) + %d artifact(s)\n", ui.OK(), containers, swept)
+
+	if !removeImage {
+		fmt.Println(ui.Dim("  image kept — run `guard clean --image` to reclaim its ~1.6 GB"))
+		return nil
+	}
+
+	// --image: also reclaim the observation image.
+	removed, rmErr := box.RemoveObsImage(runtime)
 	if rmErr != nil {
 		fmt.Fprintln(os.Stderr, "guard:", rmErr)
 	}
-	swept := box.SweepArtifacts(dir)
-
 	switch {
 	case runtime == "":
-		fmt.Println(ui.Warn(), "no container runtime — skipped image cleanup")
-	case removedImage:
+		fmt.Println(ui.Warn(), "no container runtime — could not remove the image")
+	case removed:
 		fmt.Println(ui.OK(), "removed observation image", box.ObsImageName())
 	default:
 		fmt.Println(ui.OK(), "observation image not present — nothing to remove")
 	}
-	fmt.Printf("%s swept %d stray artifact(s) (backups / obs logs)\n", ui.OK(), swept)
+	return nil
+}
+
+// cmdPrewarm builds the sandbox (strace) image ahead of time so the FIRST boxed
+// script run doesn't pay the one-time build. Needs a container runtime + network
+// (the §9 box; pure-JS installs never touch it). Idempotent — a no-op if already
+// built.
+func cmdPrewarm(args []string) error {
+	runtime := box.Runtime()
+	if runtime == "" {
+		return fmt.Errorf("no container runtime (docker/podman) found — install one first")
+	}
+	fmt.Println("guard: prewarming the sandbox image (one-time, needs network)...")
+	if _, traced := box.EnsureObsImage(runtime); !traced {
+		return fmt.Errorf("could not build the sandbox image %s (see output above)", box.ObsImageName())
+	}
+	fmt.Println(ui.OK(), "sandbox image ready:", box.ObsImageName())
 	return nil
 }
 
@@ -142,10 +179,13 @@ func cmdClean(args []string) error {
 
 // cmdInit drops the per-repo state: policy file + trigger shims (DESIGN.md §3, §10).
 func cmdInit(args []string) error {
-	ci := false
+	ci, prebuildBox := false, false
 	for _, a := range args {
-		if a == "--ci" {
+		switch a {
+		case "--ci":
 			ci = true
+		case "--prebuild-box":
+			prebuildBox = true
 		}
 	}
 	dir, err := os.Getwd()
@@ -182,6 +222,20 @@ func cmdInit(args []string) error {
 		fmt.Println("\nCommit the policy so it travels with the repo + CI:")
 		fmt.Printf("  git add %s && git commit -m \"chore: add depguard policy\"\n", strings.Join(commit, " "))
 	}
+	// --prebuild-box: build the sandbox image now so the first boxed run is
+	// instant. Best-effort and OPT-IN — default init stays offline and never
+	// needs docker (most repos have no script-bearing deps anyway).
+	if prebuildBox {
+		if rt := box.Runtime(); rt != "" {
+			fmt.Println("\nguard: prebuilding the sandbox image (--prebuild-box)...")
+			if _, traced := box.EnsureObsImage(rt); !traced {
+				fmt.Fprintln(os.Stderr, "guard: ⚠ sandbox prebuild failed — it will build lazily on the first boxed run")
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "guard: ⚠ --prebuild-box: no container runtime found; skipping")
+		}
+	}
+
 	fmt.Println("\nNext: use 'guard install <pkg>' instead of 'npm install <pkg>'.")
 	fmt.Println("Check status anytime with 'guard status'.")
 	return nil

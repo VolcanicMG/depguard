@@ -2,6 +2,7 @@ package box
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,5 +117,40 @@ func TestRunUncontainedScrubsEnv(t *testing.T) {
 	leak, _ := os.ReadFile(filepath.Join(dir, "leak.txt"))
 	if strings.Contains(string(leak), "tok-should-not-leak") {
 		t.Errorf("uncontained env LEAKED the probe token: %q", leak)
+	}
+}
+
+func dockerUp() bool {
+	rt := Runtime()
+	return rt != "" && exec.Command(rt, "version").Run() == nil
+}
+
+// TestSweepContainersNoRuntime: a no-op without a container runtime.
+func TestSweepContainersNoRuntime(t *testing.T) {
+	if n := SweepContainers(""); n != 0 {
+		t.Errorf("SweepContainers(\"\") = %d, want 0", n)
+	}
+}
+
+// TestSweepContainersRemovesOrphan creates a stray depguard-run container and
+// confirms the sweep force-removes it. Docker-gated.
+func TestSweepContainersRemovesOrphan(t *testing.T) {
+	rt := Runtime()
+	if !dockerUp() {
+		t.Skip("docker daemon not reachable")
+	}
+	name := fmt.Sprintf("depguard-run-test-%d", os.Getpid())
+	// A created-but-not-started container off the box base image (already local).
+	if err := exec.Command(rt, "create", "--name", name, buildImage, "true").Run(); err != nil {
+		t.Skipf("could not create test container (image missing?): %v", err)
+	}
+	defer exec.Command(rt, "rm", "-f", name).Run() // belt-and-suspenders
+
+	if n := SweepContainers(rt); n < 1 {
+		t.Errorf("expected to sweep >=1 orphan, got %d", n)
+	}
+	out, _ := exec.Command(rt, "ps", "-aq", "--filter", "name="+name).Output()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Error("orphan container survived the sweep")
 	}
 }

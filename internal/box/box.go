@@ -153,6 +153,26 @@ func RemoveObsImage(runtime string) (bool, error) {
 	return true, nil
 }
 
+// SweepContainers force-removes any leftover depguard run containers. The normal
+// path runs with --rm and force-removes on a timeout, so this only finds orphans
+// from a hard-killed guard. Returns the count removed; a no-op without a runtime.
+func SweepContainers(runtime string) int {
+	if runtime == "" {
+		return 0
+	}
+	out, err := exec.Command(runtime, "ps", "-aq", "--filter", "name=depguard-run-").Output()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, id := range strings.Fields(string(out)) {
+		if exec.Command(runtime, "rm", "-f", id).Run() == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // SweepArtifacts removes on-disk leftovers a HARD-KILLED box run could leave
 // behind — the normal run path already cleans these via defer, so this is the
 // recovery hook for a guard process killed mid-run:
