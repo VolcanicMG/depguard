@@ -2,7 +2,8 @@
 
 Local-first supply-chain protection for npm installs. One signed binary, per-repo
 policy, **nothing running in the background** — protection fires only when you act
-(install, commit, PR). Full model: [DESIGN.md](DESIGN.md).
+(install, commit, PR). Full model: [DESIGN.md](DESIGN.md). New to a repo?
+Step-by-step: [SETUP.md](SETUP.md).
 
 ```
  guard install lodash
@@ -41,13 +42,22 @@ End users need only the compiled binary — never Go, never npm packages.
 cd your-project
 guard init            # drops .guardrc, .npmrc, pre-commit/pre-push hooks (--ci adds PR gate)
 #   bypass a hook once (depguard only, other hooks still run): GUARD_SKIP=1 git push
+guard status          # is this repo protected? policy, hooks, sandbox, decisions (offline)
 guard install <pkg>   # instead of npm install
 guard ci              # instead of npm ci (lockfile-exact installs, same protections)
 guard check [--all] [--json]   # advisories + cooldown + integrity (hooks run this)
 guard scan <dir> [--json]      # static-scan one package dir (scripts, caps, injection)
 guard approve <name@version> [--uncontained|--deny]   # script decisions
+guard ignore <issue-id> [--reason ".."] [--expires 30d]  # waive a REVIEWED check finding (--list, --remove)
+guard allow <pattern>...                 # add a name/scope to .guardrc allow (bypass cooldown)
+guard config [get | set <k> <v>]         # show or edit .guardrc policy
 guard mcp             # run as an MCP server over stdio (tools: scan_package, check_dependencies)
 ```
+
+Run `guard status` anytime for an offline, instant read on whether the repo is
+protected — policy, the committed files, hooks, sandbox runtime, and recorded
+approvals/waivers (it flags expired ones). Output is colorized on a terminal and
+respects `NO_COLOR`.
 
 ## Per-repo files (commit them)
 
@@ -55,7 +65,29 @@ guard mcp             # run as an MCP server over stdio (tools: scan_package, ch
 |---|---|
 | `.guardrc` | policy: cooldown, allowed scopes, fallback mode — **review changes in PRs** (it controls the filter) |
 | `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
+| `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` so even raw `npm install` can't run scripts |
+
+## Waiving a reviewed finding
+
+`guard check` gates commit / push / PR / CI on advisories, cooldown, and lockfile
+integrity. When you have **reviewed** a specific finding and accept it, waive that
+one issue so it stops gating — without weakening the check for anything else:
+
+```sh
+guard check                       # prints the exact `guard ignore …` line per finding
+guard ignore cooldown:lodash@4.17.21 --reason "vendored fork, vetted" --expires 90d
+guard ignore --list               # every waiver, tagged active / EXPIRED
+guard ignore --remove cooldown:lodash@4.17.21
+```
+
+A waiver is **purposeful, not a blanket off-switch**: it is pinned to an exact
+`name@version` + finding-kind, so it lapses the moment the package moves to a new
+version (which is then judged on its own). `--expires` makes it self-retiring — an
+expired waiver re-gates (fail closed) and is reported. Waivers live in the
+committed `.guard-ignores`, so the decision *and its reason* travel to teammates
+and CI as reviewable evidence. (The install-time **name** gate — typosquat /
+dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 
 ## What each layer stops
 

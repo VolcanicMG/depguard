@@ -179,3 +179,37 @@ func Install(dir string, ci bool) ([]string, error) {
 	}
 	return written, nil
 }
+
+// InstalledState reports which guard-managed artifacts are present in dir — the
+// raw material for `guard status`. Detection is by content marker (not mere
+// existence), so a hand-removed or husky-chained hook is reported accurately.
+type InstalledState struct {
+	PreCommit  bool // .git/hooks/pre-commit calls guard
+	PrePush    bool // .git/hooks/pre-push calls guard
+	Npmrc      bool // .npmrc pins ignore-scripts=true
+	CIWorkflow bool // .github/workflows/depguard.yml present
+	Husky      bool // a .husky dir exists (hooks chain there instead of .git/hooks)
+}
+
+// Installed inspects dir for the artifacts `guard init` drops.
+func Installed(dir string) InstalledState {
+	var s InstalledState
+	s.PreCommit = hookCallsGuard(filepath.Join(dir, ".git", "hooks", "pre-commit"))
+	s.PrePush = hookCallsGuard(filepath.Join(dir, ".git", "hooks", "pre-push"))
+	if b, err := os.ReadFile(filepath.Join(dir, ".npmrc")); err == nil {
+		s.Npmrc = strings.Contains(string(b), "ignore-scripts=true")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".github", "workflows", "depguard.yml")); err == nil {
+		s.CIWorkflow = true
+	}
+	if fi, err := os.Stat(filepath.Join(dir, ".husky")); err == nil && fi.IsDir() {
+		s.Husky = true
+	}
+	return s
+}
+
+// hookCallsGuard reports whether the hook file at path exists and invokes guard.
+func hookCallsGuard(path string) bool {
+	b, err := os.ReadFile(path)
+	return err == nil && strings.Contains(string(b), "guard check")
+}

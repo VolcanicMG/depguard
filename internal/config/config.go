@@ -331,3 +331,122 @@ func parseList(s string) []string {
 	}
 	return out
 }
+
+// ─── policy editing (guard allow / guard config set) ─────────────────────────
+//
+// These let a human edit .guardrc through a command instead of hand-writing the
+// flat-YAML — the same "purposeful, committed, travels with the repo" pattern as
+// .guard-approvals / .guard-ignores. Every write validates against the SAME
+// rules Load() enforces, so a command can never write a value Load() would later
+// reject (e.g. a bad cooldown or a non-https registry).
+
+// SetValue validates key/value and writes it into dir/.guardrc, replacing the
+// existing active line for key or appending one. Returns the canonical value
+// text written (e.g. a normalized list or bool). Comments and other keys are
+// left untouched.
+func SetValue(dir, key, value string) (string, error) {
+	canon, err := canonicalValue(key, value)
+	if err != nil {
+		return "", err
+	}
+	if err := writeKeyLine(dir, key, canon); err != nil {
+		return "", err
+	}
+	return canon, nil
+}
+
+// AddAllow adds pattern to the allow list (dedup) and persists it. Reports
+// whether it was newly added (false = already present).
+func AddAllow(dir, pattern string) (bool, error) {
+	c, err := Load(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range c.Allow {
+		if p == pattern {
+			return false, nil
+		}
+	}
+	list := append(append([]string{}, c.Allow...), pattern)
+	if _, err := SetValue(dir, "allow", strings.Join(list, ",")); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// canonicalValue validates value for key and returns the exact text to write.
+// It mirrors Load()'s switch so the two never disagree about what is legal.
+func canonicalValue(key, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	switch key {
+	case "cooldown":
+		if _, err := parseDays(value); err != nil {
+			return "", err
+		}
+		return value, nil
+	case "ignore-scripts":
+		b, err := parseBool(value)
+		if err != nil {
+			return "", fmt.Errorf("ignore-scripts %w", err)
+		}
+		return strconv.FormatBool(b), nil
+	case "no-container-fallback":
+		switch FallbackMode(value) {
+		case FallbackWarnApprove, FallbackFail:
+			return value, nil
+		}
+		return "", fmt.Errorf("no-container-fallback must be warn-approve or fail, got %q", value)
+	case "untraced-boxed":
+		if value == "run" || value == "fail" {
+			return value, nil
+		}
+		return "", fmt.Errorf("untraced-boxed must be run or fail, got %q", value)
+	case "registry":
+		reg := strings.TrimSuffix(value, "/")
+		if err := validateRegistry(reg); err != nil {
+			return "", err
+		}
+		return reg, nil
+	case "allow", "internal-scopes", "flag":
+		// Accept comma- or space-separated input; emit a canonical [a, b] list.
+		fields := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' })
+		var items []string
+		for _, f := range fields {
+			f = strings.Trim(strings.TrimSpace(f), "\"'")
+			if f != "" {
+				items = append(items, f)
+			}
+		}
+		return "[" + strings.Join(items, ", ") + "]", nil
+	default:
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag)", key)
+	}
+}
+
+// writeKeyLine sets key to value in dir/.guardrc: replaces the first active
+// (non-comment) line for key, or appends one if none exists. The file is
+// created if absent. Preserves every other line, including comments.
+func writeKeyLine(dir, key, value string) error {
+	path := dir + "/" + FileName
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var lines []string
+	if len(data) > 0 {
+		lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	}
+	want := key + ": " + value
+	for i, ln := range lines {
+		s := strings.TrimSpace(ln)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if k, _, ok := strings.Cut(s, ":"); ok && strings.TrimSpace(k) == key {
+			lines[i] = want
+			return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+		}
+	}
+	lines = append(lines, want)
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}

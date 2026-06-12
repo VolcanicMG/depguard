@@ -5,6 +5,7 @@
 //	guard install [args]   protected npm install through the ephemeral proxy
 //	guard check [--quiet]  lockfile vs OSV advisories (what the hooks/CI run)
 //	guard approve <pkg>    record a script decision without installing
+//	guard ignore <id>      waive a reviewed check finding (.guard-ignores)
 //	guard version          print version
 package main
 
@@ -12,6 +13,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,13 +35,15 @@ import (
 	"depguard/internal/scanner"
 	"depguard/internal/semver"
 	"depguard/internal/tty"
+	"depguard/internal/ui"
+	"depguard/internal/waivers"
 )
 
-const version = "0.5.0"
+const version = "0.7.0"
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		usage(os.Stderr)
 		os.Exit(2)
 	}
 	var err error
@@ -59,12 +63,22 @@ func main() {
 		err = cmdScan(os.Args[2:])
 	case "approve":
 		err = cmdApprove(os.Args[2:])
+	case "ignore":
+		err = cmdIgnore(os.Args[2:])
+	case "allow":
+		err = cmdAllow(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("guard", version)
+	case "help", "-h", "--help":
+		usage(os.Stdout)
 	default:
-		usage()
+		usage(os.Stderr)
 		os.Exit(2)
 	}
 	if err != nil {
@@ -73,16 +87,21 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `guard — supply-chain protection for npm installs
+func usage(w io.Writer) {
+	fmt.Fprint(w, `guard — supply-chain protection for npm installs
 
   guard init [--ci]               set up this repo (.guardrc, git hooks, CI gate)
+  guard status                    is this repo protected? (policy, hooks, sandbox, decisions)
   guard install [npm args...]     npm install, filtered + scripts neutralized
-  guard check [--quiet] [--json]  re-check installed deps against advisories
+  guard ci                        npm ci — lockfile-exact, same protections
+  guard check [--quiet] [--json]  re-check installed deps (advisories, cooldown, integrity)
   guard scan <dir> [--json]       static-scan one package dir (scripts, caps, injection)
   guard mcp                       run as an MCP server over stdio
-  guard approve <name@version>    record a script approval (use --uncontained to
-                                  allow running with no sandbox; --deny to refuse)
+  guard approve <name@version>    record a script approval (--uncontained | --deny)
+  guard ignore <issue-id>         waive a reviewed check finding (--reason, --expires, --list, --remove)
+  guard allow <pattern>...        add a name/scope to .guardrc allow (bypass cooldown)
+  guard config [get | set <k> <v>]  show or edit .guardrc policy
+  guard help                      show this message
   guard version
 `)
 }
@@ -118,7 +137,21 @@ func cmdInit(args []string) error {
 	for _, f := range wrote {
 		fmt.Println("  +", f)
 	}
+	// Nudge committing only the repo-tracked policy files that actually landed —
+	// the .git/hooks shims live inside .git (never committed), and the `wrote`
+	// labels are display strings, not bare paths, so check the disk by name.
+	var commit []string
+	for _, f := range []string{config.FileName, ".npmrc", ".github/workflows/depguard.yml"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			commit = append(commit, f)
+		}
+	}
+	if len(commit) > 0 {
+		fmt.Println("\nCommit the policy so it travels with the repo + CI:")
+		fmt.Printf("  git add %s && git commit -m \"chore: add depguard policy\"\n", strings.Join(commit, " "))
+	}
 	fmt.Println("\nNext: use 'guard install <pkg>' instead of 'npm install <pkg>'.")
+	fmt.Println("Check status anytime with 'guard status'.")
 	return nil
 }
 
@@ -215,8 +248,12 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	// existing pin) skips the proxy's packument filter and would otherwise only
 	// be caught later at commit/push. Scope is git-diff (all=false) like the
 	// hook, so only versions THIS install introduced are vetted.
-	advErr := checkAdvisories(dir, false)
-	freshErr := checkFreshness(dir, false, false)
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+	advErr := checkAdvisories(dir, false, wf)
+	freshErr := checkFreshness(dir, false, false, wf)
 	if advErr != nil {
 		return advErr
 	}
@@ -334,7 +371,7 @@ func promptApproval(key string, rep scanner.Report, runtime string, cfg config.C
 		fmt.Println("   static scan: no capability flags")
 	}
 	if len(newCaps) > 0 {
-		fmt.Println("   ⚠ NEW since the previous version:")
+		fmt.Println("   " + ui.Warn() + " NEW since the previous version:")
 		for _, f := range newCaps {
 			fmt.Printf("     + [%s] %s\n", f.Severity, f.What)
 		}
@@ -353,7 +390,7 @@ func promptApproval(key string, rep scanner.Report, runtime string, cfg config.C
 		fmt.Println("   No container runtime and policy is 'fail' — denying.")
 		return approvals.Denied
 	}
-	fmt.Println("   ⚠ No container runtime found (docker/podman).")
+	fmt.Println("   " + ui.Warn() + " No container runtime found (docker/podman).")
 	fmt.Println("   Running this script means executing its code on your machine, UNCONTAINED.")
 	if promptYN("   Run uncontained anyway?") {
 		return approvals.ApprovedUncontained
@@ -386,7 +423,7 @@ func runApproved(key, projectDir, relPath string, d approvals.Decision, runtime,
 			return fmt.Errorf("%s box run: %w", key, err)
 		}
 		if res.Unsafe {
-			fmt.Fprintf(os.Stderr, "\nguard: ✗ %s behaved MALICIOUSLY in the box:\n", key)
+			fmt.Fprintf(os.Stderr, "\nguard: %s %s behaved MALICIOUSLY in the box:\n", ui.Bad(), key)
 			for _, f := range res.Findings {
 				if f.Kind != "exec" { // execs are context; print the convictions
 					fmt.Fprintf(os.Stderr, "    [%s] %s\n", f.Kind, f.Detail)
@@ -510,9 +547,13 @@ func cmdCheck(args []string) error {
 		}
 		return nil
 	}
-	advErr := checkAdvisories(dir, quiet)
-	freshErr := checkFreshness(dir, quiet, all)
-	intErr := checkLockfileIntegrity(dir, cfg, quiet)
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+	advErr := checkAdvisories(dir, quiet, wf)
+	freshErr := checkFreshness(dir, quiet, all, wf)
+	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
 	// Informational diff signals (never gate the commit/PR). Run here so a
 	// new-deps heads-up rides the same `guard check` the hooks already run.
 	if cfg.Flagged("new-deps") {
@@ -540,7 +581,76 @@ type CheckResult struct {
 	Unhashed    []string              `json:"unhashed"`
 	NewDeps     []string              `json:"newDeps"`
 	Maintainers []maintainer.Change   `json:"maintainerChanges"`
+	Waived      []string              `json:"waived,omitempty"`
 	OK          bool                  `json:"ok"`
+}
+
+// ─── waiver identity + filtering ─────────────────────────────────────────────
+//
+// These build the stable, version-pinned ID under which a human waives a gating
+// finding in .guard-ignores, and filter actively-waived findings out of the
+// gates. They are the SINGLE source of truth for waiver IDs, shared by the
+// human-prose path (cmdCheck's three checkers) and the structured path
+// (gatherCheck / the MCP server), so the two never disagree about what is or
+// isn't waived. The kind prefix keeps categories unambiguous; the name@version
+// pin means a waiver lapses when the package moves — the new version is judged
+// on its own (DESIGN.md §13).
+
+// advisoryWaiverID is "advisory:<name>@<version>:<osv-id>".
+func advisoryWaiverID(v advisory.Vuln) string {
+	return fmt.Sprintf("advisory:%s@%s:%s", v.Package, v.Version, v.ID)
+}
+
+// cooldownWaiverID is "cooldown:<name>@<version>".
+func cooldownWaiverID(v freshness.Violation) string {
+	return fmt.Sprintf("cooldown:%s@%s", v.Name, v.Version)
+}
+
+// offRegistryWaiverID / unhashedWaiverID take a lockfile key ("name@version").
+func offRegistryWaiverID(key string) string { return "off-registry:" + key }
+func unhashedWaiverID(key string) string    { return "unhashed:" + key }
+
+// waiverReason renders " — <reason>" for display, or "" when none was given.
+func waiverReason(e waivers.Entry) string {
+	if e.Reason == "" {
+		return ""
+	}
+	return " — " + e.Reason
+}
+
+// waivedActive reports whether id has an in-force (non-expired) waiver.
+func waivedActive(wf *waivers.File, id string, now time.Time) bool {
+	_, st := wf.Check(id, now)
+	return st == waivers.Active
+}
+
+// activeAdvisories drops advisory hits an active waiver suppresses, recording
+// each suppressed ID in *waived. Expired waivers do NOT suppress (fail closed).
+func activeAdvisories(vulns []advisory.Vuln, wf *waivers.File, now time.Time, waived *[]string) []advisory.Vuln {
+	var out []advisory.Vuln
+	for _, v := range vulns {
+		id := advisoryWaiverID(v)
+		if waivedActive(wf, id, now) {
+			*waived = append(*waived, id)
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// activeCooldown is activeAdvisories for cooldown violations.
+func activeCooldown(viol []freshness.Violation, wf *waivers.File, now time.Time, waived *[]string) []freshness.Violation {
+	var out []freshness.Violation
+	for _, v := range viol {
+		id := cooldownWaiverID(v)
+		if waivedActive(wf, id, now) {
+			*waived = append(*waived, id)
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // gatherCheck runs every check over the lockfile and returns the structured
@@ -550,6 +660,11 @@ type CheckResult struct {
 // underlying internal packages.
 func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	var res CheckResult
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return res, err
+	}
+	now := time.Now()
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -559,7 +674,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		return res, err
 	}
 	if v, err := advisory.Check(pkgs); err == nil {
-		res.Advisories = v
+		res.Advisories = activeAdvisories(v, wf, now, &res.Waived)
 	}
 	regHost := hostOf(cfg.Registry)
 	for _, p := range pkgs {
@@ -567,10 +682,18 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			continue
 		}
 		if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
-			res.OffRegistry = append(res.OffRegistry, p.Key())
+			if id := offRegistryWaiverID(p.Key()); waivedActive(wf, id, now) {
+				res.Waived = append(res.Waived, id)
+			} else {
+				res.OffRegistry = append(res.OffRegistry, p.Key())
+			}
 		}
 		if p.Integrity == "" {
-			res.Unhashed = append(res.Unhashed, p.Key())
+			if id := unhashedWaiverID(p.Key()); waivedActive(wf, id, now) {
+				res.Waived = append(res.Waived, id)
+			} else {
+				res.Unhashed = append(res.Unhashed, p.Key())
+			}
 		}
 	}
 	fresh := pkgs
@@ -591,7 +714,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		}
 	}
 	if viol, _ := freshness.Check(cfg.Registry, fresh, cfg.Cooldown, cfg.Allowed); len(viol) > 0 {
-		res.Cooldown = viol
+		res.Cooldown = activeCooldown(viol, wf, now, &res.Waived)
 	}
 	if cfg.Flagged("new-maintainer") {
 		if ch, _ := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed); len(ch) > 0 {
@@ -608,7 +731,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 // download). Both are tamper signatures a hand-edited or malicious lockfile
 // leaves behind. Allowlisted packages bypass — a deliberately alternate source
 // is the human's call. Gates the check like the advisory layer.
-func checkLockfileIntegrity(dir string, cfg config.Config, quiet bool) error {
+func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -617,7 +740,24 @@ func checkLockfileIntegrity(dir string, cfg config.Config, quiet bool) error {
 		return err
 	}
 	regHost := hostOf(cfg.Registry)
+	now := time.Now()
 	var offReg, noHash []string
+	// waiveOrKeep routes one integrity finding: an active waiver suppresses it
+	// (shown muted), an expired waiver re-gates it loudly, otherwise it gates.
+	waiveOrKeep := func(id, display string, into *[]string) {
+		e, st := wf.Check(id, now)
+		switch st {
+		case waivers.Active:
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "guard: %s integrity waived %s%s\n", ui.Waived(), id, waiverReason(e))
+			}
+		case waivers.Expired:
+			fmt.Fprintf(os.Stderr, "guard: %s integrity waiver EXPIRED (%s) for %s — re-review or renew\n", ui.Warn(), e.Expires, id)
+			*into = append(*into, display)
+		default:
+			*into = append(*into, display)
+		}
+	}
 	for _, p := range pkgs {
 		if cfg.Allowed(p.Name) {
 			continue
@@ -628,15 +768,16 @@ func checkLockfileIntegrity(dir string, cfg config.Config, quiet bool) error {
 			continue
 		}
 		if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
-			offReg = append(offReg, fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost))
+			waiveOrKeep(offRegistryWaiverID(p.Key()),
+				fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost), &offReg)
 		}
 		if p.Integrity == "" {
-			noHash = append(noHash, p.Key())
+			waiveOrKeep(unhashedWaiverID(p.Key()), p.Key(), &noHash)
 		}
 	}
 	if len(offReg) == 0 && len(noHash) == 0 {
 		if !quiet {
-			fmt.Printf("guard: lockfile integrity ok (%d version(s)) ✓\n", len(pkgs))
+			fmt.Printf("guard: lockfile integrity ok (%d version(s)) %s\n", len(pkgs), ui.OK())
 		}
 		return nil
 	}
@@ -652,7 +793,7 @@ func checkLockfileIntegrity(dir string, cfg config.Config, quiet bool) error {
 			fmt.Fprintln(os.Stderr, "  ", s)
 		}
 	}
-	fmt.Fprintln(os.Stderr, "guard: a tarball off-registry or without a hash can't be verified — allowlist in .guardrc if intentional")
+	fmt.Fprintln(os.Stderr, "guard: a tarball off-registry or without a hash can't be verified — allowlist in .guardrc, or — if reviewed — guard ignore off-registry:<name>@<version> / unhashed:<name>@<version>")
 	return fmt.Errorf("lockfile integrity check failed (%d off-registry, %d unhashed)", len(offReg), len(noHash))
 }
 
@@ -744,7 +885,7 @@ func checkMaintainers(dir string, cfg config.Config, quiet bool) {
 	}
 	if len(changes) == 0 {
 		if !quiet {
-			fmt.Println("guard: no maintainer/publisher changes on installed versions ✓")
+			fmt.Println("guard: no maintainer/publisher changes on installed versions " + ui.OK())
 		}
 		return
 	}
@@ -789,7 +930,7 @@ func reportNewDeps(dir string, quiet bool) {
 	}
 	if len(added) == 0 {
 		if !quiet {
-			fmt.Println("guard: no new dependencies vs HEAD ✓")
+			fmt.Println("guard: no new dependencies vs HEAD " + ui.OK())
 		}
 		return
 	}
@@ -803,7 +944,7 @@ func reportNewDeps(dir string, quiet bool) {
 // Scope: only versions ADDED relative to git HEAD (each version gets checked
 // once, at the commit that introduces it) — full tree with --all or when
 // there's no git history to diff against.
-func checkFreshness(dir string, quiet, all bool) error {
+func checkFreshness(dir string, quiet, all bool, wf *waivers.File) error {
 	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
@@ -842,7 +983,7 @@ func checkFreshness(dir string, quiet, all bool) error {
 	}
 	if len(pkgs) == 0 {
 		if !quiet {
-			fmt.Println("guard: no new lockfile versions to cooldown-check ✓")
+			fmt.Println("guard: no new lockfile versions to cooldown-check " + ui.OK())
 		}
 		return nil
 	}
@@ -853,22 +994,41 @@ func checkFreshness(dir string, quiet, all bool) error {
 		// must not block every commit in every repo.
 		fmt.Fprintln(os.Stderr, "guard: freshness check skipped for", w)
 	}
-	if len(violations) == 0 {
+	// Drop violations a human has reviewed and waived (still shown, muted); an
+	// expired waiver re-gates and is reported.
+	now := time.Now()
+	var active []freshness.Violation
+	for _, v := range violations {
+		id := cooldownWaiverID(v)
+		e, st := wf.Check(id, now)
+		switch st {
+		case waivers.Active:
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "guard: %s cooldown waived %s%s\n", ui.Waived(), id, waiverReason(e))
+			}
+		case waivers.Expired:
+			fmt.Fprintf(os.Stderr, "guard: %s cooldown waiver EXPIRED (%s) for %s — re-review or renew\n", ui.Warn(), e.Expires, id)
+			active = append(active, v)
+		default:
+			active = append(active, v)
+		}
+	}
+	if len(active) == 0 {
 		if !quiet {
-			fmt.Printf("guard: %d version(s) cooldown-checked (%s), all clear ✓\n", len(pkgs), scope)
+			fmt.Printf("guard: %d version(s) cooldown-checked (%s), all clear %s\n", len(pkgs), scope, ui.OK())
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "guard: %d version(s) inside the %s cooldown:\n", len(violations), cfg.Cooldown)
-	for _, v := range violations {
+	fmt.Fprintf(os.Stderr, "guard: %d version(s) inside the %s cooldown:\n", len(active), cfg.Cooldown)
+	for _, v := range active {
 		if v.Age == 0 {
 			fmt.Fprintf(os.Stderr, "  %s@%s — no publish timestamp\n", v.Name, v.Version)
 		} else {
 			fmt.Fprintf(os.Stderr, "  %s@%s — published %dd ago\n", v.Name, v.Version, int(v.Age.Hours()/24))
 		}
 	}
-	fmt.Fprintln(os.Stderr, "guard: wait out the cooldown, pin an older version, or allowlist in .guardrc")
-	return fmt.Errorf("%d version(s) violate the cooldown", len(violations))
+	fmt.Fprintln(os.Stderr, "guard: wait out the cooldown, pin an older version, allowlist in .guardrc, or — if reviewed — guard ignore cooldown:<name>@<version>")
+	return fmt.Errorf("%d version(s) violate the cooldown", len(active))
 }
 
 // headLockfile reads package-lock.json as committed at git HEAD.
@@ -887,7 +1047,7 @@ func headLockfile(dir string) ([]lockfile.Pkg, bool) {
 
 // checkAdvisories queries OSV for every installed version and fails when any
 // advisory hits — the "installed last month, reported yesterday" recovery layer.
-func checkAdvisories(dir string, quiet bool) error {
+func checkAdvisories(dir string, quiet bool, wf *waivers.File) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -905,17 +1065,39 @@ func checkAdvisories(dir string, quiet bool) error {
 		fmt.Fprintln(os.Stderr, "guard: advisory check skipped:", err)
 		return nil
 	}
-	if len(vulns) == 0 {
+	// Partition into still-gating hits and the ones a human has reviewed and
+	// waived in .guard-ignores. Waived hits are shown (muted) but never gate;
+	// a lapsed waiver re-gates and is called out loudly.
+	now := time.Now()
+	var active []advisory.Vuln
+	for _, v := range vulns {
+		id := advisoryWaiverID(v)
+		e, st := wf.Check(id, now)
+		switch st {
+		case waivers.Active:
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "guard: %s advisory waived %s%s\n", ui.Waived(), id, waiverReason(e))
+			}
+		case waivers.Expired:
+			fmt.Fprintf(os.Stderr, "guard: %s advisory waiver EXPIRED (%s) for %s — re-review or renew\n", ui.Warn(), e.Expires, id)
+			active = append(active, v)
+		default:
+			active = append(active, v)
+		}
+	}
+	if len(active) == 0 {
 		if !quiet {
-			fmt.Printf("guard: %d installed package(s), no advisory hits ✓\n", len(pkgs))
+			fmt.Printf("guard: %d installed package(s), no advisory hits %s\n", len(pkgs), ui.OK())
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "guard: %d advisory hit(s) on installed packages:\n", len(vulns))
-	for _, v := range vulns {
+	fmt.Fprintf(os.Stderr, "guard: %d advisory hit(s) on installed packages:\n", len(active))
+	for _, v := range active {
 		fmt.Fprintf(os.Stderr, "  %s@%s — %s: %s\n", v.Package, v.Version, v.ID, truncate(v.Summary, 100))
 	}
-	return fmt.Errorf("%d vulnerable package(s) installed", len(vulns))
+	fmt.Fprintf(os.Stderr, "guard: reviewed and accepting one? → guard ignore advisory:%s@%s:%s --reason \"...\"\n",
+		active[0].Package, active[0].Version, active[0].ID)
+	return fmt.Errorf("%d vulnerable package(s) installed", len(active))
 }
 
 // ─── guard scan ──────────────────────────────────────────────────────────────
@@ -953,7 +1135,7 @@ func cmdScan(args []string) error {
 		}
 	}
 	if len(rep.Findings) == 0 {
-		fmt.Println("guard: no capability/injection findings ✓")
+		fmt.Println("guard: no capability/injection findings " + ui.OK())
 		return nil
 	}
 	for _, f := range rep.Findings {
@@ -1002,6 +1184,127 @@ func cmdApprove(args []string) error {
 	return nil
 }
 
+// ─── guard ignore ────────────────────────────────────────────────────────────
+
+// cmdIgnore manages .guard-ignores — the per-issue waivers that stop a REVIEWED
+// finding from gating commit/push/PR/CI (DESIGN.md §13). It is deliberately
+// low-friction (one ID waives one finding — copy the `guard ignore …` line
+// `guard check` prints for the finding you accept) but purposeful: the ID is
+// pinned to an exact name@version + kind, and a --reason / --expires are
+// encouraged so the waiver is auditable and self-retiring.
+//
+//	guard ignore <issue-id> [--reason "..."] [--expires 30d|YYYY-MM-DD]
+//	guard ignore --list
+//	guard ignore --remove <issue-id>
+func cmdIgnore(args []string) error {
+	var id, reason, expires string
+	list, remove := false, false
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; a {
+		case "--list":
+			list = true
+		case "--remove", "--rm":
+			remove = true
+		case "--reason":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--reason needs a value")
+			}
+			i++
+			reason = args[i]
+		case "--expires", "--expire":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--expires needs a value (e.g. 30d or 2026-07-01)")
+			}
+			i++
+			expires = args[i]
+		default:
+			if strings.HasPrefix(a, "-") {
+				return fmt.Errorf("unknown flag %s", a)
+			}
+			id = a
+		}
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+
+	if list {
+		ids := wf.IDs()
+		if len(ids) == 0 {
+			fmt.Println("guard: no waivers recorded (.guard-ignores is empty)")
+			return nil
+		}
+		now := time.Now()
+		fmt.Printf("guard: %d waiver(s) in %s:\n", len(ids), waivers.FileName)
+		for _, w := range ids {
+			e, st := wf.Check(w, now)
+			tag := "active"
+			if st == waivers.Expired {
+				tag = "EXPIRED"
+			}
+			exp := "never"
+			if e.Expires != "" {
+				exp = e.Expires
+			}
+			fmt.Printf("  [%s] %s  (expires: %s)%s\n", tag, w, exp, waiverReason(e))
+		}
+		return nil
+	}
+
+	if id == "" {
+		return fmt.Errorf("usage: guard ignore <issue-id> [--reason \"...\"] [--expires 30d|YYYY-MM-DD]\n" +
+			"       guard ignore --list\n" +
+			"       guard ignore --remove <issue-id>")
+	}
+	if !validWaiverID(id) {
+		return fmt.Errorf("unrecognized issue id %q — expected one of: "+
+			"advisory:<name>@<version>:<osv-id>, cooldown:<name>@<version>, "+
+			"off-registry:<name>@<version>, unhashed:<name>@<version>", id)
+	}
+
+	if remove {
+		if !wf.Remove(id) {
+			return fmt.Errorf("no waiver for %q", id)
+		}
+		if err := wf.Save(dir); err != nil {
+			return err
+		}
+		fmt.Printf("guard: removed waiver %s (commit %s)\n", id, waivers.FileName)
+		return nil
+	}
+
+	if err := wf.Set(id, reason, expires); err != nil {
+		return err
+	}
+	if err := wf.Save(dir); err != nil {
+		return err
+	}
+	note := ""
+	if reason == "" {
+		note = " — no reason given; add --reason so the next reviewer knows why"
+	}
+	fmt.Printf("guard: waived %s (saved to %s — commit it so the waiver travels)%s\n", id, waivers.FileName, note)
+	return nil
+}
+
+// validWaiverID checks the kind prefix so a typo'd id (which would silently
+// never match any finding) is rejected at write time rather than rotting in the
+// file. It validates the SHAPE, not that a matching finding currently exists —
+// you may pre-empt a finding you expect.
+func validWaiverID(id string) bool {
+	for _, prefix := range []string{"advisory:", "cooldown:", "off-registry:", "unhashed:"} {
+		if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // stdinIsTTY reports whether a human is attached — the gate between
@@ -1038,4 +1341,266 @@ func tail(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return "    " + strings.Join(lines, "\n    ")
+}
+
+// ─── guard status ────────────────────────────────────────────────────────────
+
+// cmdStatus answers "is this repo actually protected, right now?" on one screen:
+// policy, the committed files, the trigger hooks, the sandbox runtime, and the
+// recorded decisions. It is read-only and OFFLINE (no registry/OSV calls), so it
+// is safe and instant to run anytime. Color is decoration — every state is also a
+// word, so it reads fine piped or under NO_COLOR.
+func cmdStatus(args []string) error {
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s · %s\n\n", ui.Bold("depguard status"), dir)
+
+	row := func(label, val string) { fmt.Printf("  %-22s %s\n", label, val) }
+	have := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name))
+		return err == nil
+	}
+	fileState := func(name string) string {
+		if !have(name) {
+			return ui.Dim("— absent")
+		}
+		if gitTracked(dir, name) {
+			return ui.OK() + " present, tracked"
+		}
+		return ui.Warn() + " present, NOT committed"
+	}
+
+	// Policy
+	cfg, cfgErr := config.Load(dir)
+	fmt.Println(ui.Bold("policy") + " (.guardrc)")
+	switch {
+	case cfgErr != nil:
+		row("status", ui.Red("✗ invalid: ")+cfgErr.Error())
+	case !have(config.FileName):
+		row("status", ui.Dim("— using built-in defaults (run 'guard init')"))
+	default:
+		row("status", ui.OK()+" loaded")
+	}
+	row("cooldown", fmtCooldown(cfg.Cooldown))
+	row("ignore-scripts", fmt.Sprintf("%v", cfg.IgnoreScripts))
+	row("allow", listOrNone(cfg.Allow))
+	row("internal-scopes", listOrNone(cfg.InternalScopes))
+	row("fallback", string(cfg.NoContainerFallback))
+	row("flags", listOrNone(cfg.Flag))
+
+	// Files
+	fmt.Println("\n" + ui.Bold("protection files"))
+	row(".guardrc", fileState(config.FileName))
+	row(".npmrc", npmrcState(dir))
+	row(".guard-approvals", fileState(approvals.FileName))
+	row(".guard-ignores", fileState(waivers.FileName))
+
+	// Triggers
+	fmt.Println("\n" + ui.Bold("triggers"))
+	st := hooks.Installed(dir)
+	row("pre-commit hook", boolState(st.PreCommit, "installed", "not installed (guard init)"))
+	row("pre-push hook", boolState(st.PrePush, "installed", "not installed (guard init)"))
+	row("CI PR gate", boolState(st.CIWorkflow, "installed", "not installed (guard init --ci)"))
+	if st.Husky {
+		row("husky", ui.OK()+" detected (depguard chained onto it)")
+	}
+
+	// Sandbox
+	fmt.Println("\n" + ui.Bold("sandbox (the box)"))
+	if rt := box.Runtime(); rt != "" {
+		row("runtime", ui.OK()+" "+rt+ui.Dim("  (obs image builds on first approved script)"))
+	} else {
+		row("runtime", ui.Warn()+" none — approved builds follow '"+string(cfg.NoContainerFallback)+"'")
+	}
+
+	// Decisions
+	fmt.Println("\n" + ui.Bold("decisions"))
+	row("approvals", approvalSummary(dir))
+	row("waivers", waiverSummary(dir))
+
+	// Tools
+	fmt.Println("\n" + ui.Bold("tools"))
+	row("npm", lookState("npm"))
+	row("git", lookState("git"))
+
+	// Verdict — protected means policy loads AND at least one local gate fires.
+	fmt.Println()
+	if cfgErr == nil && (st.PreCommit || st.PrePush) {
+		fmt.Println(ui.Green("→ this repo is protected ") + ui.OK())
+	} else {
+		fmt.Println(ui.Yellow("→ not fully set up — run 'guard init'"))
+	}
+	return nil
+}
+
+// fmtCooldown renders a duration as "Nd" when it's a whole number of days,
+// else the Go duration string — matching how .guardrc is written.
+func fmtCooldown(d time.Duration) string {
+	if d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	}
+	return d.String()
+}
+
+// listOrNone joins a list for display, dimmed "(none)" when empty.
+func listOrNone(xs []string) string {
+	if len(xs) == 0 {
+		return ui.Dim("(none)")
+	}
+	return strings.Join(xs, ", ")
+}
+
+// boolState renders an on/off trigger row.
+func boolState(on bool, yes, no string) string {
+	if on {
+		return ui.OK() + " " + yes
+	}
+	return ui.Dim("— " + no)
+}
+
+// npmrcState reports whether .npmrc pins ignore-scripts and is committed.
+func npmrcState(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, ".npmrc"))
+	if err != nil {
+		return ui.Dim("— absent")
+	}
+	if !strings.Contains(string(b), "ignore-scripts=true") {
+		return ui.Warn() + " present, ignore-scripts NOT set"
+	}
+	if gitTracked(dir, ".npmrc") {
+		return ui.OK() + " ignore-scripts set, tracked"
+	}
+	return ui.Warn() + " ignore-scripts set, NOT committed"
+}
+
+// lookState reports whether a binary is on PATH.
+func lookState(bin string) string {
+	if _, err := exec.LookPath(bin); err == nil {
+		return ui.OK() + " found"
+	}
+	return ui.Warn() + " not on PATH"
+}
+
+// gitTracked reports whether name is a committed file in dir's repo. False when
+// there's no git, no repo, or the file isn't tracked — all "not committed".
+func gitTracked(dir, name string) bool {
+	err := exec.Command("git", "-C", dir, "ls-files", "--error-unmatch", name).Run()
+	return err == nil
+}
+
+// approvalSummary counts recorded script decisions by kind.
+func approvalSummary(dir string) string {
+	appr, err := approvals.Load(dir)
+	if err != nil || len(appr.Packages) == 0 {
+		return ui.Dim("(none)")
+	}
+	var boxed, unc, denied int
+	for _, e := range appr.Packages {
+		switch e.Decision {
+		case approvals.ApprovedBoxed:
+			boxed++
+		case approvals.ApprovedUncontained:
+			unc++
+		case approvals.Denied:
+			denied++
+		}
+	}
+	return fmt.Sprintf("%d (%d boxed, %d uncontained, %d denied)", len(appr.Packages), boxed, unc, denied)
+}
+
+// waiverSummary counts active vs expired waivers, flagging expiries loudly.
+func waiverSummary(dir string) string {
+	wf, err := waivers.Load(dir)
+	if err != nil || len(wf.Ignores) == 0 {
+		return ui.Dim("(none)")
+	}
+	now := time.Now()
+	var active, expired int
+	for _, id := range wf.IDs() {
+		if _, s := wf.Check(id, now); s == waivers.Expired {
+			expired++
+		} else {
+			active++
+		}
+	}
+	out := fmt.Sprintf("%d active", active)
+	if expired > 0 {
+		out += ", " + ui.Yellow(fmt.Sprintf("%d EXPIRED", expired)) + " " + ui.Warn() + " (guard ignore --list)"
+	}
+	return out
+}
+
+// ─── guard allow ─────────────────────────────────────────────────────────────
+
+// cmdAllow adds a name/scope to .guardrc's allow list — the command form of the
+// cooldown-bypass escape hatch (and the clear for a typosquat name block), so a
+// human doesn't hand-edit YAML. Symmetric with guard ignore: edits a committed
+// file, dedups, tells you to commit.
+func cmdAllow(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: guard allow <pattern>...  (e.g. @yourco/*)")
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	for _, pat := range args {
+		added, err := config.AddAllow(dir, pat)
+		if err != nil {
+			return err
+		}
+		if added {
+			fmt.Printf("guard: allow += %s  (saved to %s — commit it)\n", pat, config.FileName)
+		} else {
+			fmt.Printf("guard: %s is already allowed\n", pat)
+		}
+	}
+	return nil
+}
+
+// ─── guard config ────────────────────────────────────────────────────────────
+
+// cmdConfig shows the effective policy (get/list) or edits one key (set). Every
+// set is validated against the same rules Load() enforces, so a command can't
+// write a value a later run would reject.
+func cmdConfig(args []string) error {
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(args) == 0, args[0] == "get", args[0] == "list":
+		cfg, err := config.Load(dir)
+		if err != nil {
+			return err
+		}
+		printConfig(cfg)
+		return nil
+	case args[0] == "set":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: guard config set <key> <value>")
+		}
+		key, value := args[1], strings.Join(args[2:], " ")
+		canon, err := config.SetValue(dir, key, value)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("guard: %s = %s  (saved to %s — commit it)\n", key, canon, config.FileName)
+		return nil
+	default:
+		return fmt.Errorf("usage: guard config [get | set <key> <value>]")
+	}
+}
+
+// printConfig prints the effective policy (defaults merged with .guardrc).
+func printConfig(cfg config.Config) {
+	fmt.Printf("cooldown:              %s\n", fmtCooldown(cfg.Cooldown))
+	fmt.Printf("ignore-scripts:        %v\n", cfg.IgnoreScripts)
+	fmt.Printf("no-container-fallback: %s\n", cfg.NoContainerFallback)
+	fmt.Printf("registry:              %s\n", cfg.Registry)
+	fmt.Printf("allow:                 %s\n", listOrNone(cfg.Allow))
+	fmt.Printf("internal-scopes:       %s\n", listOrNone(cfg.InternalScopes))
+	fmt.Printf("flag:                  %s\n", listOrNone(cfg.Flag))
 }

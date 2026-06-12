@@ -17,6 +17,7 @@ nicety.
 |---|---|---|
 | `DESIGN.md` | **the contract** — the *why* | goals/non-goals, the layered threat model, each defense layer's guarantee, design stance |
 | `README.md` | end users — the *how to use* | install steps, the command list + flags, per-repo files, the "what each layer stops" table |
+| `SETUP.md` | end users — *onboarding* | step-by-step per-repo setup (binary → `init` → workflow → CI), `.guardrc` tuning, waiving findings, tips/tricks, troubleshooting |
 | `docs/CODEMAP.md` | contributors — the *where* | file/dir layout, what calls what, where to make which kind of change |
 | `PITCH.md` | prospective users — the *sell* | problem framing, product summary, value per layer in plain language |
 | `demo/README.md` | demo runners | demo commands, scenario cast, safety guarantees of the demo |
@@ -33,6 +34,7 @@ nicety.
 | a demo scenario or its safety model | `demo/README.md` |
 | how tests are built/run, or the registry mock | `test/README.md` |
 | MCP tools exposed by `guard mcp` | `README.md` (the `guard mcp` line) **and** `docs/CODEMAP.md` (`mcp.go`) |
+| install/onboarding steps, a setup tip, or a new per-repo file | `SETUP.md` |
 
 Rule of thumb: `DESIGN.md` answers *why/what-guarantee*, `README.md` answers
 *how-to-use*, `CODEMAP.md` answers *where-in-the-code*. A change usually touches at
@@ -61,5 +63,5 @@ others.
 ## Inherited rules
 
 The parent `~/repos/CLAUDE.md` applies (SOLID, version-pegging, ask before any git
-action, no Claude attribution in commits, no tests unless asked, JSDoc/comment-the-why).
+action, no tests unless asked, JSDoc/comment-the-why).
 This file refines it for depguard; on conflict, this file wins for repo-specific points.

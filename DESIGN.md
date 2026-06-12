@@ -290,6 +290,7 @@ uncontained in a non-interactive context.
 ```
  .guardrc           policy — cooldown, allowlist scopes, fallback mode
  .guard-approvals   remembered ask-once answers + verdicts (travels with team)
+ .guard-ignores     reviewed-finding waivers — one per issue, version-pinned (§13)
  package-lock.json  source of truth for what's installed (already version-controlled)
 ```
 
@@ -461,6 +462,54 @@ agents.
    → ignore-scripts (and bools) error on a typo'd value instead of silently
      going unsafe; unknown .guardrc keys warn.
 ```
+
+## 13. Reviewed-finding waivers (v0.6.0 — .guard-ignores)
+
+`guard check` is the enforcement point: advisories, cooldown, and lockfile
+integrity gate commit / push / PR / CI. Sometimes a gating finding is one a human
+has reviewed and consciously accepts (a vendored fork still inside the cooldown,
+an internal mirror that resolves off-registry). Forcing the choice between "leave
+the gate red forever" and "weaken the policy for everything" is exactly what
+trains a team to disable a security tool. Waivers add the missing third option:
+silence ONE finding, on purpose, with evidence.
+
+```
+ guard check ──► prints, per gating finding, the exact line that waives it:
+                 "→ guard ignore cooldown:lodash@4.17.21 --reason ..."
+        │
+ guard ignore <id> [--reason ..] [--expires 30d|YYYY-MM-DD]
+        │
+        ▼
+ .guard-ignores   (committed JSON, like .guard-approvals)
+        │
+ next guard check ─► waived findings are SHOWN (muted ⊘) but do NOT gate;
+                     every other finding still gates normally
+```
+
+**Issue identity is version-pinned.** A waiver ID is `<kind>:<name>@<version>`
+(advisories also carry the OSV id): `cooldown:lodash@4.17.21`,
+`off-registry:evil@9.9.9`, `unhashed:bar@1.0.0`, `advisory:foo@1.2.3:GHSA-xxxx`.
+Because the version is part of the ID, a waiver **lapses automatically** when the
+package moves — the new version is a new finding, judged (and, if still wanted,
+re-waived) on its own. A waiver can never silently cover a version nobody reviewed.
+
+**Purposeful but low-friction.** Adding one is a single command (copy the line
+`guard check` prints), but it is scoped to exactly one issue and carries an
+optional `--reason` (encouraged — it is the audit trail) and `--expires`
+(relative `30d`, or absolute `YYYY-MM-DD`). An **expired** waiver does not
+suppress: it fails closed, re-gates the finding, and is reported loudly, so a
+stale waiver cannot quietly hide a real problem.
+
+**Scope.** Waivers cover the `guard check` gates (advisory, cooldown,
+off-registry, unhashed) — the findings that hold up *events*. The install-time
+**name** gate (typosquat / dependency-confusion, which fails closed before any
+metadata is even served) keeps its existing escape hatch, `allow:` in `.guardrc`:
+clearing a fail-closed name block is a deliberately different decision from
+waiving a reviewed check finding.
+
+The ID scheme is the single source of truth shared by the human-prose path and
+the structured `--json` / MCP path (`CheckResult.waived`), so the two never
+disagree about what is or isn't waived.
 
 ## 12. Open items
 
