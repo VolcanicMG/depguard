@@ -189,6 +189,28 @@ func cmdInit(args []string) error {
 
 // ─── guard install ───────────────────────────────────────────────────────────
 
+// warnAltManager prints a loud notice when a pnpm/yarn lockfile is present, so
+// a team that normally installs with pnpm/yarn knows `guard install` proxies
+// npm only and their direct installs bypass the §5 filter. The `guard check`
+// gate (hooks/CI) still re-vets the resulting lockfile, so this is a heads-up
+// about the install-time gap, not a hard failure.
+func warnAltManager(dir string) {
+	for _, f := range []string{"pnpm-lock.yaml", "yarn.lock"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			continue
+		}
+		mgr := "pnpm"
+		if f == "yarn.lock" {
+			mgr = "yarn"
+		}
+		fmt.Fprintf(os.Stderr,
+			"guard: this repo has a %s. `guard install` proxies npm only — a direct\n"+
+				"       `%s install` bypasses the install-time filter; only `guard check`\n"+
+				"       (hooks/CI) re-vets %s installs. See README \u00a7 Honest limits.\n",
+			f, mgr, mgr)
+	}
+}
+
 // cmdInstall is the protected install path — the whole §5–§9 flow:
 // ephemeral proxy → npm with scripts neutralized → approval/box for the few
 // script-bearing packages → advisory check on the result.
@@ -206,6 +228,13 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	if err != nil {
 		return err
 	}
+
+	// guard install is npm-shaped (§5). If the repo carries a pnpm/yarn
+	// lockfile, the developer's usual `pnpm install` / `yarn install` runs
+	// OUTSIDE this proxy and is unprotected at install time — only `guard
+	// check` (hooks/CI) re-vets those lockfiles. Warn loudly so the gap is
+	// never silent. Full pnpm/yarn install proxying is a tracked follow-up.
+	warnAltManager(dir)
 
 	// 1. Ephemeral proxy: exists only for this command (§5).
 	proxy, err := registry.Start(cfg)

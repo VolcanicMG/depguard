@@ -148,7 +148,10 @@ npm test             # builds the binary (globalSetup), runs the e2e suite
   protection can't help once you run the code on purpose.
 - `guard install` is npm-shaped (it wraps npm). pnpm and yarn are covered by the
   **check** path (`guard check` reads `pnpm-lock.yaml` / `yarn.lock` for
-  advisory/cooldown/integrity), not the install-time proxy.
+  advisory/cooldown/integrity), not the install-time proxy. When a repo carries a
+  `pnpm-lock.yaml` / `yarn.lock`, `guard install` **warns** that a direct
+  `pnpm install` / `yarn install` bypasses the install-time filter — so the gap is
+  loud, not silent. (Full pnpm/yarn install proxying is a tracked follow-up.)
 - Signature verification **blocks only present-but-invalid** signatures; unsigned
   versions pass, because most of the ecosystem still is. Maintainer-change and the
   per-version capability diff are **opt-in** (`flag:`) — they fetch a packument per
