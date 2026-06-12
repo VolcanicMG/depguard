@@ -60,8 +60,39 @@ others.
 - Go toolchain lives at `~/.local/go/bin/go` (not on PATH); override in tests with
   `GUARD_GO=/path/to/go`.
 
+## Testing — required, regression-first
+
+Security IS the product here, so we test as much as we can. **This repo OVERRIDES
+the parent's "no tests unless asked" rule:** every behavior change ships with tests
+in the same change. The goal is a net dense enough that a future edit cannot
+silently regress a check — when we make changes, the tests are what stop us
+breaking something elsewhere.
+
+Two layers, both zero-dep:
+
+| Layer | Tool | Covers | Lives in |
+|---|---|---|---|
+| **Unit** | Go stdlib `testing` | internal logic in isolation — parsers, matchers, the scan/trace/proxy decision functions, fail-closed branches | `internal/<pkg>/*_test.go` |
+| **E2E** | vitest + mock registry | the real compiled binary end-to-end (install / check / scan / mcp) | `test/*.test.mjs` |
+
+Rules:
+- **Test in the same change as the behavior.** A new check, filter, parser, or
+  fail-closed branch is not done until a test pins it. A bug fix gets a test that
+  fails *before* the fix (see `hasPathFragment`, `Check` non-200 → error).
+- **Characterize before refactoring.** Before changing a hot path (e.g. the
+  scanner), land tests for the CURRENT behavior first so the refactor proves it
+  preserved them.
+- **Cover the negative + fail-closed cases**, not just the happy path: the
+  look-alike that must NOT match, the non-200 that must fail loud, the bomb that
+  must be flagged, the dedup that must collapse to one finding.
+- Make an internal knob a `var` (not `const`) when a test needs to trip a bound
+  cheaply (see `maxArchiveBytes`, `maxArchiveEntries`, `maxOSVResponse`).
+- Before calling a change done: `~/.local/go/bin/go test ./...` (unit) **and** the
+  `test/` e2e suite (per `test/README.md`) must both be green.
+
 ## Inherited rules
 
 The parent `~/repos/CLAUDE.md` applies (SOLID, version-pegging, ask before any git
-action, no tests unless asked, JSDoc/comment-the-why).
+action, JSDoc/comment-the-why). **Exception: the parent's "no tests unless asked"
+does NOT apply here** — see Testing above; tests are required for every change.
 This file refines it for depguard; on conflict, this file wins for repo-specific points.

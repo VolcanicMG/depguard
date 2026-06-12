@@ -1,9 +1,17 @@
 # depguard test suite — how it works
 
-Black-box end-to-end tests: vitest spawns the **real compiled `guard` binary**
-and asserts on its observable behavior (exit codes, stderr, what landed on
-disk). No Go internals are tested directly — the contract under test is the
-same one users get.
+Two layers, both zero-dependency:
+
+- **Go unit tests** (`internal/<pkg>/*_test.go`, stdlib `testing`) pin internal
+  logic in isolation — parsers, matchers, fail-closed branches, the scan/trace
+  decision functions. Run with `~/.local/go/bin/go test ./...`. Fast, no registry
+  or docker needed. This is the regression net for the security checks.
+- **Black-box e2e** (this directory) — vitest spawns the **real compiled `guard`
+  binary** and asserts on observable behavior (exit codes, stderr, what landed on
+  disk). The contract under test is the same one users get.
+
+The rest of this file documents the e2e layer (the Go unit tests are ordinary
+`go test` files next to the code they cover).
 
 ## Run it
 
