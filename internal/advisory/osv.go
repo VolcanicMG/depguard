@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -22,10 +23,16 @@ type Vuln struct {
 }
 
 // osvBatchURL is OSV's bulk endpoint: one POST covers a whole lockfile.
-const osvBatchURL = "https://api.osv.dev/v1/querybatch"
+// var (not const) so a test can repoint it at a local httptest server.
+var osvBatchURL = "https://api.osv.dev/v1/querybatch"
 
 // batchSize stays under OSV's request limits while keeping round-trips low.
 const batchSize = 500
+
+// maxOSVResponse caps bytes read from OSV's response. A compromised or MITM'd
+// endpoint can't exhaust memory with an unbounded JSON stream; a batch answer
+// for 500 queries is well under this.
+var maxOSVResponse int64 = 32 << 20 // 32 MiB (var so a test can lower it)
 
 // CheckVersions queries OSV for several versions of ONE package and returns
 // the versions that carry at least one advisory, mapped to the first hit's id.
@@ -77,6 +84,14 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 		if err != nil {
 			return nil, fmt.Errorf("osv query: %w", err)
 		}
+		// Fail LOUD on a non-200. OSV is a security gate (the hooks/CI block on
+		// its verdict); a 429 (rate-limit) or 5xx must surface as an error, not
+		// decode to an empty result set that reads as "no advisories" — that
+		// would let an OSV outage or a rate-limit quietly turn the gate green.
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("osv query: unexpected status %d", resp.StatusCode)
+		}
 		var parsed struct {
 			Results []struct {
 				Vulns []struct {
@@ -85,7 +100,7 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 				} `json:"vulns"`
 			} `json:"results"`
 		}
-		err = json.NewDecoder(resp.Body).Decode(&parsed)
+		err = json.NewDecoder(io.LimitReader(resp.Body, maxOSVResponse)).Decode(&parsed)
 		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("osv response: %w", err)

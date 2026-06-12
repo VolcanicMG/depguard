@@ -141,11 +141,44 @@ func isSecretPath(path string) bool {
 		}
 	}
 	for _, frag := range secretFragments {
-		if strings.Contains(path, frag) {
+		if hasPathFragment(path, frag) {
 			return true
 		}
 	}
 	return false
+}
+
+// hasPathFragment reports whether frag occurs in path on PATH BOUNDARIES, not
+// as an arbitrary substring. Plain strings.Contains false-positives on names
+// like "id_rsa_helper" or ".ssh-config", and a false UNSAFE verdict discards a
+// legitimate build's output — the exact noise DESIGN.md §11b warns trains a
+// team to disable the tool. A match requires frag to begin at the path start or
+// just after a '/' (unless frag is itself '/'-anchored) and to end at the path
+// end or just before a '/'.
+func hasPathFragment(path, frag string) bool {
+	if frag == "" {
+		return false
+	}
+	for i := 0; ; {
+		j := strings.Index(path[i:], frag)
+		if j < 0 {
+			return false
+		}
+		start := i + j
+		end := start + len(frag)
+		// Left edge: frag is '/'-anchored, at the path start, or right after '/'.
+		leftOK := frag[0] == '/' || start == 0 || path[start-1] == '/'
+		// Right edge: end of path, a '/' (deeper path), or a '.' (extension/
+		// suffix) — so "/.docker/config" matches "config.json" and ".npmrc"
+		// matches a ".npmrc.bak" backup that still holds the token. A letter,
+		// digit, '-' or '_' after means a LONGER name ("id_rsa_helper",
+		// ".ssh-config") and is NOT a match.
+		rightOK := end == len(path) || path[end] == '/' || path[end] == '.'
+		if leftOK && rightOK {
+			return true
+		}
+		i = start + 1
+	}
 }
 
 // isLoopback covers IPv4 127/8 and IPv6 ::1.
