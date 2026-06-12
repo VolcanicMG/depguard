@@ -9,6 +9,7 @@
 package scanner
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Severity buckets findings for display ordering.
@@ -122,9 +124,21 @@ var injectionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(do not|don't|never) (tell|inform|alert|warn|flag|report|mention)`),
 }
 
-// maxScanBytes caps per-file reads; minified bundles past this size get
-// scanned only in their head, keeping scans fast on huge packages.
-const maxScanBytes = 1 << 20 // 1 MiB
+// Streaming-scan knobs. We scan every file IN FULL (not just a head) by sliding
+// a window over it: scanChunk fresh bytes per read, carrying scanOverlap bytes
+// between windows so a match straddling a seam is still found. Memory per file
+// is ~scanChunk+scanOverlap regardless of file size, and Go's RE2 engine makes
+// matching linear (no ReDoS), so full coverage is not a DoS vector.
+const (
+	scanChunk   = 1 << 20  // 1 MiB: fresh bytes per window
+	scanOverlap = 64 << 10 // 64 KiB: carried between windows (>> longest pattern)
+)
+
+// maxFileScanBytes is the per-file ceiling: full coverage below it (covers
+// essentially every real source/bundle file), flag-and-stop above it so a single
+// pathological file can't burn unbounded CPU. The tarball path is additionally
+// bounded by maxArchiveBytes. var (not const) so a test can lower it cheaply.
+var maxFileScanBytes int64 = 64 << 20 // 64 MiB
 
 // ReadScripts returns just the install-phase scripts from a package dir —
 // the cheap check (one small file read) that decides whether the expensive
@@ -180,11 +194,12 @@ func ScanDir(dir string) (Report, error) {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, path)
-		src, rerr := readCapped(path)
-		if rerr != nil {
+		f, oerr := os.Open(path)
+		if oerr != nil {
 			return nil // unreadable file: skip, don't fail the whole scan
 		}
-		scanFile(rel, src, &rep, seen)
+		scanFileStream(rel, f, &rep, seen)
+		_ = f.Close()
 		return nil
 	})
 	return rep, err
@@ -194,11 +209,11 @@ func ScanDir(dir string) (Report, error) {
 // the capability patterns (code only), and the injection/Unicode checks (code
 // and text). Shared by the directory scan and the tarball scan so both judge a
 // file identically. seen dedupes each distinct signal across the package.
-func scanFile(rel string, src []byte, rep *Report, seen map[string]bool) {
+func scanFileStream(rel string, r io.Reader, rep *Report, seen map[string]bool) {
 	// Prebuilt binaries ship as opaque bytes — we can't scan a .node addon or a
 	// bundled executable as source, so the most we can do is flag that one is
 	// present (a native addon or, worse, a stowaway binary). Checked on name
-	// alone, so it works even when we don't read the (binary) content.
+	// alone, so it works even when we never read the (binary) content.
 	const binWhat = "ships a prebuilt binary (opaque to source scanning)"
 	if binaryExts[filepath.Ext(rel)] && !seen[binWhat] {
 		seen[binWhat] = true
@@ -206,12 +221,65 @@ func scanFile(rel string, src []byte, rep *Report, seen map[string]bool) {
 	}
 	code, text := isCodeFile(rel), isTextFile(rel)
 	if !code && !text {
-		return
+		return // not scanned as source; the caller need not have read r
 	}
-	if code {
-		scanPatterns(rel, src, capabilityFinders, rep, seen)
+	scanReader(rel, r, code, rep, seen)
+}
+
+// scanReader streams r through the capability + injection sweeps with bounded
+// memory, scanning the file IN FULL rather than only its head. It reads in
+// scanChunk windows, prepending scanOverlap bytes of the previous window so a
+// match across a seam is still caught; lineBase keeps Where line numbers exact
+// across windows. A file past maxFileScanBytes is scanned to the ceiling and
+// flagged (so a pathological input can't run matching unbounded).
+func scanReader(rel string, r io.Reader, code bool, rep *Report, seen map[string]bool) {
+	var (
+		carry    []byte // tail of the previous window, re-scanned with the next
+		lineBase int    // newlines before carry[0]; line of carry[0] == lineBase+1
+		total    int64  // bytes pulled from r so far
+		buf      = make([]byte, scanChunk)
+	)
+	for {
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			total += int64(n)
+			// Build an independent window = carry + fresh, so appending fresh
+			// bytes can never clobber the carry backing array.
+			window := make([]byte, 0, len(carry)+n)
+			window = append(window, carry...)
+			window = append(window, buf[:n]...)
+
+			if code {
+				scanPatterns(rel, window, capabilityFinders, rep, seen, lineBase)
+			}
+			scanInjection(rel, window, code, rep, seen, lineBase)
+
+			// Carry the last scanOverlap bytes forward. Back the cut up to a
+			// UTF-8 rune boundary so the next window's rune decode (bidi /
+			// zero-width) sees whole runes, never a half rune split at the seam.
+			keep := scanOverlap
+			if keep > len(window) {
+				keep = len(window)
+			}
+			cut := len(window) - keep
+			for cut > 0 && !utf8.RuneStart(window[cut]) {
+				cut--
+			}
+			lineBase += bytes.Count(window[:cut], []byte{'\n'})
+			carry = append([]byte(nil), window[cut:]...)
+		}
+		if err != nil {
+			return // io.EOF, io.ErrUnexpectedEOF (last partial), or a read error
+		}
+		if total >= maxFileScanBytes {
+			rep.Findings = append(rep.Findings, Finding{
+				Severity: Warn,
+				What:     fmt.Sprintf("scanned only the first %d MiB; the rest is uninspected (payload could hide past the cap)", maxFileScanBytes>>20),
+				Where:    rel,
+			})
+			return
+		}
 	}
-	scanInjection(rel, src, code, rep, seen)
 }
 
 // binaryExts are file types that are compiled/opaque, not source — a package
@@ -240,7 +308,7 @@ type finder struct {
 
 // scanPatterns records the first match of each finder in src (deduped by What
 // across the whole package via seen), tagging it with rel:line.
-func scanPatterns(rel string, src []byte, finders []finder, rep *Report, seen map[string]bool) {
+func scanPatterns(rel string, src []byte, finders []finder, rep *Report, seen map[string]bool, lineBase int) {
 	for _, f := range finders {
 		if seen[f.what] {
 			continue
@@ -250,7 +318,7 @@ func scanPatterns(rel string, src []byte, finders []finder, rep *Report, seen ma
 			rep.Findings = append(rep.Findings, Finding{
 				Severity: f.sev,
 				What:     f.what,
-				Where:    fmt.Sprintf("%s:%d", rel, lineAt(src, loc[0])),
+				Where:    fmt.Sprintf("%s:%d", rel, lineBase+lineAt(src, loc[0])),
 			})
 		}
 	}
@@ -260,7 +328,7 @@ func scanPatterns(rel string, src []byte, finders []finder, rep *Report, seen ma
 // bidirectional control characters (the Trojan-Source attack — only meaningful
 // in code), and zero-width characters used to hide content. All are deduped by
 // What across the package so one finding flags the whole package.
-func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[string]bool) {
+func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[string]bool, lineBase int) {
 	const injWhat = "embedded instructions aimed at an LLM/agent reviewer"
 	if !seen[injWhat] {
 		for _, re := range injectionPatterns {
@@ -269,7 +337,7 @@ func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[stri
 				rep.Findings = append(rep.Findings, Finding{
 					Severity: Danger,
 					What:     injWhat,
-					Where:    fmt.Sprintf("%s:%d", rel, lineAt(src, loc[0])),
+					Where:    fmt.Sprintf("%s:%d", rel, lineBase+lineAt(src, loc[0])),
 				})
 				break
 			}
@@ -288,7 +356,7 @@ func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[stri
 			rep.Findings = append(rep.Findings, Finding{
 				Severity: Danger,
 				What:     bidiWhat,
-				Where:    fmt.Sprintf("%s:%d (U+%04X)", rel, lineAt(src, off), r),
+				Where:    fmt.Sprintf("%s:%d (U+%04X)", rel, lineBase+lineAt(src, off), r),
 			})
 		}
 		if isZeroWidth(r) && !seen[zwWhat] {
@@ -302,7 +370,7 @@ func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[stri
 				rep.Findings = append(rep.Findings, Finding{
 					Severity: Warn,
 					What:     zwWhat,
-					Where:    fmt.Sprintf("%s:%d (U+%04X)", rel, lineAt(src, off), r),
+					Where:    fmt.Sprintf("%s:%d (U+%04X)", rel, lineBase+lineAt(src, off), r),
 				})
 			}
 		}
@@ -311,18 +379,6 @@ func scanInjection(rel string, src []byte, code bool, rep *Report, seen map[stri
 
 // lineAt returns the 1-based line number of byte offset off in src.
 func lineAt(src []byte, off int) int { return 1 + strings.Count(string(src[:off]), "\n") }
-
-// readCapped reads up to maxScanBytes of path. Uses io.LimitReader so a short
-// Read can't leave the buffer half-filled (the old single f.Read could under-
-// read), while still bounding work on huge minified bundles.
-func readCapped(path string) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxScanBytes))
-}
 
 // codeExts / textBases decide which files get which sweep.
 var codeExts = map[string]bool{

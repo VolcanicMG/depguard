@@ -118,7 +118,10 @@ Inside, per request:
    │
  npm resolves normally — it never sees the risky version, picks newest safe one
    │
- tarball request → proxy streams it through, runs the scan (§6), caches by hash
+ tarball request → proxy streams it through UNMODIFIED (npm verifies the
+   integrity hash itself, which doubles as the tamper check). The §6 static
+   scan is not inline here — it runs at APPROVAL time on the few script-bearing
+   packages (and as the capability diff against the prior version), cached by hash
 ```
 
 **Decision engine filters** (ordered cheap → expensive):
@@ -148,6 +151,15 @@ ever, reused forever).
 
 Highest-signal cheap wins: **capability diff** (good package turning bad) and
 **provenance** (publish differs from source).
+
+The tarball scanner reads under a **total decompression budget** (256 MiB) and an
+entry-count cap, so a gzip bomb is *flagged*, never run unbounded. Within that
+budget **every file is scanned in full**: a sliding window (1 MiB + a 64 KiB
+overlap, so a match across a seam still counts) streams the whole file at constant
+memory, and Go's RE2 engine keeps matching linear — full coverage is not a ReDoS
+or memory-exhaustion vector. A per-file ceiling (64 MiB) backstops a pathological
+input: beyond it the scan stops and says so. So a payload padded past 1 MiB is now
+*found*, not an unseen blind spot.
 
 ---
 
