@@ -180,6 +180,12 @@ Tips:
   where there's no sandbox, or `--deny` to refuse). Commit `.guard-approvals`.
 - **`untraced-boxed: fail`** for shops that won't accept output they couldn't
   observe (the strace image failed to build, e.g. offline).
+- **An uncontained run is still env-scrubbed** — even when you approve a bare run
+  (no sandbox), the script inherits only `PATH`/`HOME`/`LANG`/`TMPDIR`, never the
+  API tokens in your shell. It's damage limitation, not containment.
+- **Reclaim space with `guard clean`** — removes the locally-built strace image
+  (`depguard-box`) and any stray backup/trace leftovers from a hard-killed run.
+  Offline and idempotent; the image just rebuilds on the next boxed script.
 
 ---
 

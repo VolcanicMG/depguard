@@ -452,9 +452,20 @@ agents.
                                     three managers. (install stays npm-shaped.)
    → io_uring/seccomp               box runs under a seccomp profile blocking
                                     io_uring_* (else network I/O is invisible to
-                                    strace) + bpf/perf/userfaultfd/kexec.
+                                    strace) + the kernel keyring (keyctl/add_key/
+                                    request_key — no-cap-required) + bpf/perf/
+                                    userfaultfd/kexec. A DENYLIST on an allow-by-
+                                    default base, NOT a brittle full allowlist:
+                                    a hand-rolled allowlist breaks node-gyp (the
+                                    §11b false-positive trap), and --cap-drop ALL
+                                    already covers the capability-gated syscalls.
    → box resource caps              --memory/--cpus + a wall-clock kill (a miner
                                     that just spins is bounded).
+   → box cleanup                    the run container is NAMED and force-removed
+                                    on a wall-clock kill (--rm only fires on a
+                                    clean CLI exit); `guard clean` reclaims the
+                                    locally-built strace image + any stray
+                                    backup/obs leftovers a killed run left behind.
    → more scan signals              wallet/clipboard paths, os.homedir, dynamic
                                     require/import, process.binding, bundled
                                     prebuilt binaries (.node/.wasm/.exe...).

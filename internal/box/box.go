@@ -60,8 +60,20 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends strace 
 //     strace's syscall tracing — a script could connect()/sendto() through a
 //     ring and our observer would see nothing. Blocking it forces all I/O back
 //     through observable syscalls.
+//   - keyctl / add_key / request_key: the kernel keyring — credential storage a
+//     build never touches. These need NO capability, so --cap-drop does not
+//     cover them; blocking here removes a stash/read-keys avenue strace would
+//     also not see clearly.
 //   - bpf / perf_event_open / userfaultfd / kexec_*: kernel-attack surface a
 //     build never needs.
+//
+// This stays a DENYLIST on an allow-by-default base rather than a full
+// default-deny allowlist ON PURPOSE: a hand-rolled allowlist reliably breaks
+// node-gyp across kernels/arches (the false-positive fatigue DESIGN.md §11b
+// warns trains users to disable the tool), and the box's real containment
+// (--cap-drop ALL, --network none, no-new-privileges, non-root) already
+// neutralizes the capability-gated syscalls. We add the few no-cap-required
+// dangerous ones explicitly.
 //
 // Deliberately NOT blocked: ptrace and process_vm_readv — strace uses those to
 // read the tracee's string arguments (the DNS payloads we decode). The profile
@@ -72,7 +84,7 @@ const seccompProfile = `{
   "defaultAction": "SCMP_ACT_ALLOW",
   "syscalls": [
     {
-      "names": ["io_uring_setup","io_uring_enter","io_uring_register","bpf","perf_event_open","userfaultfd","kexec_load","kexec_file_load"],
+      "names": ["io_uring_setup","io_uring_enter","io_uring_register","keyctl","add_key","request_key","bpf","perf_event_open","userfaultfd","kexec_load","kexec_file_load"],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1
     }
@@ -119,6 +131,65 @@ func EnsureObsImage(runtime string) (string, bool) {
 		return buildImage, false
 	}
 	return obsImage, true
+}
+
+// ObsImageName is the tag of the locally-built observation image (for status
+// and clean reporting).
+func ObsImageName() string { return obsImage }
+
+// RemoveObsImage deletes the locally-built observation image to reclaim its
+// space. It is safe (and a no-op) when no runtime exists or the image is
+// absent; returns whether anything was removed.
+func RemoveObsImage(runtime string) (bool, error) {
+	if runtime == "" {
+		return false, nil
+	}
+	if exec.Command(runtime, "image", "inspect", obsImage).Run() != nil {
+		return false, nil // not present
+	}
+	if out, err := exec.Command(runtime, "rmi", obsImage).CombinedOutput(); err != nil {
+		return false, fmt.Errorf("removing %s: %s", obsImage, strings.TrimSpace(string(out)))
+	}
+	return true, nil
+}
+
+// SweepArtifacts removes on-disk leftovers a HARD-KILLED box run could leave
+// behind — the normal run path already cleans these via defer, so this is the
+// recovery hook for a guard process killed mid-run:
+//   - "*.guard-backup" sibling dirs anywhere under node_modules (pre-run backups)
+//   - "guard-obs-*" temp dirs (strace logs)
+//   - the shared seccomp profile temp file
+//
+// Returns the count removed. Best-effort: an unremovable item is skipped, never
+// fatal.
+func SweepArtifacts(projectDir string) int {
+	removed := 0
+	nm := filepath.Join(projectDir, "node_modules")
+	_ = filepath.WalkDir(nm, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && strings.HasSuffix(path, ".guard-backup") {
+			if os.RemoveAll(path) == nil {
+				removed++
+			}
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if entries, err := os.ReadDir(os.TempDir()); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "guard-obs-") {
+				if os.RemoveAll(filepath.Join(os.TempDir(), e.Name())) == nil {
+					removed++
+				}
+			}
+		}
+	}
+	if os.Remove(filepath.Join(os.TempDir(), "depguard-seccomp.json")) == nil {
+		removed++
+	}
+	return removed
 }
 
 // Result is what the box observed during one script run.
@@ -189,8 +260,11 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 		script = `strace -f -qq -e trace=%network,execve,openat -s 512 -o /obs/trace.log sh -c '` + script + `'`
 	}
 
+	// Name the container so a timed-out (SIGKILL'd) run can still be force-removed
+	// below — --rm only fires on a clean CLI exit, not when we kill it.
+	containerName := fmt.Sprintf("depguard-run-%d-%d", os.Getpid(), time.Now().UnixNano())
 	args := []string{
-		"run", "--rm",
+		"run", "--rm", "--name", containerName,
 		"--network", "none", // no phone line
 		"--read-only",               // image is immutable
 		"--tmpfs", "/tmp:size=512m", // scratch space
@@ -240,6 +314,8 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 	out, runErr := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		out = append(out, []byte(fmt.Sprintf("\nguard: box killed after %s wall-clock limit\n", boxTimeout))...)
+		// The killed CLI may not have run --rm; make sure the container is gone.
+		_ = exec.Command(runtime, "rm", "-f", containerName).Run()
 	}
 
 	res := Result{Output: string(out), Traced: traced}
@@ -293,6 +369,21 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 	return res, nil
 }
 
+// scrubbedEnv is the minimal environment an uncontained script inherits: enough
+// to find a toolchain and a home, but NONE of the caller's secrets. The human
+// approved running the script, not handing it every API token in their shell —
+// so a leaked $NPM_TOKEN / $AWS_SECRET_ACCESS_KEY / $GITHUB_TOKEN can't ride
+// along. Kept separate so a test can assert exactly what does (and does not)
+// pass through.
+func scrubbedEnv() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"LANG=" + os.Getenv("LANG"),
+		"TMPDIR=" + os.TempDir(),
+	}
+}
+
 // RunUncontained executes install scripts with NO sandbox — the §9
 // warn-approve path only. The caller is responsible for having obtained
 // explicit human approval before calling this.
@@ -304,12 +395,7 @@ func RunUncontained(pkgDir string) (Result, error) {
 	cmd := exec.Command("sh", "-c",
 		`for s in preinstall install postinstall; do npm run "$s" --if-present --foreground-scripts || exit $?; done`)
 	cmd.Dir = pkgDir
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		"LANG=" + os.Getenv("LANG"),
-		"TMPDIR=" + os.TempDir(),
-	}
+	cmd.Env = scrubbedEnv()
 	out, runErr := cmd.CombinedOutput()
 	res := Result{Output: string(out)}
 	if exitErr, ok := runErr.(*exec.ExitError); ok {

@@ -71,6 +71,8 @@ func main() {
 		err = cmdConfig(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "clean":
+		err = cmdClean(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
 	case "version", "--version", "-v":
@@ -101,9 +103,39 @@ func usage(w io.Writer) {
   guard ignore <issue-id>         waive a reviewed check finding (--reason, --expires, --list, --remove)
   guard allow <pattern>...        add a name/scope to .guardrc allow (bypass cooldown)
   guard config [get | set <k> <v>]  show or edit .guardrc policy
+  guard clean                     remove the sandbox image + stray run artifacts
   guard help                      show this message
   guard version
 `)
+}
+
+// cmdClean reclaims depguard's footprint: the locally-built observation image
+// (`depguard-box`) and any on-disk leftovers a HARD-KILLED box run left behind
+// (pre-run backups, strace temp dirs, the seccomp temp file). OFFLINE and
+// idempotent — it removes nothing a future run can't rebuild, so it is always
+// safe to run.
+func cmdClean(args []string) error {
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	runtime := box.Runtime()
+	removedImage, rmErr := box.RemoveObsImage(runtime)
+	if rmErr != nil {
+		fmt.Fprintln(os.Stderr, "guard:", rmErr)
+	}
+	swept := box.SweepArtifacts(dir)
+
+	switch {
+	case runtime == "":
+		fmt.Println(ui.Warn(), "no container runtime — skipped image cleanup")
+	case removedImage:
+		fmt.Println(ui.OK(), "removed observation image", box.ObsImageName())
+	default:
+		fmt.Println(ui.OK(), "observation image not present — nothing to remove")
+	}
+	fmt.Printf("%s swept %d stray artifact(s) (backups / obs logs)\n", ui.OK(), swept)
+	return nil
 }
 
 // ─── guard init ──────────────────────────────────────────────────────────────

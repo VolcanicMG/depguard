@@ -51,6 +51,7 @@ guard approve <name@version> [--uncontained|--deny]   # script decisions
 guard ignore <issue-id> [--reason ".."] [--expires 30d]  # waive a REVIEWED check finding (--list, --remove)
 guard allow <pattern>...                 # add a name/scope to .guardrc allow (bypass cooldown)
 guard config [get | set <k> <v>]         # show or edit .guardrc policy
+guard clean           # remove the sandbox image + stray run artifacts (offline, idempotent)
 guard mcp             # run as an MCP server over stdio (tools: scan_package, check_dependencies)
 ```
 
@@ -102,7 +103,7 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 | Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
 | Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
-| Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval |
+| Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard clean` reclaims the image |
 | `guard check` on commit/PR | newly-reported advisories AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
