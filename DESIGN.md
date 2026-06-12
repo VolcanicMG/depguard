@@ -487,9 +487,12 @@ agents.
  FAIL-CLOSED PARSING:
    → ignore-scripts (and bools) error on a typo'd value instead of silently
      going unsafe; unknown .guardrc keys warn.
-   → OSV queries fail LOUD on a non-200 (rate-limit / outage) instead of
-     decoding to an empty result that reads as "no advisories" — an OSV
-     hiccup can never silently turn the gate green; the body is size-capped.
+   → OSV non-200s (rate-limit / outage) surface as an explicit lookup error
+     instead of mis-decoding to an empty "no advisories". The advisory layer
+     stays FAIL-OPEN for availability (an OSV outage must not block every
+     commit) but no longer SILENTLY: the prose check warns, and guard check
+     --json / MCP record it in CheckResult.degraded, so a green result cannot
+     hide that the advisory layer did not run. Body is size-capped.
 ```
 
 ## 13. Reviewed-finding waivers (v0.6.0 — .guard-ignores)

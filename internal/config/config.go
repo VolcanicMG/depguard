@@ -314,9 +314,21 @@ func parseDays(s string) (time.Duration, error) {
 		if err != nil {
 			return 0, fmt.Errorf("bad cooldown %q", s)
 		}
+		if n < 0 {
+			return 0, fmt.Errorf("cooldown cannot be negative: %q", s)
+		}
 		return time.Duration(n) * 24 * time.Hour, nil
 	}
-	return time.ParseDuration(s)
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		// A negative cooldown moves the cutoff into the future and silently
+		// disables the filter — reject it rather than fail open.
+		return 0, fmt.Errorf("cooldown cannot be negative: %q", s)
+	}
+	return d, nil
 }
 
 // parseList parses [a, b, "c"] into a string slice.

@@ -697,7 +697,12 @@ type CheckResult struct {
 	NewDeps     []string              `json:"newDeps"`
 	Maintainers []maintainer.Change   `json:"maintainerChanges"`
 	Waived      []string              `json:"waived,omitempty"`
-	OK          bool                  `json:"ok"`
+	// Degraded names layers that could NOT run this check (e.g. OSV unreachable,
+	// a registry fetch failed). The check stays fail-open — these don't flip OK —
+	// but a non-empty Degraded means a green result is INCOMPLETE, not proven
+	// clean. Surfacing it is what keeps --json/MCP from hiding an outage.
+	Degraded []string `json:"degraded,omitempty"`
+	OK       bool     `json:"ok"`
 }
 
 // ─── waiver identity + filtering ─────────────────────────────────────────────
@@ -788,8 +793,17 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		}
 		return res, err
 	}
-	if v, err := advisory.Check(pkgs); err == nil {
-		res.Advisories = activeAdvisories(v, wf, now, &res.Waived)
+	// OSV is meaningless for a loopback/mock registry (those versions aren't in
+	// OSV's public npm namespace) — same skip the proxy applies. For a real
+	// registry, a lookup failure is recorded as DEGRADED rather than swallowed:
+	// the advisory layer stays fail-open (an OSV outage must not block every
+	// commit), but a green --json/MCP result can no longer hide that it didn't run.
+	if !isLoopbackHost(hostOf(cfg.Registry)) {
+		if v, err := advisory.Check(pkgs); err != nil {
+			res.Degraded = append(res.Degraded, "advisory check skipped: "+err.Error())
+		} else {
+			res.Advisories = activeAdvisories(v, wf, now, &res.Waived)
+		}
 	}
 	regHost := hostOf(cfg.Registry)
 	for _, p := range pkgs {
@@ -828,9 +842,12 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			fresh = add
 		}
 	}
-	if viol, _ := freshness.Check(cfg.Registry, fresh, cfg.Cooldown, cfg.Allowed); len(viol) > 0 {
+	viol, warns := freshness.Check(cfg.Registry, fresh, cfg.Cooldown, cfg.Allowed)
+	if len(viol) > 0 {
 		res.Cooldown = activeCooldown(viol, wf, now, &res.Waived)
 	}
+	// Per-package fetch failures are fail-open too — but recorded, not dropped.
+	res.Degraded = append(res.Degraded, warns...)
 	if cfg.Flagged("new-maintainer") {
 		if ch, _ := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed); len(ch) > 0 {
 			res.Maintainers = ch
