@@ -62,7 +62,7 @@ lands:
 ```
  your-project/
  ├── .guardrc            ◄ policy (cooldown, scopes, fallback) — COMMIT IT
- ├── .npmrc              ◄ ignore-scripts=true so even raw `npm install` can't run scripts
+ ├── .npmrc              ◄ ignore-scripts=true (raw `npm install` can't run scripts) + save-exact=true (deps pinned, no ^/~)
  ├── .git/hooks/         ◄ pre-commit + pre-push shims that call the global `guard check`
  └── .github/workflows/  ◄ (--ci only) the PR gate template — see §6
 ```

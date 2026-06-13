@@ -328,6 +328,9 @@ Closed in the lockdown review before multi-repo rollout:
 ```
  BYPASS: plain npm / npx / npm ci skip guard entirely
    → .npmrc ignore-scripts=true written by guard init  (raw npm can't run scripts)
+   → .npmrc save-exact=true + save-prefix= written by guard init  (new deps
+     pinned to the exact installed version — no ^/~ range drift when a later
+     `npm install` re-resolves; bump deliberately, never silently)
    → guard check now re-verifies the COOLDOWN on lockfile versions added
      since git HEAD (hooks/CI = enforcement point for any install path)
    → guard ci command wraps lockfile-exact installs

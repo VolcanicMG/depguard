@@ -1592,19 +1592,24 @@ func boolState(on bool, yes, no string) string {
 	return ui.Dim("— " + no)
 }
 
-// npmrcState reports whether .npmrc pins ignore-scripts and is committed.
+// npmrcState reports whether .npmrc pins ignore-scripts + save-exact and is
+// committed.
 func npmrcState(dir string) string {
 	b, err := os.ReadFile(filepath.Join(dir, ".npmrc"))
 	if err != nil {
 		return ui.Dim("— absent")
 	}
-	if !strings.Contains(string(b), "ignore-scripts=true") {
+	s := string(b)
+	if !strings.Contains(s, "ignore-scripts=true") {
 		return ui.Warn() + " present, ignore-scripts NOT set"
 	}
-	if gitTracked(dir, ".npmrc") {
-		return ui.OK() + " ignore-scripts set, tracked"
+	if !strings.Contains(s, "save-exact=true") {
+		return ui.Warn() + " ignore-scripts set, save-exact NOT set"
 	}
-	return ui.Warn() + " ignore-scripts set, NOT committed"
+	if gitTracked(dir, ".npmrc") {
+		return ui.OK() + " ignore-scripts + save-exact set, tracked"
+	}
+	return ui.Warn() + " ignore-scripts + save-exact set, NOT committed"
 }
 
 // lookState reports whether a binary is on PATH.

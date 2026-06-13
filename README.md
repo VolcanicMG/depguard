@@ -14,6 +14,7 @@ Step-by-step: [SETUP.md](SETUP.md).
  │ only) filters what npm SEES  │  invisible → npm picks a safe one itself
  └─────────────────────────────┘
        │  --ignore-scripts: lifecycle scripts never auto-run
+       │  save-exact: new deps pinned to the exact version (no ^/~)
        ▼
  script-bearing packages (the few) → static scan shown → you approve once
        │                              → script runs BOXED + TRACED (docker:
@@ -69,7 +70,7 @@ respects `NO_COLOR`.
 | `.guardrc` | policy: cooldown, allowed scopes, fallback mode — **review changes in PRs** (it controls the filter) |
 | `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
-| `.npmrc` | `ignore-scripts=true` so even raw `npm install` can't run scripts |
+| `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
 
 ## Waiving a reviewed finding
 
@@ -104,6 +105,7 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 | Maintainer-change (opt-in) | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 | Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
 | Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
+| Exact version pinning (`.npmrc` `save-exact`) | silent range drift — a later `npm install` pulling a freshly-compromised `^`/`~` patch you never chose; deps stay at the version you vetted until you bump manually |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
 | `guard check` on commit/PR | newly-reported advisories AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds |

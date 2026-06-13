@@ -106,28 +106,49 @@ func installHook(hookDir, h string) (string, error) {
 	return path, os.WriteFile(path, []byte(content), 0o755)
 }
 
-// npmrcLine hard-disables lifecycle scripts at the npm-config level. This is
-// the backstop for installs that DON'T go through guard: a teammate running
-// plain `npm install` in this repo gets script neutralization anyway,
-// because npm itself reads this file.
-const npmrcLine = "ignore-scripts=true\n"
+// npmrcSettings are the npm-config keys depguard pins at the .npmrc level. This
+// is the backstop for installs that DON'T go through guard: a teammate running
+// plain `npm install` in this repo still gets these, because npm itself reads
+// this file. Each entry carries the substring used to detect a pre-existing
+// setting (so we never clobber a human's choice) and the block to append.
+//
+//   ignore-scripts=true  lifecycle scripts never auto-run; 'guard install'
+//                        handles approvals.
+//   save-exact=true /    new deps are written at their exact resolved version
+//   save-prefix=         (e.g. "react": "19.1.0"), never a "^"/"~" range — so a
+//                        version changes only when you deliberately bump it,
+//                        never silently on a later install. save-prefix= is the
+//                        belt-and-suspenders backstop if save-exact is unset.
+var npmrcSettings = []struct{ key, block string }{
+	{"ignore-scripts", "# depguard: never auto-run lifecycle scripts; 'guard install' handles approvals.\nignore-scripts=true\n"},
+	{"save-exact", "# depguard: pin new deps to the exact installed version (no ^/~); bump manually.\nsave-exact=true\nsave-prefix=\n"},
+}
 
-// installNpmrc writes (or appends to) the repo's .npmrc so raw npm installs
-// are also script-neutralized. Never duplicates the line.
+// installNpmrc writes (or appends to) the repo's .npmrc so raw npm installs are
+// also script-neutralized and version-pinned. Each setting is appended only if
+// absent, so a human's existing choice for any one of them is left untouched.
+// Returns true if anything was written.
 func installNpmrc(dir string) (bool, error) {
 	path := filepath.Join(dir, ".npmrc")
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	if strings.Contains(string(existing), "ignore-scripts") {
-		return false, nil // already configured (either value) — human's choice stands
-	}
 	content := string(existing)
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		content += "\n"
+	wrote := false
+	for _, s := range npmrcSettings {
+		if strings.Contains(content, s.key) {
+			continue // already configured (either value) — human's choice stands
+		}
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		content += s.block
+		wrote = true
 	}
-	content += "# depguard: never auto-run lifecycle scripts; 'guard install' handles approvals.\n" + npmrcLine
+	if !wrote {
+		return false, nil
+	}
 	return true, os.WriteFile(path, []byte(content), 0o644)
 }
 
@@ -139,7 +160,7 @@ func Install(dir string, ci bool) ([]string, error) {
 	if wrote, err := installNpmrc(dir); err != nil {
 		return nil, err
 	} else if wrote {
-		written = append(written, ".npmrc (ignore-scripts=true)")
+		written = append(written, ".npmrc (ignore-scripts + save-exact)")
 	}
 
 	// Prefer husky's hook dir when present: husky points core.hooksPath at
