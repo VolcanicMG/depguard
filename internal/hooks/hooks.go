@@ -112,13 +112,13 @@ func installHook(hookDir, h string) (string, error) {
 // this file. Each entry carries the substring used to detect a pre-existing
 // setting (so we never clobber a human's choice) and the block to append.
 //
-//   ignore-scripts=true  lifecycle scripts never auto-run; 'guard install'
-//                        handles approvals.
-//   save-exact=true /    new deps are written at their exact resolved version
-//   save-prefix=         (e.g. "react": "19.1.0"), never a "^"/"~" range — so a
-//                        version changes only when you deliberately bump it,
-//                        never silently on a later install. save-prefix= is the
-//                        belt-and-suspenders backstop if save-exact is unset.
+//	ignore-scripts=true  lifecycle scripts never auto-run; 'guard install'
+//	                     handles approvals.
+//	save-exact=true /    new deps are written at their exact resolved version
+//	save-prefix=         (e.g. "react": "19.1.0"), never a "^"/"~" range — so a
+//	                     version changes only when you deliberately bump it,
+//	                     never silently on a later install. save-prefix= is the
+//	                     belt-and-suspenders backstop if save-exact is unset.
 var npmrcSettings = []struct{ key, block string }{
 	{"ignore-scripts", "# depguard: never auto-run lifecycle scripts; 'guard install' handles approvals.\nignore-scripts=true\n"},
 	{"save-exact", "# depguard: pin new deps to the exact installed version (no ^/~); bump manually.\nsave-exact=true\nsave-prefix=\n"},

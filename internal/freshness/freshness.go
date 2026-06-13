@@ -25,6 +25,10 @@ type Violation struct {
 	Version string
 	// Age is time since publish; zero when the registry had no timestamp.
 	Age time.Duration
+	// Remaining is how much longer until this version clears the cooldown
+	// (cooldown − Age). Zero when the publish date is unknown (we can't tell
+	// when it clears, so it's treated as fail-closed with no ETA).
+	Remaining time.Duration
 }
 
 // workers bounds concurrent packument fetches: each is one registry GET and
@@ -57,10 +61,14 @@ func Check(registry string, pkgs []lockfile.Pkg, cooldown time.Duration, skip fu
 				case err != nil:
 					warnings = append(warnings, fmt.Sprintf("%s@%s: %v", j.name, j.version, err))
 				case published.IsZero():
-					// No timestamp: same fail-closed stance as the proxy.
-					violations = append(violations, Violation{j.name, j.version, 0})
+					// No timestamp: same fail-closed stance as the proxy. No
+					// publish date means no ETA, so Remaining stays zero.
+					violations = append(violations, Violation{Name: j.name, Version: j.version})
 				case published.After(cutoff):
-					violations = append(violations, Violation{j.name, j.version, time.Since(published)})
+					age := time.Since(published)
+					violations = append(violations, Violation{
+						Name: j.name, Version: j.version, Age: age, Remaining: cooldown - age,
+					})
 				}
 				mu.Unlock()
 			}

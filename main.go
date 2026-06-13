@@ -42,7 +42,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "0.8.0"
+const version = "0.8.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -245,8 +245,15 @@ func cmdInit(args []string) error {
 		}
 	}
 
-	fmt.Println("\nNext: use 'guard install <pkg>' instead of 'npm install <pkg>'.")
-	fmt.Println("Check status anytime with 'guard status'.")
+	fmt.Println("\nNext steps:")
+	fmt.Println("  1. use 'guard install <pkg>' instead of 'npm install <pkg>'")
+	fmt.Println("  2. your commits & pushes now run 'guard check' automatically (the hooks above)")
+	fmt.Println("  3. check protection anytime with 'guard status'")
+	tip := "Optional: enable build-provenance + license gates in .guardrc (see the comments there)."
+	if !ci {
+		tip = "Optional: 'guard init --ci' adds a PR gate; provenance + license gates live in .guardrc."
+	}
+	fmt.Println(ui.Dim("  " + tip))
 	return nil
 }
 
@@ -747,6 +754,17 @@ func cmdCheck(args []string) error {
 	if cfg.Flagged("new-maintainer") {
 		checkMaintainers(dir, cfg, quiet)
 	}
+	// One-line rollup so the overall verdict is scannable regardless of how many
+	// checkers printed above (and lands as a single line in CI logs).
+	if !quiet {
+		printCheckSummary(dir, map[string]error{
+			"advisories": advErr,
+			"cooldown":   freshErr,
+			"integrity":  intErr,
+			"licenses":   licErr,
+			"provenance": provErr,
+		})
+	}
 	// First gate to trip wins the exit code; all of them already printed.
 	if advErr != nil {
 		return advErr
@@ -761,6 +779,28 @@ func cmdCheck(args []string) error {
 		return provErr
 	}
 	return freshErr
+}
+
+// printCheckSummary prints the single-line verdict for guard check: the
+// dependency count and either "no issues" or the list of gates that tripped.
+// Skipped entirely when there's no lockfile (the checkers already said so).
+func printCheckSummary(dir string, gates map[string]error) {
+	pkgs, err := lockfile.Installed(dir)
+	if err != nil {
+		return // no lockfile / unreadable — the per-checker output already covered it
+	}
+	var tripped []string
+	for name, gerr := range gates {
+		if gerr != nil {
+			tripped = append(tripped, name)
+		}
+	}
+	sort.Strings(tripped) // deterministic order (map iteration is random)
+	if len(tripped) == 0 {
+		fmt.Printf("guard: %s %d dependency(s) checked — no issues\n", ui.OK(), len(pkgs))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "guard: %s %d dependency(s) — gating: %s\n", ui.Bad(), len(pkgs), strings.Join(tripped, ", "))
 }
 
 // CheckResult is the structured outcome of a `guard check` — the shape emitted
@@ -933,7 +973,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	// Per-package fetch failures are fail-open too — but recorded, not dropped.
 	res.Degraded = append(res.Degraded, warns...)
 	if cfg.Flagged("new-maintainer") {
-		if ch, _ := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed); len(ch) > 0 {
+		if ch, _ := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, nil); len(ch) > 0 {
 			res.Maintainers = ch
 		}
 	}
@@ -958,7 +998,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
 		}
 		client := &http.Client{Timeout: 30 * time.Second}
-		res.Provenance = attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed)
+		res.Provenance = attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed, nil)
 		for _, r := range res.Provenance {
 			if r.Status == attestation.StatusInvalid {
 				invalidProv++
@@ -1121,7 +1161,7 @@ func checkMaintainers(dir string, cfg config.Config, quiet bool) {
 	if err != nil {
 		return
 	}
-	changes, warnings := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed)
+	changes, warnings := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, progressPrinter("maintainers", quiet))
 	for _, w := range warnings {
 		if !quiet {
 			fmt.Fprintln(os.Stderr, "guard: maintainer check skipped for", w)
@@ -1266,9 +1306,10 @@ func checkFreshness(dir string, quiet, all bool, wf *waivers.File) error {
 	fmt.Fprintf(os.Stderr, "guard: %d version(s) inside the %s cooldown:\n", len(active), cfg.Cooldown)
 	for _, v := range active {
 		if v.Age == 0 {
-			fmt.Fprintf(os.Stderr, "  %s@%s — no publish timestamp\n", v.Name, v.Version)
+			fmt.Fprintf(os.Stderr, "  %s@%s — no publish timestamp (unknown age)\n", v.Name, v.Version)
 		} else {
-			fmt.Fprintf(os.Stderr, "  %s@%s — published %dd ago\n", v.Name, v.Version, int(v.Age.Hours()/24))
+			fmt.Fprintf(os.Stderr, "  %s@%s — published %dd ago, clears cooldown in %s\n",
+				v.Name, v.Version, int(v.Age.Hours()/24), fmtRemaining(v.Remaining))
 		}
 	}
 	fmt.Fprintln(os.Stderr, "guard: wait out the cooldown, pin an older version, allowlist in .guardrc, or — if reviewed — guard ignore cooldown:<name>@<version>")
@@ -1376,7 +1417,7 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	verified, invalid := 0, 0
-	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed) {
+	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed, progressPrinter("provenance", quiet)) {
 		switch r.Status {
 		case attestation.StatusVerified:
 			verified++
@@ -1880,6 +1921,9 @@ func cmdStatus(args []string) error {
 	row("internal-scopes", listOrNone(cfg.InternalScopes))
 	row("fallback", string(cfg.NoContainerFallback))
 	row("flags", listOrNone(cfg.Flag))
+	row("license-deny", listOrNone(cfg.LicenseDeny))
+	row("license-allow", listOrNone(cfg.LicenseAllow))
+	row("provenance", boolState(cfg.Flagged("provenance"), "on", "off (add 'provenance' to flag: to enable)"))
 
 	// Files
 	fmt.Println("\n" + ui.Bold("protection files"))
@@ -1933,6 +1977,34 @@ func fmtCooldown(d time.Duration) string {
 		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
 	}
 	return d.String()
+}
+
+// progressPrinter returns a (done,total) callback that redraws "label N/M" on a
+// single stderr line for liveness during slow per-package network checks, or
+// nil when output is quiet or not a TTY (so piped/CI logs stay clean). It emits
+// the closing newline itself once done reaches total.
+func progressPrinter(label string, quiet bool) func(done, total int) {
+	if quiet || !tty.IsTerminalFd(os.Stderr.Fd()) {
+		return nil
+	}
+	return func(done, total int) {
+		fmt.Fprintf(os.Stderr, "\rguard: %s %d/%d ", label, done, total)
+		if done >= total {
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+}
+
+// fmtRemaining renders a cooldown ETA in friendly, rounded-UP units so we never
+// under-promise when a version clears: hours under a day, whole days otherwise.
+func fmtRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "moments"
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("~%dh", int((d+time.Hour-1)/time.Hour))
+	}
+	return fmt.Sprintf("~%dd", int((d+24*time.Hour-1)/(24*time.Hour)))
 }
 
 // listOrNone joins a list for display, dimmed "(none)" when empty.

@@ -583,7 +583,9 @@ Five capabilities added in one pass:
      Boxed script approval stays npm-only (it enumerates from package-lock.json).
 ```
 
+**v0.8.1 — feedback polish:** cooldown violations show an ETA ("clears cooldown in ~3d"); `guard check` prints a one-line rollup verdict (deps count + gating categories); the slow per-package network checks (provenance, maintainer) show `N/M` progress on a TTY; `guard status` lists the license + provenance gates and whether each is enabled; `guard init` prints numbered next steps. Output-only — no new commands, flags, or policy keys.
 
+## 12. Open items
 
 1. ~~§9 fallback~~ — **resolved: warn-then-approve** (run uncontained only on explicit
    approval; CI falls back to fail unless pre-approved in `.guard-approvals`).

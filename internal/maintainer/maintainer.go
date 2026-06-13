@@ -42,8 +42,11 @@ const workers = 8
 // Check fetches each package's packument and reports publisher changes that
 // land on an installed version. Network errors per package are returned as
 // warnings (fail-open: a registry blip must not block a commit). skip exempts
-// allowlisted names.
-func Check(registry string, pkgs []lockfile.Pkg, skip func(string) bool) ([]Change, []string) {
+// allowlisted names. progress, if non-nil, is called after each packument with
+// (done, total) so a caller can show liveness on a large tree (one fetch per
+// package name is slow); it's invoked under the lock, so it need not be
+// thread-safe.
+func Check(registry string, pkgs []lockfile.Pkg, skip func(string) bool, progress func(done, total int)) ([]Change, []string) {
 	// Group installed versions by package name — one packument fetch per name.
 	byName := map[string][]string{}
 	for _, p := range pkgs {
@@ -52,6 +55,7 @@ func Check(registry string, pkgs []lockfile.Pkg, skip func(string) bool) ([]Chan
 		}
 		byName[p.Name] = append(byName[p.Name], p.Version)
 	}
+	total, done := len(byName), 0
 
 	type job struct {
 		name     string
@@ -75,6 +79,10 @@ func Check(registry string, pkgs []lockfile.Pkg, skip func(string) bool) ([]Chan
 					warnings = append(warnings, fmt.Sprintf("%s: %v", j.name, err))
 				} else {
 					changes = append(changes, ch...)
+				}
+				done++
+				if progress != nil {
+					progress(done, total)
 				}
 				mu.Unlock()
 			}

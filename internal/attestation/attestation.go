@@ -190,11 +190,16 @@ type inTotoStatement struct {
 // known (the tarball hash we bind to). allowed packages are skipped (your own
 // scopes). Network/parse failures fail OPEN per package (StatusNone with no
 // error) so a registry blip never blocks a commit — the caller distinguishes
-// StatusInvalid (a real tamper signal) from StatusNone.
-func Check(client *http.Client, registry string, pkgs []Pkg, allowed func(string) bool) []Result {
+// StatusInvalid (a real tamper signal) from StatusNone. progress, if non-nil,
+// is called once per package (incl. skips) with (done, total) for liveness on
+// a large tree — one registry fetch per package makes this the slow check.
+func Check(client *http.Client, registry string, pkgs []Pkg, allowed func(string) bool, progress func(done, total int)) []Result {
 	reg := strings.TrimSuffix(registry, "/")
 	var out []Result
-	for _, p := range pkgs {
+	for i, p := range pkgs {
+		if progress != nil {
+			progress(i+1, len(pkgs))
+		}
 		if allowed != nil && allowed(p.Name) {
 			continue
 		}
