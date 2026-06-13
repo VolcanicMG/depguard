@@ -280,5 +280,5 @@ fire: `node demo/run.mjs` ([demo/README.md](demo/README.md)).
 | Hook blocks an urgent push | `GUARD_SKIP=1 git push` (this push only; CI still enforces) |
 | `unknown key "…" (ignored)` warning | a misspelt `.guardrc` key — fix the spelling |
 | `ignore-scripts …: expected true or false` | a typo'd bool fails closed by design; correct the value |
-| pnpm / yarn project | `guard install` is npm-shaped; the **check** path reads `pnpm-lock.yaml` / `yarn.lock` for advisory/cooldown/integrity |
+| pnpm / yarn project | `guard install` proxies all three managers (auto-detected); boxed **script approval** is npm-only, so under pnpm/yarn scripts stay disabled and the lockfile is re-checked |
 | Waiver isn't suppressing | it may have **expired** (`guard ignore --list` shows EXPIRED) or the package version changed (re-waive the new `name@version`) |

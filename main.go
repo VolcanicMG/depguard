@@ -25,13 +25,16 @@ import (
 
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
+	"depguard/internal/attestation"
 	"depguard/internal/box"
 	"depguard/internal/config"
 	"depguard/internal/freshness"
 	"depguard/internal/hooks"
+	"depguard/internal/license"
 	"depguard/internal/lockfile"
 	"depguard/internal/maintainer"
 	"depguard/internal/registry"
+	"depguard/internal/sbom"
 	"depguard/internal/scanner"
 	"depguard/internal/semver"
 	"depguard/internal/tty"
@@ -39,7 +42,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -61,6 +64,10 @@ func main() {
 		err = cmdCheck(os.Args[2:])
 	case "scan":
 		err = cmdScan(os.Args[2:])
+	case "why":
+		err = cmdWhy(os.Args[2:])
+	case "sbom":
+		err = cmdSbom(os.Args[2:])
 	case "approve":
 		err = cmdApprove(os.Args[2:])
 	case "ignore":
@@ -100,6 +107,8 @@ func usage(w io.Writer) {
   guard ci                        npm ci — lockfile-exact, same protections
   guard check [--quiet] [--json]  re-check installed deps (advisories, cooldown, integrity)
   guard scan <dir> [--json]       static-scan one package dir (scripts, caps, injection)
+  guard why <package> [--all]     show which direct dep(s) pull a package in (npm lockfile)
+  guard sbom [--spdx]             write an SBOM of installed deps to stdout (CycloneDX, or SPDX)
   guard mcp                       run as an MCP server over stdio
   guard approve <name@version>    record a script approval (--uncontained | --deny)
   guard ignore <issue-id>         waive a reviewed check finding (--reason, --expires, --list, --remove)
@@ -243,26 +252,74 @@ func cmdInit(args []string) error {
 
 // ─── guard install ───────────────────────────────────────────────────────────
 
-// warnAltManager prints a loud notice when a pnpm/yarn lockfile is present, so
-// a team that normally installs with pnpm/yarn knows `guard install` proxies
-// npm only and their direct installs bypass the §5 filter. The `guard check`
-// gate (hooks/CI) still re-vets the resulting lockfile, so this is a heads-up
-// about the install-time gap, not a hard failure.
-func warnAltManager(dir string) {
-	for _, f := range []string{"pnpm-lock.yaml", "yarn.lock"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			continue
-		}
-		mgr := "pnpm"
-		if f == "yarn.lock" {
-			mgr = "yarn"
-		}
-		fmt.Fprintf(os.Stderr,
-			"guard: this repo has a %s. `guard install` proxies npm only — a direct\n"+
-				"       `%s install` bypasses the install-time filter; only `guard check`\n"+
-				"       (hooks/CI) re-vets %s installs. See README \u00a7 Honest limits.\n",
-			f, mgr, mgr)
+// detectManager picks the package manager for an install from the lockfile
+// present in dir: pnpm-lock.yaml -> pnpm, yarn.lock -> yarn, else npm (also the
+// default in a fresh repo with no lockfile yet). Lockfile presence is each
+// manager's own "this is a <mgr> project" signal, so we reuse it.
+func detectManager(dir string) string {
+	if _, err := os.Stat(filepath.Join(dir, "pnpm-lock.yaml")); err == nil {
+		return "pnpm"
 	}
+	if _, err := os.Stat(filepath.Join(dir, "yarn.lock")); err == nil {
+		return "yarn"
+	}
+	return "npm"
+}
+
+// installInvocation is how to run a protected install for one package manager:
+// the binary, its args, and the registry-override env vars to append. Returned
+// (not executed) by buildInstall so command construction is unit-testable
+// without npm/pnpm/yarn installed.
+type installInvocation struct {
+	name string
+	args []string
+	env  []string
+}
+
+// buildInstall constructs the install invocation for mgr, pointing it at the
+// ephemeral proxy. sub is "install" or "ci". "ci" maps to each manager's
+// frozen-lockfile install (npm has a real `ci` subcommand; pnpm/yarn take
+// `install --frozen-lockfile`). ignoreScripts adds --ignore-scripts, honored by
+// all three.
+func buildInstall(mgr, sub string, userArgs []string, proxyURL string, ignoreScripts bool) installInvocation {
+	// Registry env covers managers that read it over their rc file: npm + pnpm
+	// honor npm_config_registry; yarn berry honors YARN_NPM_REGISTRY_SERVER and
+	// yarn classic YARN_REGISTRY. Set all so the override is generation-proof.
+	regEnv := []string{
+		"npm_config_registry=" + proxyURL,
+		"YARN_NPM_REGISTRY_SERVER=" + proxyURL,
+		"YARN_REGISTRY=" + proxyURL,
+	}
+	withScripts := func(args []string) []string {
+		if ignoreScripts {
+			return append(args, "--ignore-scripts")
+		}
+		return args
+	}
+	switch mgr {
+	case "pnpm":
+		args := frozenArgs(sub, userArgs)
+		args = append(args, "--registry="+proxyURL) // pnpm accepts the flag too
+		return installInvocation{"pnpm", withScripts(args), regEnv}
+	case "yarn":
+		// No --registry flag: yarn berry errors on unknown flags, so route via
+		// env only (both generations honor the registry env vars above).
+		return installInvocation{"yarn", withScripts(frozenArgs(sub, userArgs)), regEnv}
+	default: // npm
+		args := append([]string{sub}, userArgs...)
+		args = append(args, "--registry="+proxyURL) // CLI flag beats any .npmrc
+		return installInvocation{"npm", withScripts(args), regEnv}
+	}
+}
+
+// frozenArgs builds [subcmd, userArgs...] for pnpm/yarn, mapping the npm-style
+// "ci" to "install --frozen-lockfile" (the equivalent both managers use instead
+// of a separate ci command).
+func frozenArgs(sub string, userArgs []string) []string {
+	if sub == "ci" {
+		return append(append([]string{"install"}, userArgs...), "--frozen-lockfile")
+	}
+	return append([]string{sub}, userArgs...)
 }
 
 // cmdInstall is the protected install path — the whole §5–§9 flow:
@@ -283,12 +340,12 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		return err
 	}
 
-	// guard install is npm-shaped (§5). If the repo carries a pnpm/yarn
-	// lockfile, the developer's usual `pnpm install` / `yarn install` runs
-	// OUTSIDE this proxy and is unprotected at install time — only `guard
-	// check` (hooks/CI) re-vets those lockfiles. Warn loudly so the gap is
-	// never silent. Full pnpm/yarn install proxying is a tracked follow-up.
-	warnAltManager(dir)
+	// Detect the package manager from the lockfile so pnpm/yarn installs route
+	// through the SAME ephemeral proxy as npm (§5). guard install used to be
+	// npm-only at install time; now all three are cooldown-filtered. The boxed
+	// lifecycle-script approval flow (§7–§8) stays npm-only — see the note after
+	// the install.
+	mgr := detectManager(dir)
 
 	// 1. Ephemeral proxy: exists only for this command (§5).
 	proxy, err := registry.Start(cfg)
@@ -297,17 +354,16 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	}
 	defer proxy.Stop()
 
-	// 2. The real install, pointed at the proxy, lifecycle scripts OFF.
-	// CLI flags beat any .npmrc, so a repo-level registry override can't
-	// route around the filter.
-	args := append([]string{npmCmd}, npmArgs...)
-	args = append(args, "--registry="+proxy.URL())
-	if cfg.IgnoreScripts {
-		args = append(args, "--ignore-scripts")
-	}
-	npm := exec.Command("npm", args...)
-	npm.Stdout, npm.Stderr, npm.Stdin = os.Stdout, os.Stderr, os.Stdin
-	npmErr := npm.Run()
+	// 2. The real install, pointed at the proxy, lifecycle scripts OFF. The
+	// registry override goes in as a flag (npm/pnpm — CLI beats the rc file) AND
+	// as env vars (yarn, which rejects an unknown --registry flag on berry but
+	// honors YARN_NPM_REGISTRY_SERVER / YARN_REGISTRY over its rc), so a
+	// repo-level registry setting can't route around the filter on any manager.
+	inv := buildInstall(mgr, npmCmd, npmArgs, proxy.URL(), cfg.IgnoreScripts)
+	pm := exec.Command(inv.name, inv.args...)
+	pm.Stdout, pm.Stderr, pm.Stdin = os.Stdout, os.Stderr, os.Stdin
+	pm.Env = append(os.Environ(), inv.env...)
+	npmErr := pm.Run()
 
 	// 3. Tell the human what the filter hid and why — even when npm failed,
 	// because "all versions in cooldown" IS the explanation for the failure.
@@ -338,11 +394,14 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		}
 	}
 	if npmErr != nil {
-		return fmt.Errorf("npm install failed: %w", npmErr)
+		return fmt.Errorf("%s %s failed: %w", inv.name, npmCmd, npmErr)
 	}
 
-	// 4. Script-bearing packages: detect → approve → box (§7, §8).
-	if cfg.IgnoreScripts {
+	// 4. Script-bearing packages: detect → approve → box (§7, §8). This reads
+	// package-lock.json to enumerate packages, so it's npm-only; under pnpm/yarn
+	// scripts simply stayed disabled (--ignore-scripts above) and the lockfile
+	// re-check below still runs over all three managers.
+	if cfg.IgnoreScripts && mgr == "npm" {
 		if err := handleScripts(dir, cfg, appr); err != nil {
 			return err
 		}
@@ -353,6 +412,12 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		if err := runRootScripts(dir); err != nil {
 			return err
 		}
+	} else if cfg.IgnoreScripts && mgr != "npm" {
+		fmt.Fprintf(os.Stderr,
+			"guard: %s install ran with lifecycle scripts disabled. Boxed script\n"+
+				"       approval is npm-only for now — if a dependency's postinstall is\n"+
+				"       genuinely needed, review and run it manually. Lockfile re-checked below.\n",
+			mgr)
 	}
 
 	// 5. Re-check the FINAL lockfile (§3 layer 5): advisories AND cooldown.
@@ -669,6 +734,11 @@ func cmdCheck(args []string) error {
 	advErr := checkAdvisories(dir, quiet, wf)
 	freshErr := checkFreshness(dir, quiet, all, wf)
 	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
+	licErr := checkLicenses(dir, cfg, wf, quiet)
+	var provErr error
+	if cfg.Flagged("provenance") {
+		provErr = checkProvenance(dir, cfg, quiet)
+	}
 	// Informational diff signals (never gate the commit/PR). Run here so a
 	// new-deps heads-up rides the same `guard check` the hooks already run.
 	if cfg.Flagged("new-deps") {
@@ -684,6 +754,12 @@ func cmdCheck(args []string) error {
 	if intErr != nil {
 		return intErr
 	}
+	if licErr != nil {
+		return licErr
+	}
+	if provErr != nil {
+		return provErr
+	}
 	return freshErr
 }
 
@@ -696,6 +772,8 @@ type CheckResult struct {
 	Unhashed    []string              `json:"unhashed"`
 	NewDeps     []string              `json:"newDeps"`
 	Maintainers []maintainer.Change   `json:"maintainerChanges"`
+	License     []license.Violation   `json:"licenseViolations,omitempty"`
+	Provenance  []attestation.Result  `json:"provenance,omitempty"`
 	Waived      []string              `json:"waived,omitempty"`
 	// Degraded names layers that could NOT run this check (e.g. OSV unreachable,
 	// a registry fetch failed). The check stays fail-open — these don't flip OK —
@@ -729,6 +807,12 @@ func cooldownWaiverID(v freshness.Violation) string {
 // offRegistryWaiverID / unhashedWaiverID take a lockfile key ("name@version").
 func offRegistryWaiverID(key string) string { return "off-registry:" + key }
 func unhashedWaiverID(key string) string    { return "unhashed:" + key }
+
+// licenseWaiverID is "license:<name>@<version>" — version-pinned like the rest,
+// so the waiver lapses when the package moves (a new version is re-judged).
+func licenseWaiverID(v license.Violation) string {
+	return fmt.Sprintf("license:%s@%s", v.Name, v.Version)
+}
 
 // waiverReason renders " — <reason>" for display, or "" when none was given.
 func waiverReason(e waivers.Entry) string {
@@ -853,7 +937,35 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			res.Maintainers = ch
 		}
 	}
-	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0
+	// License gate (no-op unless a deny/allow list is configured). Reads
+	// node_modules; an absent tree is recorded as degraded, not a clean pass.
+	if len(cfg.LicenseDeny) > 0 || len(cfg.LicenseAllow) > 0 {
+		if entries, lerr := lockfile.InstalledPaths(dir); lerr == nil {
+			lres := license.Check(dir, entries, cfg.LicenseDeny, cfg.LicenseAllow)
+			if lres.Degraded {
+				res.Degraded = append(res.Degraded, "license check incomplete: node_modules missing for some packages")
+			}
+			res.License = activeLicense(lres.Violations, wf, now, &res.Waived)
+		}
+	}
+	// Build-provenance gate (flag-gated, opt-in). Only INVALID attestations gate;
+	// verified/absent are informational. One registry fetch per package, so it's
+	// off by default.
+	invalidProv := 0
+	if cfg.Flagged("provenance") {
+		apkgs := make([]attestation.Pkg, 0, len(pkgs))
+		for _, p := range pkgs {
+			apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
+		}
+		client := &http.Client{Timeout: 30 * time.Second}
+		res.Provenance = attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed)
+		for _, r := range res.Provenance {
+			if r.Status == attestation.StatusInvalid {
+				invalidProv++
+			}
+		}
+	}
+	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0 && len(res.License) == 0 && invalidProv == 0
 	return res, nil
 }
 
@@ -1177,6 +1289,114 @@ func headLockfile(dir string) ([]lockfile.Pkg, bool) {
 	return prev, true
 }
 
+// activeLicense drops license violations an active waiver suppresses, recording
+// each suppressed ID in *waived. Mirrors activeAdvisories/activeCooldown.
+func activeLicense(viol []license.Violation, wf *waivers.File, now time.Time, waived *[]string) []license.Violation {
+	var out []license.Violation
+	for _, v := range viol {
+		id := licenseWaiverID(v)
+		if waivedActive(wf, id, now) {
+			*waived = append(*waived, id)
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// checkLicenses gates on the .guardrc license policy (deny / allow lists). It's
+// a no-op when neither list is set. Reads node_modules for each package's
+// declared license; a missing tree DEGRADES the check (warned, never silently
+// green) rather than gating. Non-waived violations fail the commit/PR.
+func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
+	if len(cfg.LicenseDeny) == 0 && len(cfg.LicenseAllow) == 0 {
+		return nil // gate disabled
+	}
+	entries, err := lockfile.InstalledPaths(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no npm lockfile — nothing to check
+		}
+		return err
+	}
+	res := license.Check(dir, entries, cfg.LicenseDeny, cfg.LicenseAllow)
+	if res.Degraded && !quiet {
+		fmt.Fprintf(os.Stderr, "guard: %s license check incomplete — node_modules missing for some packages (run an install first)\n", ui.Warn())
+	}
+	now := time.Now()
+	var active []license.Violation
+	for _, v := range res.Violations {
+		id := licenseWaiverID(v)
+		e, st := wf.Check(id, now)
+		switch st {
+		case waivers.Active:
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "guard: %s license waived %s%s\n", ui.Waived(), id, waiverReason(e))
+			}
+		case waivers.Expired:
+			fmt.Fprintf(os.Stderr, "guard: %s license waiver EXPIRED (%s) for %s — re-review or renew\n", ui.Warn(), e.Expires, id)
+			active = append(active, v)
+		default:
+			active = append(active, v)
+		}
+	}
+	if len(active) == 0 {
+		if !quiet && len(res.Violations) == 0 {
+			fmt.Printf("guard: license policy OK %s\n", ui.OK())
+		}
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "guard: %d license violation(s):\n", len(active))
+	for _, v := range active {
+		fmt.Fprintf(os.Stderr, "  %s@%s — %s (%s)\n", v.Name, v.Version, v.License, v.Reason)
+	}
+	fmt.Fprintf(os.Stderr, "guard: reviewed and accepting one? → guard ignore license:%s@%s --reason \"...\"\n",
+		active[0].Name, active[0].Version)
+	return fmt.Errorf("%d license violation(s)", len(active))
+}
+
+// checkProvenance verifies npm build-provenance (Sigstore) attestations for the
+// installed packages — flag-gated ("provenance") and opt-in, because most
+// packages don't publish attestations yet so an unconditional run would be
+// noisy and slow (one registry fetch per package). A VERIFIED result reports
+// the attested source repo; an INVALID one (attestation present but signature,
+// cert chain, or digest binding failed) is a tamper signal that GATES. Absent
+// attestations are not reported and never gate. Network errors fail open.
+func checkProvenance(dir string, cfg config.Config, quiet bool) error {
+	pkgs, err := lockfile.Installed(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	apkgs := make([]attestation.Pkg, 0, len(pkgs))
+	for _, p := range pkgs {
+		apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	verified, invalid := 0, 0
+	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed) {
+		switch r.Status {
+		case attestation.StatusVerified:
+			verified++
+			if !quiet {
+				fmt.Printf("guard: %s provenance %s@%s ← %s\n", ui.OK(), r.Name, r.Version, r.Source)
+			}
+		case attestation.StatusInvalid:
+			invalid++
+			fmt.Fprintf(os.Stderr, "guard: %s provenance INVALID for %s@%s — %s\n", ui.Bad(), r.Name, r.Version, r.Reason)
+		}
+	}
+	if !quiet && verified > 0 {
+		fmt.Printf("guard: %d package(s) with verified build provenance %s\n", verified, ui.OK())
+	}
+	if invalid > 0 {
+		return fmt.Errorf("%d package(s) with INVALID provenance attestation", invalid)
+	}
+	return nil
+}
+
 // checkAdvisories queries OSV for every installed version and fails when any
 // advisory hits — the "installed last month, reported yesterday" recovery layer.
 func checkAdvisories(dir string, quiet bool, wf *waivers.File) error {
@@ -1277,6 +1497,145 @@ func cmdScan(args []string) error {
 }
 
 // ─── guard approve ───────────────────────────────────────────────────────────
+
+// cmdWhy explains why a package is present: it prints the dependency path(s)
+// from a direct dependency down to the named package — the first question when
+// `guard check` flags a transitive dep you don't recognize ("which of MY deps
+// dragged this in?"). The graph is name-level (versions are reported in the
+// header but not used for routing), and npm-only: pnpm/yarn lockfiles don't
+// carry a graph we parse zero-dep, so those users get a clear message.
+//
+// Accepts a bare name or "name@version" (the version is ignored for routing).
+// Without --all it caps output at whyMaxPaths to keep deep graphs readable.
+func cmdWhy(args []string) error {
+	const whyMaxPaths = 20
+	target, maxPaths := "", whyMaxPaths
+	for _, a := range args {
+		switch {
+		case a == "--all":
+			maxPaths = 0 // uncapped
+		case strings.HasPrefix(a, "-"):
+			// ignore unknown flags — keep the surface forgiving
+		case target == "":
+			target = a
+		}
+	}
+	if target == "" {
+		return fmt.Errorf("usage: guard why <package> [--all]")
+	}
+	if at := strings.LastIndex(target, "@"); at > 0 { // tolerate name@version
+		target = target[:at]
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	g, err := lockfile.BuildGraph(dir)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("guard why needs an npm package-lock.json (pnpm/yarn dependency graphs aren't supported)")
+	}
+	if err != nil {
+		return err
+	}
+
+	versions := g.SortedVersions(target)
+	if len(versions) == 0 && !g.Roots[target] {
+		fmt.Printf("%s %s is not in the lockfile (not installed)\n", ui.Warn(), target)
+		return nil
+	}
+	if len(versions) > 0 {
+		fmt.Printf("%s %s @ %s\n", ui.OK(), target, strings.Join(versions, ", "))
+	} else {
+		fmt.Printf("%s %s\n", ui.OK(), target)
+	}
+	if g.Roots[target] {
+		fmt.Printf("  %s direct dependency of this project\n", ui.Dim("•"))
+	}
+
+	// Only multi-hop paths are interesting; the root-only path restates the
+	// "direct dependency" line above.
+	var shown [][]string
+	for _, p := range g.Paths(target, maxPaths) {
+		if len(p) > 1 {
+			shown = append(shown, p)
+		}
+	}
+	if len(shown) == 0 {
+		if !g.Roots[target] {
+			fmt.Printf("  %s present but not reachable from any direct dependency (orphaned lockfile entry)\n", ui.Dim("•"))
+		}
+		return nil
+	}
+	fmt.Printf("  pulled in by:\n")
+	for _, p := range shown {
+		fmt.Println("    " + strings.Join(p, " › "))
+	}
+	if maxPaths > 0 && len(shown) >= maxPaths {
+		fmt.Printf("  %s\n", ui.Dim(fmt.Sprintf("(showing first %d paths — run with --all for every path)", maxPaths)))
+	}
+	return nil
+}
+
+// cmdSbom writes a Software Bill of Materials for the installed dependency set
+// to stdout — an audit/compliance artifact straight from the lockfile depguard
+// already trusts as its source of truth. Default format is CycloneDX 1.5 JSON;
+// --spdx switches to SPDX 2.3 JSON. Works for any lockfile lockfile.Installed
+// understands (npm/pnpm/yarn).
+func cmdSbom(args []string) error {
+	format := "cyclonedx"
+	for _, a := range args {
+		switch a {
+		case "--spdx":
+			format = "spdx"
+		case "--cyclonedx":
+			format = "cyclonedx"
+		}
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	pkgs, err := lockfile.Installed(dir)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("no lockfile found (package-lock.json / pnpm-lock.yaml / yarn.lock) — nothing to bill")
+	}
+	if err != nil {
+		return err
+	}
+	meta := sbom.Meta{ToolVersion: version}
+	meta.Name, meta.Version = projectMeta(dir)
+
+	var out []byte
+	if format == "spdx" {
+		out, err = sbom.SPDX(meta, pkgs)
+	} else {
+		out, err = sbom.CycloneDX(meta, pkgs)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+// projectMeta reads name+version from the repo's package.json, falling back to
+// the directory's base name when there's no manifest (a bare lockfile).
+func projectMeta(dir string) (name, ver string) {
+	name = filepath.Base(dir)
+	if raw, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pj struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(raw, &pj) == nil {
+			if pj.Name != "" {
+				name = pj.Name
+			}
+			ver = pj.Version
+		}
+	}
+	return name, ver
+}
 
 // cmdApprove records a script decision outside the install flow — how CI
 // skips get resolved and how teammates pre-approve for non-interactive runs.
@@ -1429,7 +1788,7 @@ func cmdIgnore(args []string) error {
 // file. It validates the SHAPE, not that a matching finding currently exists —
 // you may pre-empt a finding you expect.
 func validWaiverID(id string) bool {
-	for _, prefix := range []string{"advisory:", "cooldown:", "off-registry:", "unhashed:"} {
+	for _, prefix := range []string{"advisory:", "cooldown:", "off-registry:", "unhashed:", "license:"} {
 		if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
 			return true
 		}
