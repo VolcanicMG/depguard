@@ -37,6 +37,27 @@ sudo mv guard /usr/local/bin # or anywhere on PATH
 
 End users need only the compiled binary — never Go, never npm packages.
 
+**Build for another OS/arch** — depguard is pure Go (no cgo), so you can cross-compile
+to any target from any machine; `CGO_ENABLED=0` is implied when `GOOS` differs:
+
+| Target | Command |
+|--------|---------|
+| macOS (Apple silicon) | `GOOS=darwin GOARCH=arm64 go build -o guard .` |
+| macOS (Intel) | `GOOS=darwin GOARCH=amd64 go build -o guard .` |
+| Windows | `GOOS=windows GOARCH=amd64 go build -o guard.exe .` |
+| Linux (x86-64) | `GOOS=linux GOARCH=amd64 go build -o guard .` |
+| Linux (arm64) | `GOOS=linux GOARCH=arm64 go build -o guard .` |
+
+The core (proxy, cooldown, OSV, scan, `why`, `sbom`, license, provenance) runs on all
+of them. **Script sandboxing** additionally needs Docker/Podman — and because `strace`
++ seccomp run *inside* the Linux container (not on the host), it works on macOS and
+Windows hosts too; without a runtime it follows `no-container-fallback`. Git hooks are
+`sh` shims: native on macOS/Linux, Git-for-Windows' bash on Windows.
+
+> **Updating an in-use binary?** Overwriting `guard` while `guard mcp` (the MCP server)
+> is running fails with `Text file busy`. Unlink first — it doesn't disturb the running
+> process: `sudo rm -f /usr/local/bin/guard && sudo cp guard /usr/local/bin/guard`.
+
 ## Use
 
 ```sh
