@@ -56,6 +56,15 @@ type Config struct {
 	// the proxy blocks them from resolving against the public one (dependency
 	// confusion). Same single-trailing-'*' glob as Allow.
 	InternalScopes []string
+	// LicenseDeny lists SPDX license identifiers that are NOT permitted; any
+	// installed package carrying one is a gating finding in `guard check`.
+	// Empty (the default) disables the deny gate.
+	LicenseDeny []string
+	// LicenseAllow, when non-empty, switches license checking to ALLOWLIST mode:
+	// a package is a violation unless at least one of its declared licenses is
+	// on this list (an unknown/missing license is therefore a violation too).
+	// Empty leaves allowlist mode off. If both are set, deny is applied first.
+	LicenseAllow []string
 }
 
 // FileName is the policy file dropped by `guard init`, committed with the repo.
@@ -122,6 +131,10 @@ func Load(dir string) (Config, error) {
 			c.Flag = parseList(val)
 		case "internal-scopes":
 			c.InternalScopes = parseList(val)
+		case "license-deny":
+			c.LicenseDeny = parseList(val)
+		case "license-allow":
+			c.LicenseAllow = parseList(val)
 		case "untraced-boxed":
 			switch val {
 			case "run":
@@ -273,8 +286,12 @@ no-container-fallback: warn-approve
 #                            takeover signal; one packument fetch per package)
 #            new-network /   per-version capability diff surfaced at approval time
 #            new-fs
+#            provenance      verify npm build-provenance (Sigstore) attestations:
+#                            confirms a package was built from its claimed source
+#                            repo. Opt-in (one registry fetch per package); an
+#                            INVALID attestation gates, absent/verified don't.
 #   default: [new-deps]
-# flag: [new-deps, new-maintainer]
+# flag: [new-deps, new-maintainer, provenance]
 
 # ── untraced-boxed ────────────────────────────────────────────────────────────
 # What to do when an approved build script can only run UNTRACED (the strace
@@ -282,6 +299,19 @@ no-container-fallback: warn-approve
 #   values:  run | fail
 #   default: run
 # untraced-boxed: run
+
+# ── license-deny / license-allow ──────────────────────────────────────────────
+# License policy gate for 'guard check'. Reads each installed package's declared
+# license (from its package.json in node_modules) and gates the commit/PR.
+#   license-deny:  SPDX ids that are NOT permitted (any match is a violation).
+#   license-allow: if set, switches to ALLOWLIST mode — a package is a violation
+#                  unless one of its licenses is on this list (so an unknown or
+#                  missing license is also a violation). deny is applied first.
+# Needs node_modules present (run after install); otherwise the check degrades
+# (reported, never silently green). Waive a specific hit with 'guard ignore'.
+#   default: [] / []  (license gate off)
+# license-deny: ["GPL-3.0", "AGPL-3.0", "GPL-2.0"]
+# license-allow: ["MIT", "ISC", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"]
 `
 	return os.WriteFile(path, []byte(starter), 0o644)
 }
@@ -419,7 +449,7 @@ func canonicalValue(key, value string) (string, error) {
 			return "", err
 		}
 		return reg, nil
-	case "allow", "internal-scopes", "flag":
+	case "allow", "internal-scopes", "flag", "license-deny", "license-allow":
 		// Accept comma- or space-separated input; emit a canonical [a, b] list.
 		fields := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' })
 		var items []string
@@ -431,7 +461,7 @@ func canonicalValue(key, value string) (string, error) {
 		}
 		return "[" + strings.Join(items, ", ") + "]", nil
 	default:
-		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag)", key)
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow)", key)
 	}
 }
 

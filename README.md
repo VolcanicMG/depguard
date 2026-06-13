@@ -48,6 +48,8 @@ guard install <pkg>   # instead of npm install
 guard ci              # instead of npm ci (lockfile-exact installs, same protections)
 guard check [--all] [--json]   # advisories + cooldown + integrity (hooks run this)
 guard scan <dir> [--json]      # static-scan one package dir (scripts, caps, injection)
+guard why <package> [--all]    # which direct dep(s) pull a package in (npm lockfile)
+guard sbom [--spdx]            # write an SBOM of installed deps (CycloneDX, or SPDX) to stdout
 guard approve <name@version> [--uncontained|--deny]   # script decisions
 guard ignore <issue-id> [--reason ".."] [--expires 30d]  # waive a REVIEWED check finding (--list, --remove)
 guard allow <pattern>...                 # add a name/scope to .guardrc allow (bypass cooldown)
@@ -101,8 +103,10 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 | Cooldown (default 14d) | freshly-published malicious versions (most are yanked in days) |
 | OSV at resolve time + on commit | known-bad versions dropped *before* npm resolves (not just flagged after) |
 | Registry signature verification | a version whose npm ECDSA signature is present-but-invalid (registry/account tampering the integrity hash can't catch) |
+| Build-provenance attestation (opt-in) | a published Sigstore/SLSA attestation that fails to verify — DSSE signature, Fulcio cert chain, or tarball-digest binding — i.e. a tampered provenance claim (`flag: [provenance]`) |
 | Maintainer-change (opt-in) | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 | Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
+| License-policy gate (opt-in) | installed packages under a denied — or, in allowlist mode, non-allowed — license (`license-deny` / `license-allow` in .guardrc) |
 | Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
@@ -157,16 +161,23 @@ npm test             # builds the binary (globalSetup), runs the e2e suite
   built (offline), scripts still run CAGED but UNTRACED, and guard says so.
 - A `.bin` entry from a malicious package still executes when *invoked* — install
   protection can't help once you run the code on purpose.
-- `guard install` is npm-shaped (it wraps npm). pnpm and yarn are covered by the
-  **check** path (`guard check` reads `pnpm-lock.yaml` / `yarn.lock` for
-  advisory/cooldown/integrity), not the install-time proxy. When a repo carries a
-  `pnpm-lock.yaml` / `yarn.lock`, `guard install` **warns** that a direct
-  `pnpm install` / `yarn install` bypasses the install-time filter — so the gap is
-  loud, not silent. (Full pnpm/yarn install proxying is a tracked follow-up.)
+- `guard install` now routes **npm, pnpm, and yarn** through the cooldown proxy
+  (manager auto-detected from the lockfile; the registry override is applied by
+  flag for npm/pnpm and by env for yarn, which berry honors). The **boxed
+  lifecycle-script approval** flow (§7–§8) stays npm-only — it enumerates
+  packages from `package-lock.json` — so under pnpm/yarn scripts simply stay
+  disabled (`--ignore-scripts`) and the lockfile re-check still runs. Approving a
+  specific pnpm/yarn postinstall is a manual review for now.
 - Signature verification **blocks only present-but-invalid** signatures; unsigned
-  versions pass, because most of the ecosystem still is. Maintainer-change and the
-  per-version capability diff are **opt-in** (`flag:`) — they fetch a packument per
-  package, too heavy to run on every commit by default.
+  versions pass, because most of the ecosystem still is. Maintainer-change, the
+  per-version capability diff, and **build-provenance** are **opt-in** (`flag:`) —
+  they fetch per package, too heavy to run on every commit by default.
+- Build-provenance verification checks the **DSSE signature, the Fulcio cert
+  chain to a pinned Sigstore root, and the subject↔tarball digest binding**, then
+  reports the attested source repo. It does **not** yet verify Rekor
+  transparency-log inclusion, the SCT, or rotate trust roots via TUF — so a green
+  result is a high bar, not the full Sigstore guarantee (documented in
+  `internal/attestation`).
 - The MCP server returns scan/check results wrapped as **untrusted data**; an agent
   must still be told (as the banner says) not to follow instructions embedded in a
   package's files.

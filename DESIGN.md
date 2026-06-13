@@ -447,9 +447,10 @@ agents.
                                     new eval...) at approval. flag: new-network/new-fs.
 
  BROADER COVERAGE:
-   → pnpm-lock.yaml + yarn.lock      hand-rolled zero-dep parsers; the check path
-                                    (advisory/cooldown/integrity) now spans all
-                                    three managers. (install stays npm-shaped.)
+   → pnpm-lock.yaml + yarn.lock      hand-rolled zero-dep parsers; check spans all
+                                    three managers. As of v0.8.0 `guard install`
+                                    PROXIES all three too (§11e); boxed script
+                                    approval stays npm-only.
    → io_uring/seccomp               box runs under a seccomp profile blocking
                                     io_uring_* (else network I/O is invisible to
                                     strace) + the kernel keyring (keyctl/add_key/
@@ -543,10 +544,49 @@ The ID scheme is the single source of truth shared by the human-prose path and
 the structured `--json` / MCP path (`CheckResult.waived`), so the two never
 disagree about what is or isn't waived.
 
-## 12. Open items
+## 11e. Provenance, SBOM, licenses, why, pnpm/yarn (v0.8.0)
+
+Five capabilities added in one pass:
+
+```
+ BUILD PROVENANCE (internal/attestation, flag: [provenance])
+   → fetches npm's Sigstore attestation (/-/npm/v1/attestations/<name>@<ver>),
+     verifies the DSSE signature over the in-toto SLSA statement, chains the
+     leaf cert to a PINNED Fulcio root, and binds the statement subject digest
+     to the installed tarball hash. Reports the attested source repo + builder.
+     Only present-but-INVALID gates (tamper); absent/verified are informational.
+     LIMITS (documented, like §6 provenance candor): no Rekor inclusion / SCT /
+     TUF root rotation yet — a high bar, not the full Sigstore guarantee.
+
+ SBOM (internal/sbom, guard sbom [--spdx])
+   → emits CycloneDX 1.5 (default) or SPDX 2.3 JSON straight from the lockfile,
+     with purls + SRI-derived hashes. An audit artifact from existing state.
+
+ LICENSE GATE (internal/license, .guardrc license-deny / license-allow)
+   → reads each installed package's declared license (node_modules manifest),
+     gates guard check on a denied (or, in allowlist mode, non-allowed) license.
+     Version-pinned waivers (license:<name>@<ver>); degrades if node_modules is
+     absent rather than passing silently.
+
+ GUARD WHY (internal/lockfile graph, guard why <pkg>)
+   → reconstructs the npm lockfile's parent->child graph and prints the path(s)
+     from a direct dependency down to a transitive one — triage for "what pulled
+     this in?". npm-only (pnpm/yarn carry no graph we parse zero-dep).
+
+ pnpm/yarn INSTALL PROXYING (buildInstall / detectManager)
+   → guard install now detects the manager from the lockfile and routes npm,
+     pnpm, AND yarn through the same ephemeral cooldown proxy (registry override
+     by flag for npm/pnpm, by env for yarn berry). Closes the loudest §11d gap.
+     Boxed script approval stays npm-only (it enumerates from package-lock.json).
+```
+
+
 
 1. ~~§9 fallback~~ — **resolved: warn-then-approve** (run uncontained only on explicit
    approval; CI falls back to fail unless pre-approved in `.guard-approvals`).
 2. Ecosystem after npm (PyPI has different registry API + script model).
 3. How shared verdicts are distributed/trusted (community feed vs local-only).
-4. Exact provenance method (sigstore/npm-provenance when present; diff fallback).
+4. ~~Exact provenance method~~ — **partially resolved (v0.8.0, §11e)**: npm
+   build-provenance (Sigstore/SLSA) attestations are fetched and verified
+   (DSSE + Fulcio chain + digest binding). Rekor inclusion / SCT / TUF root
+   rotation remain future work.
