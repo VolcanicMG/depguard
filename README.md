@@ -68,7 +68,7 @@ guard init            # drops .guardrc, .npmrc, pre-commit/pre-push hooks
 guard status          # is this repo protected? policy, hooks, sandbox, decisions (offline)
 guard install <pkg>   # instead of npm install
 guard ci              # instead of npm ci (lockfile-exact installs, same protections)
-guard check [--all] [--json]   # advisories + cooldown + integrity (hooks run this)
+guard check [--all] [--json] [--confirm]   # advisories + cooldown + integrity (hooks run this)
 guard scan <dir> [--json]      # static-scan one package dir (scripts, caps, injection)
 guard why <package> [--all]    # which direct dep(s) pull a package in (npm lockfile)
 guard sbom [--spdx]            # write an SBOM of installed deps (CycloneDX, or SPDX) to stdout
@@ -90,7 +90,7 @@ respects `NO_COLOR`.
 
 | File | Holds |
 |---|---|
-| `.guardrc` | policy: cooldown, allowed scopes, fallback mode — **review changes in PRs** (it controls the filter) |
+| `.guardrc` | policy: cooldown, allowed scopes, fallback mode, advisory severity threshold — **review changes in PRs** (it controls the filter) |
 | `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
@@ -107,6 +107,13 @@ guard ignore cooldown:lodash@4.17.21 --reason "vendored fork, vetted" --expires 
 guard ignore --list               # every waiver, tagged active / EXPIRED
 guard ignore --remove cooldown:lodash@4.17.21
 ```
+
+Low-severity advisories (below `advisory-threshold`, default `high`) **warn**
+rather than block. On a commit/push at a terminal the hook runs `guard check
+--confirm`, which lists the warnings and asks before proceeding; accepting them
+records a waiver in `.guard-ignores` automatically, so what you waved through is
+auditable in the same place as hand-written waivers. CI (no terminal) never
+prompts — warnings print, only blockers (high+/`MAL-*`/unscored) fail the gate.
 
 A waiver is **purposeful, not a blanket off-switch**: it is pinned to an exact
 `name@version` + finding-kind, so it lapses the moment the package moves to a new
@@ -133,7 +140,7 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 | Exact version pinning (`.npmrc` `save-exact`) | silent range drift — a later `npm install` pulling a freshly-compromised `^`/`~` patch you never chose; deps stay at the version you vetted until you bump manually |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
-| `guard check` on commit/PR | newly-reported advisories AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds |
+| `guard check` on commit/PR | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
 HEAD** — each version is vetted once, at the commit that introduces it. `--all`

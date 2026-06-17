@@ -3,7 +3,7 @@
 //
 //	guard init [--ci]      drop .guardrc + git hooks (+ CI workflow) into a repo
 //	guard install [args]   protected npm install through the ephemeral proxy
-//	guard check [--quiet]  lockfile vs OSV advisories (what the hooks/CI run)
+//	guard check [flags]    lockfile vs OSV advisories (what the hooks/CI run; --confirm prompts on warn-tier)
 //	guard approve <pkg>    record a script decision without installing
 //	guard ignore <id>      waive a reviewed check finding (.guard-ignores)
 //	guard version          print version
@@ -42,7 +42,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "0.8.1"
+const version = "0.9.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -105,7 +105,7 @@ func usage(w io.Writer) {
   guard status                    is this repo protected? (policy, hooks, sandbox, decisions)
   guard install [npm args...]     npm install, filtered + scripts neutralized
   guard ci                        npm ci — lockfile-exact, same protections
-  guard check [--quiet] [--json]  re-check installed deps (advisories, cooldown, integrity)
+  guard check [--quiet] [--json] [--confirm]  re-check installed deps (advisories, cooldown, integrity)
   guard scan <dir> [--json]       static-scan one package dir (scripts, caps, injection)
   guard why <package> [--all]     show which direct dep(s) pull a package in (npm lockfile)
   guard sbom [--spdx]             write an SBOM of installed deps to stdout (CycloneDX, or SPDX)
@@ -439,7 +439,9 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	if err != nil {
 		return err
 	}
-	advErr := checkAdvisories(dir, false, wf)
+	// Same severity tiering as 'guard check' (moderate/low warn, high+/MAL/unknown
+	// block), but no interactive confirm here — install isn't the commit/push gate.
+	advErr := checkAdvisories(dir, false, false, cfg.AdvisoryThreshold, wf)
 	freshErr := checkFreshness(dir, false, false, wf)
 	if advErr != nil {
 		return advErr
@@ -697,7 +699,7 @@ func runRootScripts(dir string) error {
 // npm, a teammate without it) still can't push a too-young version past a
 // commit or PR.
 func cmdCheck(args []string) error {
-	quiet, all, jsonOut := false, false, false
+	quiet, all, jsonOut, confirm := false, false, false, false
 	for _, a := range args {
 		switch a {
 		case "--quiet":
@@ -706,6 +708,11 @@ func cmdCheck(args []string) error {
 			all = true // force full-tree freshness check, not just the git diff
 		case "--json":
 			jsonOut = true
+		case "--confirm":
+			// Interactive gate for warn-tier advisories: prompt on a terminal
+			// before proceeding, recording acceptances. The git hooks pass this;
+			// CI (no terminal) sees warnings print without prompting.
+			confirm = true
 		}
 	}
 	dir, err := os.Getwd()
@@ -738,7 +745,7 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	advErr := checkAdvisories(dir, quiet, wf)
+	advErr := checkAdvisories(dir, quiet, confirm, cfg.AdvisoryThreshold, wf)
 	freshErr := checkFreshness(dir, quiet, all, wf)
 	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
 	licErr := checkLicenses(dir, cfg, wf, quiet)
@@ -806,15 +813,23 @@ func printCheckSummary(dir string, gates map[string]error) {
 // CheckResult is the structured outcome of a `guard check` — the shape emitted
 // by --json and returned by the MCP server's check tool.
 type CheckResult struct {
-	Advisories  []advisory.Vuln       `json:"advisories"`
-	Cooldown    []freshness.Violation `json:"cooldownViolations"`
-	OffRegistry []string              `json:"offRegistry"`
-	Unhashed    []string              `json:"unhashed"`
-	NewDeps     []string              `json:"newDeps"`
-	Maintainers []maintainer.Change   `json:"maintainerChanges"`
-	License     []license.Violation   `json:"licenseViolations,omitempty"`
-	Provenance  []attestation.Result  `json:"provenance,omitempty"`
-	Waived      []string              `json:"waived,omitempty"`
+	// Advisories are the BLOCKING advisory hits — severity at/above the
+	// configured threshold, plus MAL-* and any unknown/unscored hit (fail
+	// closed). These flip OK to false.
+	Advisories []advisory.Vuln `json:"advisories"`
+	// AdvisoryWarnings are hits BELOW the threshold (e.g. moderate/low when
+	// threshold is high). Surfaced for visibility but never gate — OK ignores
+	// them. On an interactive `guard check --confirm` the human is asked to
+	// accept these before the commit/push proceeds.
+	AdvisoryWarnings []advisory.Vuln       `json:"advisoryWarnings,omitempty"`
+	Cooldown         []freshness.Violation `json:"cooldownViolations"`
+	OffRegistry      []string              `json:"offRegistry"`
+	Unhashed         []string              `json:"unhashed"`
+	NewDeps          []string              `json:"newDeps"`
+	Maintainers      []maintainer.Change   `json:"maintainerChanges"`
+	License          []license.Violation   `json:"licenseViolations,omitempty"`
+	Provenance       []attestation.Result  `json:"provenance,omitempty"`
+	Waived           []string              `json:"waived,omitempty"`
 	// Degraded names layers that could NOT run this check (e.g. OSV unreachable,
 	// a registry fetch failed). The check stays fail-open — these don't flip OK —
 	// but a non-empty Degraded means a green result is INCOMPLETE, not proven
@@ -897,6 +912,42 @@ func activeCooldown(viol []freshness.Violation, wf *waivers.File, now time.Time,
 	return out
 }
 
+// enrichSeverities populates each hit's Severity from OSV's per-vuln detail
+// endpoint (querybatch carries none). Distinct ids are fetched once; a hit OSV
+// could not score stays SevUnknown — which BLOCKS under the fail-closed policy,
+// so a flaky detail fetch only ever makes the gate stricter.
+func enrichSeverities(vulns []advisory.Vuln) []advisory.Vuln {
+	if len(vulns) == 0 {
+		return vulns
+	}
+	ids := make([]string, 0, len(vulns))
+	for _, v := range vulns {
+		ids = append(ids, v.ID)
+	}
+	sev := advisory.Severities(ids)
+	for i := range vulns {
+		if s, ok := sev[vulns[i].ID]; ok {
+			vulns[i].Severity = s
+		} else {
+			vulns[i].Severity = advisory.SevUnknown
+		}
+	}
+	return vulns
+}
+
+// partitionBySeverity splits enriched hits into blockers (gate the action) and
+// warnings (surfaced, never gate) using each hit's Blocks(threshold) verdict.
+func partitionBySeverity(vulns []advisory.Vuln, threshold advisory.Severity) (blockers, warnings []advisory.Vuln) {
+	for _, v := range vulns {
+		if v.Blocks(threshold) {
+			blockers = append(blockers, v)
+		} else {
+			warnings = append(warnings, v)
+		}
+	}
+	return blockers, warnings
+}
+
 // gatherCheck runs every check over the lockfile and returns the structured
 // result WITHOUT printing — the single source of truth behind both
 // `guard check --json` and the MCP check tool. The human-prose path in
@@ -926,7 +977,11 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		if v, err := advisory.Check(pkgs); err != nil {
 			res.Degraded = append(res.Degraded, "advisory check skipped: "+err.Error())
 		} else {
-			res.Advisories = activeAdvisories(v, wf, now, &res.Waived)
+			active := activeAdvisories(v, wf, now, &res.Waived)
+			active = enrichSeverities(active)
+			// Split into blocking (>= threshold, or MAL-*/unknown) and warn-only
+			// (below threshold). Only blockers flip OK; warnings are surfaced.
+			res.Advisories, res.AdvisoryWarnings = partitionBySeverity(active, cfg.AdvisoryThreshold)
 		}
 	}
 	regHost := hostOf(cfg.Registry)
@@ -1005,6 +1060,8 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			}
 		}
 	}
+	// res.Advisories is blockers-only (warnings live in AdvisoryWarnings and do
+	// not gate), so OK keys off it directly.
 	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0 && len(res.License) == 0 && invalidProv == 0
 	return res, nil
 }
@@ -1440,7 +1497,7 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 
 // checkAdvisories queries OSV for every installed version and fails when any
 // advisory hits — the "installed last month, reported yesterday" recovery layer.
-func checkAdvisories(dir string, quiet bool, wf *waivers.File) error {
+func checkAdvisories(dir string, quiet, confirm bool, threshold advisory.Severity, wf *waivers.File) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1484,13 +1541,87 @@ func checkAdvisories(dir string, quiet bool, wf *waivers.File) error {
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "guard: %d advisory hit(s) on installed packages:\n", len(active))
-	for _, v := range active {
-		fmt.Fprintf(os.Stderr, "  %s@%s — %s: %s\n", v.Package, v.Version, v.ID, truncate(v.Summary, 100))
+	// Score the live hits and split: at/above the threshold (plus MAL-* and any
+	// unknown/unscored hit) BLOCKS; below the threshold WARNS (DESIGN.md §5).
+	active = enrichSeverities(active)
+	blockers, warns := partitionBySeverity(active, threshold)
+
+	// Warnings are always shown and never gate on their own.
+	if len(warns) > 0 {
+		fmt.Fprintf(os.Stderr, "guard: %s %d advisory warning(s) below the %s threshold (not blocking):\n", ui.Warn(), len(warns), threshold)
+		for _, v := range warns {
+			fmt.Fprintf(os.Stderr, "  [%s] %s@%s — %s: %s\n", v.Severity, v.Package, v.Version, v.ID, truncate(v.Summary, 100))
+		}
 	}
-	fmt.Fprintf(os.Stderr, "guard: reviewed and accepting one? → guard ignore advisory:%s@%s:%s --reason \"...\"\n",
-		active[0].Package, active[0].Version, active[0].ID)
-	return fmt.Errorf("%d vulnerable package(s) installed", len(active))
+
+	// Blockers gate unconditionally — the confirm flow does NOT apply to them.
+	// (Accept a specific blocker deliberately with 'guard ignore'.)
+	if len(blockers) > 0 {
+		fmt.Fprintf(os.Stderr, "guard: %s %d blocking advisory hit(s) on installed packages:\n", ui.Bad(), len(blockers))
+		for _, v := range blockers {
+			fmt.Fprintf(os.Stderr, "  [%s] %s@%s — %s: %s\n", v.Severity, v.Package, v.Version, v.ID, truncate(v.Summary, 100))
+		}
+		fmt.Fprintf(os.Stderr, "guard: reviewed and accepting one? → guard ignore advisory:%s@%s:%s --reason \"...\"\n",
+			blockers[0].Package, blockers[0].Version, blockers[0].ID)
+		return fmt.Errorf("%d vulnerable package(s) installed", len(blockers))
+	}
+
+	// Only warnings remain. Without --confirm (a direct 'guard check' or CI),
+	// they were printed above and don't gate — proceed.
+	if !confirm || len(warns) == 0 {
+		return nil
+	}
+	// Interactive --confirm: ask before proceeding, and record acceptances so
+	// the human can later see what was waved through and when.
+	accepted, interactive, err := confirmThroughWarnings(dir, warns, wf)
+	if err != nil {
+		return err
+	}
+	if !interactive {
+		// No terminal to ask at (CI, a piped hook): warnings print, action proceeds.
+		return nil
+	}
+	if !accepted {
+		return fmt.Errorf("commit/push aborted — %d advisory warning(s) not accepted", len(warns))
+	}
+	return nil
+}
+
+// confirmThroughWarnings asks, on the controlling terminal, whether to proceed
+// past warn-tier advisory hits. On "yes" it records each as a waiver in
+// .guard-ignores — both the audit trail of what was accepted (and when) and the
+// thing that suppresses the same hit on later runs. interactive is false when
+// there is no terminal to ask at (CI, a piped hook); the caller then proceeds
+// without recording. Reads /dev/tty directly, not stdin, because a git hook's
+// stdin carries ref data, not the keyboard.
+func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File) (accepted, interactive bool, err error) {
+	// Note: open /dev/tty (the controlling terminal) rather than reading os.Stdin
+	// like promptYN does — a git hook's stdin is ref data or /dev/null, not the
+	// keyboard. A failed open means "no terminal" (CI), the non-interactive path.
+	ttyf, e := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if e != nil {
+		return false, false, nil // no terminal — caller proceeds, no record
+	}
+	defer ttyf.Close()
+	fmt.Fprintf(ttyf, "\nguard: accept the %d warning advisory(ies) above and proceed? [y/N] ", len(warns))
+	line, _ := bufio.NewReader(ttyf).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		reason := "accepted " + time.Now().UTC().Format("2006-01-02") + " via guard check --confirm"
+		for _, v := range warns {
+			if e := wf.Set(advisoryWaiverID(v), reason, ""); e != nil {
+				return false, true, e
+			}
+		}
+		if e := wf.Save(dir); e != nil {
+			return false, true, e
+		}
+		fmt.Fprintf(ttyf, "guard: recorded %d acceptance(s) in %s\n", len(warns), waivers.FileName)
+		return true, true, nil
+	default:
+		fmt.Fprintln(ttyf, "guard: not accepted — aborting.")
+		return false, true, nil
+	}
 }
 
 // ─── guard scan ──────────────────────────────────────────────────────────────
@@ -2171,4 +2302,5 @@ func printConfig(cfg config.Config) {
 	fmt.Printf("allow:                 %s\n", listOrNone(cfg.Allow))
 	fmt.Printf("internal-scopes:       %s\n", listOrNone(cfg.InternalScopes))
 	fmt.Printf("flag:                  %s\n", listOrNone(cfg.Flag))
+	fmt.Printf("advisory-threshold:    %s\n", cfg.AdvisoryThreshold)
 }

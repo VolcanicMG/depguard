@@ -30,8 +30,8 @@ if [ -n "$GUARD_SKIP" ]; then
   exit 0
 fi
 if command -v guard >/dev/null 2>&1; then
-  guard check --quiet || {
-    echo "depguard: advisory check failed. Run 'guard check' for details." >&2
+  guard check --quiet --confirm || {
+    echo "depguard: advisory check failed (or warnings not accepted). Run 'guard check' for details." >&2
     echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
     exit 1
   }
@@ -78,7 +78,7 @@ const hookAppend = `
 if [ -n "$GUARD_SKIP" ]; then
   echo "depguard: check skipped (GUARD_SKIP set)." >&2
 elif command -v guard >/dev/null 2>&1; then
-  guard check --quiet || { echo "depguard: advisory check failed (bypass once with GUARD_SKIP=1)" >&2; exit 1; }
+  guard check --quiet --confirm || { echo "depguard: advisory check failed or warnings not accepted (bypass once with GUARD_SKIP=1)" >&2; exit 1; }
 fi
 `
 

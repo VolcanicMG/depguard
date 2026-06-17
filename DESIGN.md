@@ -499,6 +499,43 @@ agents.
      hide that the advisory layer did not run. Body is size-capped.
 ```
 
+### 12a. Advisory severity tiering (v0.9.0)
+
+The advisory layer is **graded**, not all-or-nothing. Each hit is scored against
+OSV's per-vuln detail (`/v1/vulns/{id}` — the `querybatch` feed carries no
+severity, so this is one extra GET per *distinct* id, only when there are hits)
+and split against a configurable threshold:
+
+```
+ advisory-threshold: high   (default — npm-audit-style)
+
+   MAL-* id ........................... BLOCK   (malicious package; never a warning)
+   severity unknown / unscored ........ BLOCK   (fail closed — can't prove it's minor)
+   severity >= threshold .............. BLOCK
+   severity <  threshold .............. WARN    (printed, does not gate)
+```
+
+Three invariants keep this fail-closed:
+
+- **`MAL-*` always blocks**, regardless of threshold — flagging an outright
+  malicious package is the tool's whole reason to exist; it is never downgradable.
+- **Unknown severity always blocks.** `SevUnknown` is the zero value, and an OSV
+  detail fetch that fails or returns no machine-readable severity leaves the hit
+  unscored — so a flaky fetch can only make the gate *stricter*, never leak a hit
+  through as a "low".
+- **Only blockers flip `CheckResult.OK`.** Warnings live in
+  `CheckResult.advisoryWarnings`; they are surfaced but never gate on their own.
+
+**Interactive accept-and-record (`guard check --confirm`).** The git hooks pass
+`--confirm`. When the *only* findings are warn-tier and a controlling terminal
+exists, `guard check` asks before letting the commit/push through; on "yes" it
+records each accepted hit as a waiver in `.guard-ignores` (the audit trail of
+what was waved through and when, and what suppresses the same hit next time).
+No terminal (CI, a piped hook) ⇒ no prompt: warnings print, the action proceeds,
+blockers still fail the gate. The prompt reads `/dev/tty`, not stdin, because a
+git hook's stdin is ref data, not the keyboard. Blockers are **never** confirmable
+this way — accept a specific blocker deliberately with `guard ignore`.
+
 ## 13. Reviewed-finding waivers (v0.6.0 — .guard-ignores)
 
 `guard check` is the enforcement point: advisories, cooldown, and lockfile

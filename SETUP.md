@@ -127,6 +127,7 @@ allow: ["@yourco/*"]               # YOUR scopes bypass the cooldown (you publis
 internal-scopes: ["@yourco/*"]     # MUST come from a private registry — blocked from public (confusion guard)
 no-container-fallback: warn-approve # no Docker? warn + ask (CI fails closed unless pre-approved) | or: fail
 flag: [new-deps, new-maintainer]   # extra signals guard check surfaces (see below)
+advisory-threshold: high           # lowest advisory severity that BLOCKS; below it warns | critical|high|moderate|low
 untraced-boxed: run                # box can't build the strace image? run caged-but-unwatched | or: fail
 # registry: https://registry.npmjs.org   # upstream; must be https (loopback http ok for tests)
 ```
@@ -147,9 +148,17 @@ Tips:
   lockfile change adds — cheap, non-blocking. `new-maintainer` flags publisher
   changes / long-dormancy republishes (account-takeover fingerprint) but costs one
   packument fetch per package, so it's off by default.
+- **`advisory-threshold:` grades advisories.** Hits at/above it BLOCK; below it
+  WARN. Default `high` (critical+high block, moderate+low warn). `MAL-*`
+  malicious-package hits and advisories OSV couldn't score **always** block,
+  whatever the threshold (fail closed). On a commit/push at a terminal the hook
+  runs `guard check --confirm`: it lists any warnings and asks before proceeding,
+  and recording your acceptance writes a waiver into `.guard-ignores` so it's
+  auditable later. CI (no terminal) never prompts — warnings print, blockers gate.
 - **A typo in a bool fails closed.** `ignore-scripts: tru` errors out rather than
-  silently disabling script neutralization. Unknown keys warn (likely a misspelt
-  known key).
+  silently disabling script neutralization. A typo'd `advisory-threshold` errors
+  the same way (it never silently arms an unknown level). Unknown keys warn
+  (likely a misspelt known key).
 
 ---
 

@@ -27,7 +27,8 @@ Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md)
  │   ├── provenance/provenance.go npm ECDSA dist.signature verification (stdlib)
  │   ├── maintainer/maintainer.go publisher-change / account-takeover detection
  │   ├── freshness/freshness.go  cooldown re-check on lockfile versions
- │   ├── advisory/osv.go         OSV.dev known-bad feed client
+ │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
+ │   │                           Severities = per-vuln detail for tiering; Blocks)
  │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
@@ -82,15 +83,20 @@ Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md)
    │           └─ skip + explain ───── approved-boxed but no runtime here
    │
    ├─ runRootScripts ───────── the repo's OWN lifecycle scripts (trusted, incl. prepare)
-   └─ checkAdvisories ──────── advisory.Check (OSV batch) on the final lockfile
+   └─ checkAdvisories ──────── advisory.Check (OSV batch) on the final lockfile,
+                              then enrichSeverities + partitionBySeverity (tiering)
 ```
 
 ## Flow: `guard check` (what hooks + CI run)
 
 ```
- main.cmdCheck
+ main.cmdCheck (--confirm enables the interactive warn-tier accept flow)
    ├─ checkAdvisories ── lockfile.Installed → advisory.Check (OSV)
    │                     fail-open on network errors (loud warning)
+   │                     → enrichSeverities (advisory.Severities, per-vuln detail)
+   │                     → partitionBySeverity: blockers gate, warns don't
+   │                     → confirmThroughWarnings (--confirm, /dev/tty): on "yes"
+   │                       records acceptances via waivers.Set → .guard-ignores
    └─ checkFreshness ─── scope = lockfile versions ADDED since git HEAD
                          (headLockfile via `git show`; --all = full tree)
                          → freshness.Check: publish dates from registry,

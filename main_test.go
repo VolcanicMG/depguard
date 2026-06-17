@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"depguard/internal/advisory"
 	"depguard/internal/approvals"
 	"depguard/internal/config"
 )
@@ -99,5 +100,26 @@ func TestGatherCheckSurfacesDegraded(t *testing.T) {
 	}
 	if !res.OK {
 		t.Errorf("expected fail-open OK=true (no findings), got OK=false: %+v", res)
+	}
+}
+
+// TestPartitionBySeverity locks the gating split that drives both the --json
+// result and the human path: MAL-* and unknown always block, scored hits split
+// at the threshold. (Severity classification itself is unit-tested in advisory.)
+func TestPartitionBySeverity(t *testing.T) {
+	hits := []advisory.Vuln{
+		{ID: "MAL-2024-1", Severity: advisory.SevLow},     // malicious -> block
+		{ID: "GHSA-crit", Severity: advisory.SevCritical}, // block
+		{ID: "GHSA-high", Severity: advisory.SevHigh},     // block (at threshold)
+		{ID: "GHSA-mod", Severity: advisory.SevModerate},  // warn
+		{ID: "GHSA-low", Severity: advisory.SevLow},       // warn
+		{ID: "GHSA-unk", Severity: advisory.SevUnknown},   // unknown -> block
+	}
+	blockers, warns := partitionBySeverity(hits, advisory.SevHigh)
+	if len(blockers) != 4 {
+		t.Errorf("blockers = %d, want 4 (MAL, crit, high, unknown)", len(blockers))
+	}
+	if len(warns) != 2 {
+		t.Errorf("warnings = %d, want 2 (moderate, low)", len(warns))
 	}
 }

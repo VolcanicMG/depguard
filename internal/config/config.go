@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"depguard/internal/advisory"
 )
 
 // FallbackMode controls what happens when an approved build script must run
@@ -65,6 +67,11 @@ type Config struct {
 	// on this list (an unknown/missing license is therefore a violation too).
 	// Empty leaves allowlist mode off. If both are set, deny is applied first.
 	LicenseAllow []string
+	// AdvisoryThreshold is the LOWEST advisory severity that hard-blocks a
+	// commit/push; anything below it warns instead (DESIGN.md §5). MAL-* hits and
+	// unknown/unscored severities always block regardless (fail closed). Default
+	// SevHigh: critical+high block, moderate+low warn.
+	AdvisoryThreshold advisory.Severity
 }
 
 // FileName is the policy file dropped by `guard init`, committed with the repo.
@@ -80,6 +87,8 @@ func Defaults() Config {
 		// new-deps is cheap and non-blocking (a lockfile diff we already have),
 		// so it's on by default; an explicit `flag:` line replaces this.
 		Flag: []string{"new-deps"},
+		// critical+high block, moderate+low warn — the npm-audit-style default.
+		AdvisoryThreshold: advisory.SevHigh,
 	}
 }
 
@@ -135,6 +144,14 @@ func Load(dir string) (Config, error) {
 			c.LicenseDeny = parseList(val)
 		case "license-allow":
 			c.LicenseAllow = parseList(val)
+		case "advisory-threshold":
+			sev, ok := advisory.ParseSeverity(val)
+			if !ok {
+				// Fail CLOSED: a typo'd threshold ("hgh") must not silently arm an
+				// unknown level. Error out rather than guess.
+				return c, fmt.Errorf("%s:%d: advisory-threshold must be critical, high, moderate or low, got %q", FileName, ln+1, val)
+			}
+			c.AdvisoryThreshold = sev
 		case "untraced-boxed":
 			switch val {
 			case "run":
@@ -300,6 +317,17 @@ no-container-fallback: warn-approve
 #   default: run
 # untraced-boxed: run
 
+# ── advisory-threshold ────────────────────────────────────────────────────────
+# Lowest OSV advisory severity that BLOCKS a commit/push. Anything below it is
+# shown as a warning instead — and on an interactive terminal 'guard check'
+# asks before letting the commit/push through (recording your acceptance in
+# .guard-ignores). Malicious-package (MAL-*) hits and advisories OSV couldn't
+# score always block regardless of this setting (fail closed). CI (no terminal)
+# never prompts: blockers fail the gate, warnings just print.
+#   values:  critical | high | moderate | low
+#   default: high   (critical+high block, moderate+low warn)
+# advisory-threshold: high
+
 # ── license-deny / license-allow ──────────────────────────────────────────────
 # License policy gate for 'guard check'. Reads each installed package's declared
 # license (from its package.json in node_modules) and gates the commit/PR.
@@ -443,6 +471,12 @@ func canonicalValue(key, value string) (string, error) {
 			return value, nil
 		}
 		return "", fmt.Errorf("untraced-boxed must be run or fail, got %q", value)
+	case "advisory-threshold":
+		sev, ok := advisory.ParseSeverity(value)
+		if !ok {
+			return "", fmt.Errorf("advisory-threshold must be critical, high, moderate or low, got %q", value)
+		}
+		return sev.String(), nil
 	case "registry":
 		reg := strings.TrimSuffix(value, "/")
 		if err := validateRegistry(reg); err != nil {
@@ -461,7 +495,7 @@ func canonicalValue(key, value string) (string, error) {
 		}
 		return "[" + strings.Join(items, ", ") + "]", nil
 	default:
-		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow)", key)
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold)", key)
 	}
 }
 

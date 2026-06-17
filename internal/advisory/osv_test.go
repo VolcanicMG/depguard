@@ -70,3 +70,166 @@ func TestCheckCapsResponseBody(t *testing.T) {
 		t.Error("expected a decode error from the capped (truncated) body, got nil")
 	}
 }
+
+// TestParseSeverity covers the label map, case-insensitivity, the medium alias,
+// and that anything unrecognized fails closed to SevUnknown with ok=false.
+func TestParseSeverity(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Severity
+		ok   bool
+	}{
+		{"LOW", SevLow, true},
+		{"low", SevLow, true},
+		{"Moderate", SevModerate, true},
+		{"medium", SevModerate, true}, // alias
+		{"HIGH", SevHigh, true},
+		{" critical ", SevCritical, true},
+		{"", SevUnknown, false},
+		{"bogus", SevUnknown, false},
+	}
+	for _, c := range cases {
+		got, ok := ParseSeverity(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("ParseSeverity(%q) = (%v,%v), want (%v,%v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// TestSeverityZeroValueIsUnknown pins the fail-closed invariant: a Vuln nobody
+// enriched must read as SevUnknown (the zero value), not as a low severity that
+// would slip under a threshold.
+func TestSeverityZeroValueIsUnknown(t *testing.T) {
+	var v Vuln
+	if v.Severity != SevUnknown {
+		t.Fatalf("zero-value Severity = %v, want SevUnknown (fail closed)", v.Severity)
+	}
+}
+
+// TestBlocks covers the gating decision: MAL-* and unknown always block; scored
+// hits block at/above the threshold and warn below it.
+func TestBlocks(t *testing.T) {
+	threshold := SevHigh
+	cases := []struct {
+		name string
+		v    Vuln
+		want bool
+	}{
+		{"mal always blocks even if low", Vuln{ID: "MAL-2024-1", Severity: SevLow}, true},
+		{"unknown blocks (fail closed)", Vuln{ID: "GHSA-x", Severity: SevUnknown}, true},
+		{"critical blocks", Vuln{ID: "GHSA-x", Severity: SevCritical}, true},
+		{"high blocks (at threshold)", Vuln{ID: "GHSA-x", Severity: SevHigh}, true},
+		{"moderate warns (below)", Vuln{ID: "GHSA-x", Severity: SevModerate}, false},
+		{"low warns (below)", Vuln{ID: "GHSA-x", Severity: SevLow}, false},
+	}
+	for _, c := range cases {
+		if got := c.v.Blocks(threshold); got != c.want {
+			t.Errorf("%s: Blocks(high) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestBlocksThresholdModerate confirms lowering the threshold to moderate flips
+// a moderate hit from warn to block.
+func TestBlocksThresholdModerate(t *testing.T) {
+	v := Vuln{ID: "GHSA-x", Severity: SevModerate}
+	if v.Blocks(SevHigh) {
+		t.Error("moderate should warn under high threshold")
+	}
+	if !v.Blocks(SevModerate) {
+		t.Error("moderate should block under moderate threshold")
+	}
+}
+
+// TestSeveritiesReadsDatabaseSpecific verifies the enrichment fetch reads
+// database_specific.severity and dedups distinct ids.
+func TestSeveritiesReadsDatabaseSpecific(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		id := strings.TrimPrefix(r.URL.Path, "/")
+		switch id {
+		case "GHSA-high":
+			w.Write([]byte(`{"database_specific":{"severity":"HIGH"}}`))
+		case "GHSA-mod":
+			w.Write([]byte(`{"database_specific":{"severity":"MODERATE"}}`))
+		default:
+			w.Write([]byte(`{}`)) // no severity -> absent -> SevUnknown for caller
+		}
+	}))
+	defer srv.Close()
+	old := osvVulnURL
+	osvVulnURL = srv.URL + "/"
+	defer func() { osvVulnURL = old }()
+
+	got := Severities([]string{"GHSA-high", "GHSA-mod", "GHSA-high", "GHSA-none"})
+	if got["GHSA-high"] != SevHigh {
+		t.Errorf("GHSA-high = %v, want high", got["GHSA-high"])
+	}
+	if got["GHSA-mod"] != SevModerate {
+		t.Errorf("GHSA-mod = %v, want moderate", got["GHSA-mod"])
+	}
+	if _, ok := got["GHSA-none"]; ok {
+		t.Error("a record with no severity must be ABSENT (caller reads it as unknown)")
+	}
+	if hits != 3 {
+		t.Errorf("fetched %d times, want 3 (duplicate GHSA-high deduped)", hits)
+	}
+}
+
+// TestSeveritiesReadsCVSSLabel verifies the CVSS fallback when a feed populates
+// severity[].score with a bare label rather than database_specific.
+func TestSeveritiesReadsCVSSLabel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"severity":[{"type":"CVSS_V3","score":"critical"}]}`))
+	}))
+	defer srv.Close()
+	old := osvVulnURL
+	osvVulnURL = srv.URL + "/"
+	defer func() { osvVulnURL = old }()
+
+	got := Severities([]string{"GHSA-c"})
+	if got["GHSA-c"] != SevCritical {
+		t.Errorf("CVSS label fallback = %v, want critical", got["GHSA-c"])
+	}
+}
+
+// TestSeveritiesFailOpenOnError confirms a non-200 / network error leaves the id
+// ABSENT (caller treats as unknown -> blocks), never decoding to a low severity.
+func TestSeveritiesFailOpenOnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	old := osvVulnURL
+	osvVulnURL = srv.URL + "/"
+	defer func() { osvVulnURL = old }()
+
+	got := Severities([]string{"GHSA-err"})
+	if _, ok := got["GHSA-err"]; ok {
+		t.Error("a 500 must leave the id absent (caller blocks), not score it")
+	}
+}
+
+// TestSeveritiesRespectsCap confirms the fetch cap bounds fan-out; ids beyond
+// the cap stay absent (and therefore block).
+func TestSeveritiesRespectsCap(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{"database_specific":{"severity":"LOW"}}`))
+	}))
+	defer srv.Close()
+	old, oldCap := osvVulnURL, maxSeverityFetches
+	osvVulnURL = srv.URL + "/"
+	maxSeverityFetches = 2
+	defer func() { osvVulnURL = old; maxSeverityFetches = oldCap }()
+
+	got := Severities([]string{"a", "b", "c", "d"})
+	if hits != 2 {
+		t.Errorf("fetched %d, want 2 (capped)", hits)
+	}
+	if len(got) != 2 {
+		t.Errorf("scored %d ids, want 2", len(got))
+	}
+}
