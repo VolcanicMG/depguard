@@ -72,6 +72,15 @@ type Config struct {
 	// unknown/unscored severities always block regardless (fail closed). Default
 	// SevHigh: critical+high block, moderate+low warn.
 	AdvisoryThreshold advisory.Severity
+	// SecretPaths lists file/dir glob patterns that must NEVER be committed or
+	// pushed (e.g. ".env", ".env.*", "secrets/", "*.pem"). `guard check` hard-
+	// blocks the commit/push — like a critical advisory — when any matching file
+	// is staged or already tracked by git, so a secret can't reach the remote.
+	// Patterns match the repo-relative path or the basename via filepath.Match; a
+	// trailing '/' matches everything under that directory. Empty disables the
+	// gate. Waive a deliberate match (e.g. ".env.example") with
+	// 'guard ignore secret:<path>'.
+	SecretPaths []string
 }
 
 // FileName is the policy file dropped by `guard init`, committed with the repo.
@@ -144,6 +153,8 @@ func Load(dir string) (Config, error) {
 			c.LicenseDeny = parseList(val)
 		case "license-allow":
 			c.LicenseAllow = parseList(val)
+		case "secret-paths":
+			c.SecretPaths = parseList(val)
 		case "advisory-threshold":
 			sev, ok := advisory.ParseSeverity(val)
 			if !ok {
@@ -340,6 +351,19 @@ no-container-fallback: warn-approve
 #   default: [] / []  (license gate off)
 # license-deny: ["GPL-3.0", "AGPL-3.0", "GPL-2.0"]
 # license-allow: ["MIT", "ISC", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"]
+
+# ── secret-paths ──────────────────────────────────────────────────────────────
+# Files/dirs that must NEVER reach the remote (credentials, key material). If any
+# matching file is STAGED or already TRACKED by git, 'guard check' HARD-BLOCKS the
+# commit/push — same gate weight as a critical advisory — so a secret can't be
+# uploaded. Untracked/gitignored files are ignored (git wouldn't upload them).
+#   matching:  repo-relative path OR basename via filepath.Match; a trailing '/'
+#              matches everything under that directory. e.g. ".env" matches
+#              "./.env" and "config/.env"; "secrets/" matches "secrets/prod.key".
+#   values:    list of patterns, e.g. [".env", ".env.*", "secrets/", "*.pem"]
+#   default:   []  (gate off)
+#   false positive? waive one path: guard ignore secret:<path> --reason "..."
+# secret-paths: [".env", ".env.*", "secrets/", "*.pem", "*.key", "id_rsa"]
 `
 	return os.WriteFile(path, []byte(starter), 0o644)
 }
@@ -483,7 +507,7 @@ func canonicalValue(key, value string) (string, error) {
 			return "", err
 		}
 		return reg, nil
-	case "allow", "internal-scopes", "flag", "license-deny", "license-allow":
+	case "allow", "internal-scopes", "flag", "license-deny", "license-allow", "secret-paths":
 		// Accept comma- or space-separated input; emit a canonical [a, b] list.
 		fields := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' })
 		var items []string
@@ -495,7 +519,7 @@ func canonicalValue(key, value string) (string, error) {
 		}
 		return "[" + strings.Join(items, ", ") + "]", nil
 	default:
-		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold)", key)
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold, secret-paths)", key)
 	}
 }
 

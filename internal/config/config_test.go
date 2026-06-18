@@ -98,3 +98,46 @@ func TestAdvisoryThresholdCanonicalValue(t *testing.T) {
 		t.Error("canonicalValue accepted a bad threshold; expected an error")
 	}
 }
+
+// TestSecretPathsParsed verifies the secret-paths list key loads into config.
+func TestSecretPathsParsed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(`secret-paths: [".env", ".env.*", "secrets/"]`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{".env", ".env.*", "secrets/"}
+	if len(c.SecretPaths) != len(want) {
+		t.Fatalf("SecretPaths = %v, want %v", c.SecretPaths, want)
+	}
+	for i := range want {
+		if c.SecretPaths[i] != want[i] {
+			t.Fatalf("SecretPaths[%d] = %q, want %q", i, c.SecretPaths[i], want[i])
+		}
+	}
+}
+
+// TestSecretPathsCanonicalValue verifies guard config set normalizes the list.
+func TestSecretPathsCanonicalValue(t *testing.T) {
+	got, err := canonicalValue("secret-paths", ".env, secrets/  *.pem")
+	if err != nil {
+		t.Fatalf("canonicalValue: %v", err)
+	}
+	if got != `[.env, secrets/, *.pem]` {
+		t.Fatalf("canonicalValue = %q, want [.env, secrets/, *.pem]", got)
+	}
+}
+
+// TestSecretPathsDefaultEmpty: the gate is off by default (no .guardrc).
+func TestSecretPathsDefaultEmpty(t *testing.T) {
+	c, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.SecretPaths) != 0 {
+		t.Fatalf("default SecretPaths = %v, want empty", c.SecretPaths)
+	}
+}

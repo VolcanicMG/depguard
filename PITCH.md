@@ -65,12 +65,18 @@ detection (the account-takeover fingerprint), per-version capability diffs
 entries, and an LLM-injection sweep (prompt-injection prose, Trojan-Source bidi,
 zero-width hiding) for the era when an *agent* reviews your deps.
 
+**Secret-leak guard** — the one layer pointed at *you*, not your deps. List the
+files that must never leave the building (`.env`, `secrets/`, keys) and `guard
+check` hard-blocks any commit/push that would carry one to the remote — staged or
+already tracked. Plus, a cooldown hit is now recoverable in place: accept all, or
+auto-pin each dep down to its latest version past the cooldown and reinstall.
+
 ## Services & surfaces
 
 | Surface | What you get |
 |---|---|
 | `guard install` / `guard ci` | protected installs — the proxy, the filters, the box |
-| `guard check [--json]` | on-demand audit: advisories, cooldown, integrity — across npm, pnpm, and yarn lockfiles |
+| `guard check [--json]` | on-demand audit: advisories, cooldown, integrity, secret files — across npm, pnpm, and yarn lockfiles |
 | `guard scan <dir> [--json]` | static-scan any package dir; JSON for CI and agents |
 | git hooks + CI gate | `guard init` drops pre-commit/pre-push hooks and an optional PR check — a teammate's bad dep never merges |
 | `guard mcp` | MCP server over stdio (`scan_package`, `check_dependencies`) — your AI agents get the same protection, with every result wrapped as untrusted data |

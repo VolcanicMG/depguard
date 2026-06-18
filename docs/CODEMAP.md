@@ -26,7 +26,8 @@ Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md)
  │   ├── typosquat/typosquat.go  name-level filter: Damerau-1 + homoglyph
  │   ├── provenance/provenance.go npm ECDSA dist.signature verification (stdlib)
  │   ├── maintainer/maintainer.go publisher-change / account-takeover detection
- │   ├── freshness/freshness.go  cooldown re-check on lockfile versions
+ │   ├── freshness/freshness.go  cooldown re-check on lockfile versions + LatestSafe (pin target)
+│   ├── secrets/secrets.go      secret-file gate: git staged/tracked vs secret-paths globs
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
  │   │                           Severities = per-vuln detail for tiering; Blocks)
  │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
@@ -138,6 +139,9 @@ the shared history.
 | Maintainer-change heuristic | `maintainer/maintainer.go` `changesFor()` |
 | Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `Installed()` |
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
+| Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
+| Cooldown accept-all / auto-pin | `main.go` `confirmCooldown` / `pinAndReinstall` / `pinPackageJSON` / `setDepVersion`; pin target from `freshness.LatestSafe` |
+| New waiver-id kind | `main.go` `validWaiverID` + a `<kind>WaiverID` helper |
 | Box hardening / seccomp | `box/box.go` `Run()` args + `seccompProfile` |
 | New dynamic (syscall) signal | `trace/trace.go` — add a matcher; convict only on no-build-excuse behavior |
 | Box hardening / different runtime | `box/box.go` `Run()` arg list; image digest + obs Dockerfile at top |

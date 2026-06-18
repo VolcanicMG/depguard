@@ -18,6 +18,8 @@ background.
  install-time scripts (postinstall)      badly when your APP runs in prod)
  typosquats / dependency confusion     vulnerabilities in YOUR own code
  tarball ≠ source tampering            kernel / container escapes (rare)
+ secrets reaching the remote (.env,
+   key material) — YOUR files leaking
 ```
 
 **Honest stance:** no single check certifies a package "clean." depguard is
@@ -621,6 +623,55 @@ Five capabilities added in one pass:
 ```
 
 **v0.8.1 — feedback polish:** cooldown violations show an ETA ("clears cooldown in ~3d"); `guard check` prints a one-line rollup verdict (deps count + gating categories); the slow per-package network checks (provenance, maintainer) show `N/M` progress on a TTY; `guard status` lists the license + provenance gates and whether each is enabled; `guard init` prints numbered next steps. Output-only — no new commands, flags, or policy keys.
+
+## 14. Secret-file gate (v1.0.0)
+
+Every layer above guards against THIRD-PARTY code. This one guards the other
+direction: the repo's own authors accidentally committing a credential. It is the
+only gate that inspects *your* files, not your dependencies.
+
+`secret-paths` in `.guardrc` lists file/dir glob patterns that must never reach
+the remote (`.env`, `.env.*`, `secrets/`, `*.pem`, …). On `guard check` — which
+the pre-commit and pre-push hooks run — the gate collects every file git would
+upload (the union of `git ls-files` for already-tracked and `git diff --cached`
+for staged) and HARD-BLOCKS, same weight as a critical advisory, when any match a
+pattern. It leads the exit-code precedence: an uploaded credential is the
+highest-stakes, least-recoverable miss.
+
+Guarantees / boundaries:
+- "Staged or tracked" is git's actual upload surface. An untracked / gitignored
+  file is ignored — git won't push it, so it isn't a leak yet. Corollary: a
+  secret committed months ago still blocks every push until it is `git rm
+  --cached`d (and rotated).
+- Matching is repo-relative-path OR basename via `path.Match`, plus a
+  trailing-'/' directory prefix. No registry, no network — pure local git state.
+- Fail-open + loud on a git error (not a repo, git absent): there is no upload
+  surface to assert about, so the gate stays inert rather than wedging commits.
+- A deliberate match (`.env.example`, a fixture) is waived per-path with `guard
+  ignore secret:<path>`, recorded in `.guard-ignores` like every other waiver.
+
+## 14b. Cooldown resolution — accept-all + auto-pin (v1.0.0)
+
+A cooldown violation at commit/push used to be a flat hard block. On an
+interactive terminal (`guard check --confirm`, which the hooks pass) it now
+offers one choice over ALL violations at once:
+
+```
+ [a] accept all       record a cooldown waiver per version, then proceed
+ [p] pin & reinstall  rewrite package.json's DIRECT deps to each package's
+                      latest version PAST the cooldown (from the registry time
+                      map), re-run the install through the ephemeral proxy,
+                      then re-verify
+ [N] abort
+```
+
+Pinning is a targeted string edit of package.json (not a JSON re-encode), so the
+committed file's formatting and key order survive; only direct deps can be pinned
+(a transitive too-fresh version is reported, and the reinstall may drop it on its
+own). The pin is not trusted blindly — after reinstall the freshness check
+re-runs, and a surviving violation fails the pin rather than reporting success.
+CI / no-terminal keeps the strict hard block: this is an interactive convenience,
+never an automatic bypass.
 
 ## 12. Open items
 

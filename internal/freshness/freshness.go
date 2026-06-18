@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"depguard/internal/lockfile"
+	"depguard/internal/semver"
 )
 
 // Violation is one lockfile version still inside the cooldown window.
@@ -114,4 +115,44 @@ func publishTime(client *http.Client, registry, name, version string) (time.Time
 		return time.Time{}, nil
 	}
 	return t, nil
+}
+
+// LatestSafe returns the highest STABLE version of name whose publish age is at
+// least cooldown — the newest version an install could safely pin to in place of
+// a too-fresh one (the `guard check --confirm` "pin & reinstall" path). Returns
+// "" (nil error) when the registry exposes no qualifying version; a network or
+// parse error is returned so the caller can fall back to a generic message
+// instead of a bogus suggestion.
+func LatestSafe(registry, name string, cooldown time.Duration) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(registry + "/" + url.PathEscape(name))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("registry returned %d", resp.StatusCode)
+	}
+	// Decode the version set + the time map; tarball/dist blobs are skipped.
+	var doc struct {
+		Versions map[string]json.RawMessage `json:"versions"`
+		Time     map[string]string          `json:"time"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return "", fmt.Errorf("packument parse: %w", err)
+	}
+	cutoff := time.Now().Add(-cooldown)
+	var safe []string
+	for v := range doc.Versions {
+		ts, ok := doc.Time[v]
+		if !ok {
+			continue // no publish timestamp → can't prove it cleared cooldown
+		}
+		t, err := time.Parse(time.RFC3339, ts)
+		if err != nil || t.After(cutoff) {
+			continue // unparseable or still inside the window
+		}
+		safe = append(safe, v)
+	}
+	return semver.MaxStable(safe), nil
 }

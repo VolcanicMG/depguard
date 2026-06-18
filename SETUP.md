@@ -129,6 +129,7 @@ no-container-fallback: warn-approve # no Docker? warn + ask (CI fails closed unl
 flag: [new-deps, new-maintainer]   # extra signals guard check surfaces (see below)
 advisory-threshold: high           # lowest advisory severity that BLOCKS; below it warns | critical|high|moderate|low
 untraced-boxed: run                # box can't build the strace image? run caged-but-unwatched | or: fail
+secret-paths: [".env", ".env.*", "secrets/", "*.pem"]  # files that must NEVER be committed/pushed (off by default)
 # registry: https://registry.npmjs.org   # upstream; must be https (loopback http ok for tests)
 ```
 
@@ -155,6 +156,18 @@ Tips:
   runs `guard check --confirm`: it lists any warnings and asks before proceeding,
   and recording your acceptance writes a waiver into `.guard-ignores` so it's
   auditable later. CI (no terminal) never prompts — warnings print, blockers gate.
+- **`secret-paths:` stops YOUR secrets from leaking.** List the files that must
+  never reach the remote (`.env`, `secrets/`, `*.pem`, keys). If any matching file
+  is staged or already tracked by git, `guard check` HARD-BLOCKS the commit/push —
+  same weight as a critical advisory — so the secret can't be uploaded. Untracked /
+  gitignored files are ignored (git wouldn't push them); a file already committed
+  keeps blocking until you `git rm --cached` it (and rotate the secret). A
+  deliberate match (`.env.example`) is waived with `guard ignore secret:<path>`.
+- **A cooldown hit at a terminal is recoverable in place.** On a commit/push the
+  hook's `guard check --confirm` offers, over all violations at once: **[a] accept
+  all** (waive them) or **[p] pin & reinstall** — drop each direct dep to its
+  latest version past the cooldown, reinstall, and re-verify. CI keeps the strict
+  block; pinning never happens unattended.
 - **A typo in a bool fails closed.** `ignore-scripts: tru` errors out rather than
   silently disabling script neutralization. A typo'd `advisory-threshold` errors
   the same way (it never silently arms an unknown level). Unknown keys warn
@@ -220,9 +233,9 @@ can reach their `node_modules`, but not past the merge gate.
 
 ## 7. Waiving a reviewed finding (`.guard-ignores`)
 
-`guard check` gates on advisories, cooldown, and lockfile integrity. When you've
-**reviewed** a finding and accept it, waive that one issue so it stops holding up
-commits/PRs — without weakening the check for anything else.
+`guard check` gates on advisories, cooldown, lockfile integrity, and secret files.
+When you've **reviewed** a finding and accept it, waive that one issue so it stops
+holding up commits/PRs — without weakening the check for anything else.
 
 ```sh
 guard check
@@ -237,7 +250,7 @@ guard ignore --remove cooldown:lodash@4.17.21
 How to think about it:
 
 - **One waiver = one finding**, pinned to an exact `name@version` + kind. IDs:
-  `cooldown:<name>@<version>`, `off-registry:<name>@<version>`,
+  `cooldown:<name>@<version>`, `secret:<path>`, `off-registry:<name>@<version>`,
   `unhashed:<name>@<version>`, `advisory:<name>@<version>:<osv-id>`.
 - **It lapses when the package moves.** A new version is a new finding — you'll be
   asked to review it fresh. A waiver can't silently cover a version nobody saw.

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"depguard/internal/registry"
 	"depguard/internal/sbom"
 	"depguard/internal/scanner"
+	"depguard/internal/secrets"
 	"depguard/internal/semver"
 	"depguard/internal/tty"
 	"depguard/internal/ui"
@@ -105,7 +107,7 @@ func usage(w io.Writer) {
   guard status                    is this repo protected? (policy, hooks, sandbox, decisions)
   guard install [npm args...]     npm install, filtered + scripts neutralized
   guard ci                        npm ci — lockfile-exact, same protections
-  guard check [--quiet] [--json] [--confirm]  re-check installed deps (advisories, cooldown, integrity)
+  guard check [--quiet] [--json] [--confirm]  re-check repo (advisories, cooldown, integrity, secret files)
   guard scan <dir> [--json]       static-scan one package dir (scripts, caps, injection)
   guard why <package> [--all]     show which direct dep(s) pull a package in (npm lockfile)
   guard sbom [--spdx]             write an SBOM of installed deps to stdout (CycloneDX, or SPDX)
@@ -442,7 +444,7 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	// Same severity tiering as 'guard check' (moderate/low warn, high+/MAL/unknown
 	// block), but no interactive confirm here — install isn't the commit/push gate.
 	advErr := checkAdvisories(dir, false, false, cfg.AdvisoryThreshold, wf)
-	freshErr := checkFreshness(dir, false, false, wf)
+	freshErr := checkFreshness(dir, false, false, false, wf)
 	if advErr != nil {
 		return advErr
 	}
@@ -745,8 +747,9 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
+	secErr := checkSecrets(dir, cfg, wf, quiet)
 	advErr := checkAdvisories(dir, quiet, confirm, cfg.AdvisoryThreshold, wf)
-	freshErr := checkFreshness(dir, quiet, all, wf)
+	freshErr := checkFreshness(dir, quiet, all, confirm, wf)
 	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
 	licErr := checkLicenses(dir, cfg, wf, quiet)
 	var provErr error
@@ -765,6 +768,7 @@ func cmdCheck(args []string) error {
 	// checkers printed above (and lands as a single line in CI logs).
 	if !quiet {
 		printCheckSummary(dir, map[string]error{
+			"secrets":    secErr,
 			"advisories": advErr,
 			"cooldown":   freshErr,
 			"integrity":  intErr,
@@ -772,7 +776,11 @@ func cmdCheck(args []string) error {
 			"provenance": provErr,
 		})
 	}
-	// First gate to trip wins the exit code; all of them already printed.
+	// First gate to trip wins the exit code; all of them already printed. Secrets
+	// lead — an uploaded credential is the highest-stakes, least-recoverable miss.
+	if secErr != nil {
+		return secErr
+	}
 	if advErr != nil {
 		return advErr
 	}
@@ -828,8 +836,11 @@ type CheckResult struct {
 	NewDeps          []string              `json:"newDeps"`
 	Maintainers      []maintainer.Change   `json:"maintainerChanges"`
 	License          []license.Violation   `json:"licenseViolations,omitempty"`
-	Provenance       []attestation.Result  `json:"provenance,omitempty"`
-	Waived           []string              `json:"waived,omitempty"`
+	// Secrets are files matching a secret-paths pattern that are staged or already
+	// tracked by git — a HARD block (like a critical advisory). These flip OK.
+	Secrets    []secrets.Match      `json:"secrets,omitempty"`
+	Provenance []attestation.Result `json:"provenance,omitempty"`
+	Waived     []string             `json:"waived,omitempty"`
 	// Degraded names layers that could NOT run this check (e.g. OSV unreachable,
 	// a registry fetch failed). The check stays fail-open — these don't flip OK —
 	// but a non-empty Degraded means a green result is INCOMPLETE, not proven
@@ -868,6 +879,11 @@ func unhashedWaiverID(key string) string    { return "unhashed:" + key }
 func licenseWaiverID(v license.Violation) string {
 	return fmt.Sprintf("license:%s@%s", v.Name, v.Version)
 }
+
+// secretWaiverID is "secret:<repo-relative-path>" — waives a deliberate match
+// (e.g. ".env.example" caught by ".env.*", or a fixture). Keyed on the path, not
+// a version: the file either should ship or shouldn't.
+func secretWaiverID(path string) string { return "secret:" + path }
 
 // waiverReason renders " — <reason>" for display, or "" when none was given.
 func waiverReason(e waivers.Entry) string {
@@ -960,10 +976,28 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		return res, err
 	}
 	now := time.Now()
+	// Secret-file gate runs FIRST and independent of the lockfile: it inspects
+	// git's tracked/staged set, not node_modules, so it must gate even in a repo
+	// with no dependencies. A git error means "no upload surface to assert about"
+	// — recorded as degraded, never silently treated as a leak.
+	if len(cfg.SecretPaths) > 0 {
+		if m, serr := secrets.Find(dir, cfg.SecretPaths); serr != nil {
+			res.Degraded = append(res.Degraded, "secret-paths check skipped: "+serr.Error())
+		} else {
+			for _, hit := range m {
+				if waivedActive(wf, secretWaiverID(hit.Path), now) {
+					res.Waived = append(res.Waived, secretWaiverID(hit.Path))
+					continue
+				}
+				res.Secrets = append(res.Secrets, hit)
+			}
+		}
+	}
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			res.OK = true
+			// No deps to vet, but a tracked secret still gates.
+			res.OK = len(res.Secrets) == 0
 			return res, nil
 		}
 		return res, err
@@ -1062,7 +1096,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	}
 	// res.Advisories is blockers-only (warnings live in AdvisoryWarnings and do
 	// not gate), so OK keys off it directly.
-	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0 && len(res.License) == 0 && invalidProv == 0
+	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0 && len(res.License) == 0 && len(res.Secrets) == 0 && invalidProv == 0
 	return res, nil
 }
 
@@ -1285,7 +1319,7 @@ func reportNewDeps(dir string, quiet bool) {
 // Scope: only versions ADDED relative to git HEAD (each version gets checked
 // once, at the commit that introduces it) — full tree with --all or when
 // there's no git history to diff against.
-func checkFreshness(dir string, quiet, all bool, wf *waivers.File) error {
+func checkFreshness(dir string, quiet, all, confirm bool, wf *waivers.File) error {
 	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
@@ -1369,8 +1403,200 @@ func checkFreshness(dir string, quiet, all bool, wf *waivers.File) error {
 				v.Name, v.Version, int(v.Age.Hours()/24), fmtRemaining(v.Remaining))
 		}
 	}
+	// Interactive gate (the git hooks pass --confirm; CI/no-terminal does not):
+	// offer to accept all and waive, or auto-pin each package to its latest
+	// version past the cooldown and reinstall. With no terminal we fall through to
+	// the hard block below — install enforcement and CI stay strict.
+	if confirm {
+		resolved, interactive, cerr := confirmCooldown(dir, cfg, active, wf)
+		if cerr != nil {
+			return cerr
+		}
+		if interactive {
+			if resolved {
+				return nil
+			}
+			return fmt.Errorf("commit/push aborted — %d version(s) inside the cooldown not accepted", len(active))
+		}
+	}
 	fmt.Fprintln(os.Stderr, "guard: wait out the cooldown, pin an older version, allowlist in .guardrc, or — if reviewed — guard ignore cooldown:<name>@<version>")
 	return fmt.Errorf("%d version(s) violate the cooldown", len(active))
+}
+
+// confirmCooldown is the interactive cooldown gate (the --confirm path). On the
+// controlling terminal it offers three choices for the too-fresh versions:
+//
+//	[a] accept all      record a cooldown waiver for each and proceed
+//	[p] pin & reinstall rewrite package.json's DIRECT deps to each package's
+//	                    latest version past the cooldown, reinstall, re-verify
+//	[N] abort
+//
+// interactive is false when there's no terminal (CI, a piped hook) — the caller
+// then falls through to the hard block. Reads /dev/tty, not stdin: a git hook's
+// stdin carries ref data, not the keyboard (mirrors confirmThroughWarnings).
+func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation, wf *waivers.File) (resolved, interactive bool, err error) {
+	ttyf, e := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if e != nil {
+		return false, false, nil // no terminal — caller hard-blocks
+	}
+	defer ttyf.Close()
+
+	// One registry fetch per package to name the concrete pin target up front, so
+	// the human chooses with the real version in hand rather than a guess.
+	safe := map[string]string{}
+	for _, v := range active {
+		if s, e := freshness.LatestSafe(cfg.Registry, v.Name, cfg.Cooldown); e == nil && s != "" {
+			safe[v.Name] = s
+		}
+	}
+	fmt.Fprintln(ttyf, "guard: cooldown options —")
+	for _, v := range active {
+		if s := safe[v.Name]; s != "" {
+			fmt.Fprintf(ttyf, "  %s@%s  → latest past cooldown: %s\n", v.Name, v.Version, s)
+		} else {
+			fmt.Fprintf(ttyf, "  %s@%s  (no version past the cooldown yet)\n", v.Name, v.Version)
+		}
+	}
+	fmt.Fprint(ttyf, "Choose: [a] accept all (waive)  [p] pin & reinstall  [N] abort: ")
+	line, _ := bufio.NewReader(ttyf).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "a", "accept":
+		reason := "accepted " + time.Now().UTC().Format("2006-01-02") + " via guard check --confirm"
+		for _, v := range active {
+			if e := wf.Set(cooldownWaiverID(v), reason, ""); e != nil {
+				return false, true, e
+			}
+		}
+		if e := wf.Save(dir); e != nil {
+			return false, true, e
+		}
+		fmt.Fprintf(ttyf, "guard: recorded %d cooldown acceptance(s) in %s\n", len(active), waivers.FileName)
+		return true, true, nil
+	case "p", "pin":
+		if e := pinAndReinstall(dir, cfg, active, safe, ttyf); e != nil {
+			fmt.Fprintln(ttyf, "guard: pin failed:", e)
+			return false, true, nil // failed pin = not resolved; caller aborts
+		}
+		return true, true, nil
+	default:
+		fmt.Fprintln(ttyf, "guard: not accepted — aborting.")
+		return false, true, nil
+	}
+}
+
+// pinAndReinstall rewrites package.json so each cooldown-violating DIRECT
+// dependency points at its latest version past the cooldown (from safe), then
+// re-runs the install through guard's ephemeral proxy to refresh the lockfile.
+// Transitive violations (not named in package.json) can't be pinned directly —
+// they're reported; the reinstall may still resolve them to an older survivor.
+// Errors if nothing could be pinned, the reinstall fails, or a violation
+// survives the reinstall.
+func pinAndReinstall(dir string, cfg config.Config, active []freshness.Violation, safe map[string]string, out io.Writer) error {
+	pinned, unpinnable, err := pinPackageJSON(dir, active, safe)
+	if err != nil {
+		return err
+	}
+	if len(pinned) == 0 {
+		return fmt.Errorf("no DIRECT dependency to pin (%d transitive — update the dep that pulls them in, or wait out the cooldown)", len(unpinnable))
+	}
+	for name, ver := range pinned {
+		fmt.Fprintf(out, "guard: pinned %s → %s in package.json\n", name, ver)
+	}
+	for _, n := range unpinnable {
+		fmt.Fprintf(out, "guard: %s is transitive — not pinned directly; reinstall may still drop it\n", n)
+	}
+	// Reinstall through the proxy so the (older) versions are fetched under the
+	// same cooldown/advisory protections; lifecycle scripts stay off.
+	proxy, err := registry.Start(cfg)
+	if err != nil {
+		return fmt.Errorf("start proxy: %w", err)
+	}
+	defer proxy.Stop()
+	inv := buildInstall(detectManager(dir), "install", nil, proxy.URL(), cfg.IgnoreScripts)
+	cmd := exec.Command(inv.name, inv.args...)
+	cmd.Dir = dir
+	cmd.Stdout, cmd.Stderr = out, out
+	cmd.Env = append(os.Environ(), inv.env...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("reinstall failed: %w", err)
+	}
+	fmt.Fprintln(out, "guard: reinstalled, lockfile refreshed.")
+	// Re-verify: a pin that didn't actually clear every violation must NOT report
+	// success (a transitive dep can drag a too-fresh version back in).
+	pkgs, err := lockfile.Installed(dir)
+	if err != nil {
+		return err
+	}
+	if viol, _ := freshness.Check(cfg.Registry, pkgs, cfg.Cooldown, cfg.Allowed); len(viol) > 0 {
+		return fmt.Errorf("%d version(s) still inside the cooldown after reinstall", len(viol))
+	}
+	return nil
+}
+
+// pinPackageJSON rewrites dir/package.json so each violating DIRECT dependency
+// is set to its safe[name] version, returning what it pinned and which names it
+// couldn't (transitive, or no safe version). The edit is a string replacement
+// (setDepVersion), not a JSON re-encode, so the committed file's formatting and
+// key order survive. The file is written only if at least one dep was pinned.
+func pinPackageJSON(dir string, active []freshness.Violation, safe map[string]string) (pinned map[string]string, unpinnable []string, err error) {
+	path := filepath.Join(dir, "package.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	var pj struct {
+		Dependencies         map[string]string `json:"dependencies"`
+		DevDependencies      map[string]string `json:"devDependencies"`
+		OptionalDependencies map[string]string `json:"optionalDependencies"`
+	}
+	if err := json.Unmarshal(data, &pj); err != nil {
+		return nil, nil, fmt.Errorf("parse package.json: %w", err)
+	}
+	direct := func(name string) bool {
+		_, a := pj.Dependencies[name]
+		_, b := pj.DevDependencies[name]
+		_, c := pj.OptionalDependencies[name]
+		return a || b || c
+	}
+	pinned = map[string]string{}
+	content := string(data)
+	seen := map[string]bool{}
+	for _, v := range active {
+		if seen[v.Name] {
+			continue // one pin per package even if several versions violate
+		}
+		seen[v.Name] = true
+		s := safe[v.Name]
+		if s == "" || !direct(v.Name) {
+			unpinnable = append(unpinnable, v.Name)
+			continue
+		}
+		if next, ok := setDepVersion(content, v.Name, s); ok {
+			content = next
+			pinned[v.Name] = s
+		} else {
+			unpinnable = append(unpinnable, v.Name)
+		}
+	}
+	if len(pinned) == 0 {
+		return pinned, unpinnable, nil
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return nil, nil, err
+	}
+	return pinned, unpinnable, nil
+}
+
+// setDepVersion rewrites the version value of dependency name in package.json
+// text, preserving every other byte (a targeted string edit, not a JSON
+// re-encode — so a committed file's layout, key order, and spacing are
+// untouched). Returns the new text and whether it changed.
+func setDepVersion(content, name, version string) (string, bool) {
+	re := regexp.MustCompile(`("` + regexp.QuoteMeta(name) + `"\s*:\s*")[^"]*(")`)
+	if !re.MatchString(content) {
+		return content, false
+	}
+	return re.ReplaceAllString(content, "${1}"+version+"${2}"), true
 }
 
 // headLockfile reads package-lock.json as committed at git HEAD.
@@ -1622,6 +1848,55 @@ func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File)
 		fmt.Fprintln(ttyf, "guard: not accepted — aborting.")
 		return false, true, nil
 	}
+}
+
+// checkSecrets is the commit/push gate for credential files (DESIGN.md §11). It
+// hard-blocks — like a critical advisory, with no interactive bypass — when a
+// file matching a secret-paths pattern is staged or already tracked by git, so a
+// secret can't be uploaded. A git error (not a repo, git missing) is fail-open
+// and logged: there's no upload surface to assert about. A deliberate match is
+// waived per-path with 'guard ignore secret:<path>'.
+func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
+	if len(cfg.SecretPaths) == 0 {
+		return nil
+	}
+	matches, err := secrets.Find(dir, cfg.SecretPaths)
+	if err != nil {
+		// Fail-open + loud, consistent with the advisory/freshness network paths:
+		// a missing git binary or non-repo must not wedge every check.
+		fmt.Fprintln(os.Stderr, "guard: secret-paths check skipped:", err)
+		return nil
+	}
+	now := time.Now()
+	var active []secrets.Match
+	for _, m := range matches {
+		id := secretWaiverID(m.Path)
+		e, st := wf.Check(id, now)
+		switch st {
+		case waivers.Active:
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "guard: %s secret-path waived %s%s\n", ui.Waived(), id, waiverReason(e))
+			}
+		case waivers.Expired:
+			fmt.Fprintf(os.Stderr, "guard: %s secret-path waiver EXPIRED (%s) for %s — re-review or renew\n", ui.Warn(), e.Expires, id)
+			active = append(active, m)
+		default:
+			active = append(active, m)
+		}
+	}
+	if len(active) == 0 {
+		if !quiet {
+			fmt.Printf("guard: no secret files staged or tracked %s\n", ui.OK())
+		}
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "guard: %s %d secret file(s) would be committed/pushed:\n", ui.Bad(), len(active))
+	for _, m := range active {
+		fmt.Fprintf(os.Stderr, "  %s  (matched secret-paths %q)\n", m.Path, m.Pattern)
+	}
+	fmt.Fprintln(os.Stderr, "guard: untrack it first — git rm --cached <file> (and add it to .gitignore).")
+	fmt.Fprintf(os.Stderr, "guard: a deliberate file? → guard ignore secret:%s --reason \"...\"\n", active[0].Path)
+	return fmt.Errorf("%d secret file(s) staged or tracked", len(active))
 }
 
 // ─── guard scan ──────────────────────────────────────────────────────────────
@@ -1927,7 +2202,8 @@ func cmdIgnore(args []string) error {
 	if !validWaiverID(id) {
 		return fmt.Errorf("unrecognized issue id %q — expected one of: "+
 			"advisory:<name>@<version>:<osv-id>, cooldown:<name>@<version>, "+
-			"off-registry:<name>@<version>, unhashed:<name>@<version>", id)
+			"off-registry:<name>@<version>, unhashed:<name>@<version>, "+
+			"license:<name>@<version>, secret:<path>", id)
 	}
 
 	if remove {
@@ -1960,7 +2236,7 @@ func cmdIgnore(args []string) error {
 // file. It validates the SHAPE, not that a matching finding currently exists —
 // you may pre-empt a finding you expect.
 func validWaiverID(id string) bool {
-	for _, prefix := range []string{"advisory:", "cooldown:", "off-registry:", "unhashed:", "license:"} {
+	for _, prefix := range []string{"advisory:", "cooldown:", "off-registry:", "unhashed:", "license:", "secret:"} {
 		if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
 			return true
 		}

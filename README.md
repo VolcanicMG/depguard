@@ -90,20 +90,22 @@ respects `NO_COLOR`.
 
 | File | Holds |
 |---|---|
-| `.guardrc` | policy: cooldown, allowed scopes, fallback mode, advisory severity threshold — **review changes in PRs** (it controls the filter) |
+| `.guardrc` | policy: cooldown, allowed scopes, fallback mode, advisory severity threshold, secret-file paths — **review changes in PRs** (it controls the filter) |
 | `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
 
 ## Waiving a reviewed finding
 
-`guard check` gates commit / push / PR / CI on advisories, cooldown, and lockfile
-integrity. When you have **reviewed** a specific finding and accept it, waive that
-one issue so it stops gating — without weakening the check for anything else:
+`guard check` gates commit / push / PR / CI on advisories, cooldown, lockfile
+integrity, and secret files. When you have **reviewed** a specific finding and
+accept it, waive that one issue so it stops gating — without weakening the check
+for anything else:
 
 ```sh
 guard check                       # prints the exact `guard ignore …` line per finding
 guard ignore cooldown:lodash@4.17.21 --reason "vendored fork, vetted" --expires 90d
+guard ignore secret:.env.example  --reason "template, no real secret"   # deliberate match
 guard ignore --list               # every waiver, tagged active / EXPIRED
 guard ignore --remove cooldown:lodash@4.17.21
 ```
@@ -136,11 +138,12 @@ dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.)
 | Maintainer-change (opt-in) | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 | Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
 | License-policy gate (opt-in) | installed packages under a denied — or, in allowlist mode, non-allowed — license (`license-deny` / `license-allow` in .guardrc) |
+| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, `*.pem`, keys) staged or already tracked by git — hard-blocks commit/push (leads the exit-code precedence) so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate file with `guard ignore secret:<path>` |
 | Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
 | Exact version pinning (`.npmrc` `save-exact`) | silent range drift — a later `npm install` pulling a freshly-compromised `^`/`~` patch you never chose; deps stay at the version you vetted until you bump manually |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
-| `guard check` on commit/PR | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds |
+| `guard check` on commit/PR | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds. At a terminal (`--confirm`, which the hooks pass) a cooldown hit offers **accept-all** (waive every violation) or **pin & reinstall** (drop each direct dep to its latest version past the cooldown, then re-verify); CI keeps the strict block |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
 HEAD** — each version is vetted once, at the commit that introduces it. `--all`
@@ -173,6 +176,7 @@ npm test             # builds the binary (globalSetup), runs the e2e suite
 | `scripts.test.mjs` | postinstall neutralized, denials honored, approvals file written, approved script runs sealed in docker (auto-skips without docker) |
 | `init.test.mjs` | policy + executable hooks + `.npmrc` dropped, never clobbers existing files, clear failure outside git, `check` with no lockfile |
 | `additions.test.mjs` | typosquat + dependency-confusion blocks, deprecation note, lockfile-integrity (off-registry / no-hash), fail-closed config, `scan --json` (caps + injection + bundled binary + zero-width), `mcp` stdio |
+| `secrets.test.mjs` | secret-file gate: staged `.env` blocked, untracked ignored, basename glob (`*.pem`), `guard ignore secret:<path>` clears it, `--json` reports + flips `ok` |
 
 ## Honest limits
 
