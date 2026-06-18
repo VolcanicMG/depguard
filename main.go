@@ -76,6 +76,8 @@ func main() {
 		err = cmdIgnore(os.Args[2:])
 	case "allow":
 		err = cmdAllow(os.Args[2:])
+	case "secret-add":
+		err = cmdSecretAdd(os.Args[2:])
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "status":
@@ -115,6 +117,7 @@ func usage(w io.Writer) {
   guard approve <name@version>    record a script approval (--uncontained | --deny)
   guard ignore <issue-id>         waive a reviewed check finding (--reason, --expires, --list, --remove)
   guard allow <pattern>...        add a name/scope to .guardrc allow (bypass cooldown)
+  guard secret-add <pattern>...   add a file/dir pattern to .guardrc secret-paths (never-commit gate)
   guard config [get | set <k> <v>]  show or edit .guardrc policy
   guard prewarm                   build the sandbox image now (skip the first-run wait)
   guard clean [--image]           sweep stray containers/artifacts (--image also reclaims the image)
@@ -2530,6 +2533,31 @@ func cmdAllow(args []string) error {
 			fmt.Printf("guard: allow += %s  (saved to %s — commit it)\n", pat, config.FileName)
 		} else {
 			fmt.Printf("guard: %s is already allowed\n", pat)
+		}
+	}
+	return nil
+}
+
+// cmdSecretAdd APPENDS one or more patterns to the secret-paths gate without
+// restating the existing list — the convenience counterpart to `guard config set
+// secret-paths …` (which replaces it). Mirrors cmdAllow.
+func cmdSecretAdd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: guard secret-add <pattern>...  (e.g. .env \"secrets/\" \"*.pem\")")
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	for _, pat := range args {
+		added, err := config.AddSecretPath(dir, pat)
+		if err != nil {
+			return err
+		}
+		if added {
+			fmt.Printf("guard: secret-paths += %s  (saved to %s — commit it)\n", pat, config.FileName)
+		} else {
+			fmt.Printf("guard: %s is already a secret-path\n", pat)
 		}
 	}
 	return nil

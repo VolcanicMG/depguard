@@ -468,6 +468,27 @@ func AddAllow(dir, pattern string) (bool, error) {
 	return true, nil
 }
 
+// AddSecretPath APPENDS pattern to the secret-paths list (dedup) and persists it,
+// so `guard secret-add` can extend the gate without restating the whole list (the
+// append counterpart to a full `config set secret-paths …`). Reports whether it
+// was newly added (false = already present). Mirrors AddAllow.
+func AddSecretPath(dir, pattern string) (bool, error) {
+	c, err := Load(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range c.SecretPaths {
+		if p == pattern {
+			return false, nil
+		}
+	}
+	list := append(append([]string{}, c.SecretPaths...), pattern)
+	if _, err := SetValue(dir, "secret-paths", strings.Join(list, ",")); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // canonicalValue validates value for key and returns the exact text to write.
 // It mirrors Load()'s switch so the two never disagree about what is legal.
 func canonicalValue(key, value string) (string, error) {

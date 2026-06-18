@@ -141,3 +141,50 @@ func TestSecretPathsDefaultEmpty(t *testing.T) {
 		t.Fatalf("default SecretPaths = %v, want empty", c.SecretPaths)
 	}
 }
+
+// TestAddSecretPathAppendsAndDedups verifies the append command grows the list
+// without restating it, and ignores a duplicate.
+func TestAddSecretPathAppendsAndDedups(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(`secret-paths: [".env"]`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// New pattern → appended.
+	added, err := AddSecretPath(dir, "secrets/")
+	if err != nil || !added {
+		t.Fatalf("AddSecretPath(secrets/) = (%v, %v), want (true, nil)", added, err)
+	}
+	// Duplicate → no-op.
+	added, err = AddSecretPath(dir, ".env")
+	if err != nil || added {
+		t.Fatalf("AddSecretPath(.env dup) = (%v, %v), want (false, nil)", added, err)
+	}
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{".env", "secrets/"}
+	if len(c.SecretPaths) != len(want) {
+		t.Fatalf("SecretPaths = %v, want %v", c.SecretPaths, want)
+	}
+	for i := range want {
+		if c.SecretPaths[i] != want[i] {
+			t.Fatalf("SecretPaths[%d] = %q, want %q", i, c.SecretPaths[i], want[i])
+		}
+	}
+}
+
+// TestAddSecretPathFromEmpty: creating the key when no secret-paths line exists.
+func TestAddSecretPathFromEmpty(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("cooldown: 14d\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if added, err := AddSecretPath(dir, "*.pem"); err != nil || !added {
+		t.Fatalf("AddSecretPath from empty = (%v, %v), want (true, nil)", added, err)
+	}
+	c, _ := Load(dir)
+	if len(c.SecretPaths) != 1 || c.SecretPaths[0] != "*.pem" {
+		t.Fatalf("SecretPaths = %v, want [*.pem]", c.SecretPaths)
+	}
+}

@@ -163,6 +163,9 @@ Tips:
   gitignored files are ignored (git wouldn't push them); a file already committed
   keeps blocking until you `git rm --cached` it (and rotate the secret). A
   deliberate match (`.env.example`) is waived with `guard ignore secret:<path>`.
+  The list is fully yours to extend — nothing is baked in. `guard secret-add
+  "*.pem" "secrets/"` APPENDS patterns without restating the list (the convenience
+  twin of `guard config set secret-paths …`, which replaces it).
 - **A cooldown hit at a terminal is recoverable in place.** On a commit/push the
   hook's `guard check --confirm` offers, over all violations at once: **[a] accept
   all** (waive them) or **[p] pin & reinstall** — drop each direct dep to its

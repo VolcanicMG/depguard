@@ -84,4 +84,24 @@ describe('secret-file gate', () => {
     expect(out.ok).toBe(false);
     expect(out.secrets.map((s) => s.Path)).toContain('.env');
   });
+
+  it('guard secret-add APPENDS a user pattern that then gates', async () => {
+    const { dir } = secretProject(['.env']); // starts with just .env
+    // A custom folder the user adds later — not one of the starter examples.
+    const add = await guard(dir, ['secret-add', 'private/', '*.pfx']);
+    expect(add.code).toBe(0);
+    expect(add.stdout).toMatch(/secret-paths \+= private\//);
+
+    // The newly-added pattern is now enforced.
+    writeFileSync(join(dir, 'cert.pfx'), 'BINARY');
+    gitAdd(dir, 'cert.pfx');
+    const res = await guard(dir, ['check']);
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toContain('cert.pfx');
+
+    // Re-adding an existing pattern is a no-op (dedup), still exit 0.
+    const dup = await guard(dir, ['secret-add', '.env']);
+    expect(dup.code).toBe(0);
+    expect(dup.stdout).toMatch(/already a secret-path/);
+  });
 });

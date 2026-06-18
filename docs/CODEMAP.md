@@ -142,6 +142,7 @@ the shared history.
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
 | Cooldown accept-all / auto-pin | `main.go` `confirmCooldown` / `pinAndReinstall` / `pinPackageJSON` / `setDepVersion`; pin target from `freshness.LatestSafe` |
 | New waiver-id kind | `main.go` `validWaiverID` + a `<kind>WaiverID` helper |
+| Append-to-a-list command | `config.AddSecretPath` / `AddAllow` (Load → dedup → SetValue); `main.go` `cmdSecretAdd` / `cmdAllow` + dispatch case |
 | Box hardening / seccomp | `box/box.go` `Run()` args + `seccompProfile` |
 | New dynamic (syscall) signal | `trace/trace.go` — add a matcher; convict only on no-build-excuse behavior |
 | Box hardening / different runtime | `box/box.go` `Run()` arg list; image digest + obs Dockerfile at top |

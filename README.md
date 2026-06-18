@@ -75,6 +75,7 @@ guard sbom [--spdx]            # write an SBOM of installed deps (CycloneDX, or 
 guard approve <name@version> [--uncontained|--deny]   # script decisions
 guard ignore <issue-id> [--reason ".."] [--expires 30d]  # waive a REVIEWED check finding (--list, --remove)
 guard allow <pattern>...                 # add a name/scope to .guardrc allow (bypass cooldown)
+guard secret-add <pattern>...            # append a file/dir pattern to .guardrc secret-paths (never-commit gate)
 guard config [get | set <k> <v>]         # show or edit .guardrc policy
 guard prewarm         # build the sandbox image now so the first boxed run isn't slow
 guard clean [--image] # sweep stray containers + run artifacts; --image also reclaims the image

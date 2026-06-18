@@ -649,6 +649,9 @@ Guarantees / boundaries:
   surface to assert about, so the gate stays inert rather than wedging commits.
 - A deliberate match (`.env.example`, a fixture) is waived per-path with `guard
   ignore secret:<path>`, recorded in `.guard-ignores` like every other waiver.
+- The pattern list is entirely user-defined (empty = gate off; no baked-in
+  entries). Extend it with `guard secret-add <pattern>…` (append) or `guard config
+  set secret-paths …` (replace), or by hand in `.guardrc`.
 
 ## 14b. Cooldown resolution — accept-all + auto-pin (v1.0.0)
 
