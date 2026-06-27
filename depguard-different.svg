@@ -1,76 +1,82 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="678" viewBox="0 0 1000 678" font-family="Segoe UI, Helvetica, Arial, sans-serif">
-<defs>
-<marker id="ag" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#34c46a"/></marker>
-</defs>
-<rect width="1000" height="678" rx="20" fill="#0a0f18"/>
-<rect x="1" y="1" width="998" height="676" rx="19" fill="none" stroke="#223145"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="682" viewBox="0 0 1000 682" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="1000" height="682" rx="20" fill="#0a0f18"/>
+<rect x="1" y="1" width="998" height="680" rx="19" fill="none" stroke="#223145"/>
 <g transform="translate(40,40)">
 <path d="M0,-14 L13,-9 V2 C13,11 7,17 0,20 C-7,17 -13,11 -13,2 V-9 Z" fill="none" stroke="#34c46a" stroke-width="2.2"/>
 <path d="M-5,1 L-1,5 L6,-4" fill="none" stroke="#34c46a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
 </g>
 <text x="66" y="46" fill="#e9eef5" font-size="24" font-weight="700">dep<tspan fill="#34c46a">guard</tspan></text>
 <text x="960" y="34" text-anchor="end" fill="#8b9bb0" font-size="12" letter-spacing="3" font-weight="600">HOW IT&#39;S DIFFERENT</text>
-<text x="960" y="52" text-anchor="end" fill="#8b9bb0" font-size="11.5">most tools report after the fact — depguard prevents in the install path</text>
+<text x="960" y="52" text-anchor="end" fill="#8b9bb0" font-size="11.5">others report after the fact — depguard prevents in the install path</text>
 <line x1="40" y1="70" x2="960" y2="70" stroke="#223145"/>
-<rect x="40" y="92" width="396" height="44" rx="10" fill="#141b25" stroke="#2a3848"/>
+<line x1="500" y1="92" x2="500" y2="570" stroke="#223145"/>
+<rect x="40" y="92" width="425" height="44" rx="10" fill="#141b25" stroke="#2a3848"/>
 <text x="58" y="111" fill="#cdd8e6" font-size="13.5" font-weight="700" letter-spacing="1">OTHER TOOLS</text>
 <text x="58" y="128" fill="#e5774a" font-size="11.5">react &amp; report — after install</text>
-<rect x="512" y="92" width="448" height="44" rx="10" fill="#0f2319" stroke="#2ea44f"/>
-<text x="530" y="111" fill="#e9eef5" font-size="13.5" font-weight="700" letter-spacing="1">dep<tspan fill="#34c46a">guard</tspan></text>
-<text x="530" y="128" fill="#34c46a" font-size="11.5">prevents — before npm resolves</text>
-<rect x="40" y="150" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="92" width="425" height="44" rx="10" fill="#0f2319" stroke="#2ea44f"/>
+<text x="553" y="111" fill="#e9eef5" font-size="13.5" font-weight="700" letter-spacing="1">dep<tspan fill="#34c46a">guard</tspan></text>
+<text x="553" y="128" fill="#34c46a" font-size="11.5">prevent — before npm ever resolves</text>
+<circle cx="500" cy="114" r="17" fill="#0a0f18" stroke="#8b9bb0"/>
+<text x="500" y="118" text-anchor="middle" fill="#8b9bb0" font-size="11" font-weight="700" letter-spacing="1">VS</text>
+<rect x="40" y="150" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="175" fill="#cdd8e6" font-size="13" font-weight="700">Dependabot · npm audit</text>
 <text x="56" y="194" fill="#8b9bb0" font-size="11.5">alerts on known CVEs after install</text>
-<line x1="444" y1="180.0" x2="504" y2="180.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="150" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="175" fill="#bfe9cd" font-size="12.5">filters bad versions before npm resolves —</text>
-<text x="528" y="194" fill="#bfe9cd" font-size="12.5">+ cooldown stops day-zero malware too</text>
-<rect x="40" y="222" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="150" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="180.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,180.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="175" fill="#bfe9cd" font-size="12.5">filters bad versions before npm resolves —</text>
+<text x="569" y="194" fill="#bfe9cd" font-size="12.5">+ a cooldown stops day-zero malware too</text>
+<rect x="40" y="222" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="247" fill="#cdd8e6" font-size="13" font-weight="700">Snyk · socket.dev</text>
 <text x="56" y="266" fill="#8b9bb0" font-size="11.5">cloud scan; your dep graph leaves</text>
-<line x1="444" y1="252.0" x2="504" y2="252.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="222" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="247" fill="#bfe9cd" font-size="12.5">local-first: zero cloud, zero telemetry,</text>
-<text x="528" y="266" fill="#bfe9cd" font-size="12.5">nothing about your repo is uploaded</text>
-<rect x="40" y="294" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="222" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="252.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,252.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="247" fill="#bfe9cd" font-size="12.5">local-first: zero cloud, zero telemetry,</text>
+<text x="569" y="266" fill="#bfe9cd" font-size="12.5">nothing about your repo is uploaded</text>
+<rect x="40" y="294" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="319" fill="#cdd8e6" font-size="13" font-weight="700">Lockfile pin · npm ci</text>
 <text x="56" y="338" fill="#8b9bb0" font-size="11.5">reproduces whatever you trusted</text>
-<line x1="444" y1="324.0" x2="504" y2="324.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="294" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="319" fill="#bfe9cd" font-size="12.5">re-checks locked versions vs fresh</text>
-<text x="528" y="338" fill="#bfe9cd" font-size="12.5">advisories on every commit / PR</text>
-<rect x="40" y="366" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="294" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="324.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,324.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="319" fill="#bfe9cd" font-size="12.5">re-checks locked versions against fresh</text>
+<text x="569" y="338" fill="#bfe9cd" font-size="12.5">advisories on every commit / PR</text>
+<rect x="40" y="366" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="391" fill="#cdd8e6" font-size="13" font-weight="700">--ignore-scripts by hand</text>
 <text x="56" y="410" fill="#8b9bb0" font-size="11.5">breaks native pkgs → teams disable it</text>
-<line x1="444" y1="396.0" x2="504" y2="396.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="366" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="391" fill="#bfe9cd" font-size="12.5">off by default + ask-once build scripts</text>
-<text x="528" y="410" fill="#bfe9cd" font-size="12.5">run boxed &amp; syscall-traced</text>
-<rect x="40" y="438" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="366" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="396.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,396.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="391" fill="#bfe9cd" font-size="12.5">off by default + ask-once build scripts</text>
+<text x="569" y="410" fill="#bfe9cd" font-size="12.5">run boxed &amp; syscall-traced</text>
+<rect x="40" y="438" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="463" fill="#cdd8e6" font-size="13" font-weight="700">OS sandboxes · jails</text>
 <text x="56" y="482" fill="#8b9bb0" font-size="11.5">per-OS, escapable, complex to set up</text>
-<line x1="444" y1="468.0" x2="504" y2="468.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="438" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="463" fill="#bfe9cd" font-size="12.5">digest-pinned box that cages AND</text>
-<text x="528" y="482" fill="#bfe9cd" font-size="12.5">observes — strace convicts on exfil</text>
-<rect x="40" y="510" width="396" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
+<rect x="535" y="438" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="468.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,468.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="463" fill="#bfe9cd" font-size="12.5">a digest-pinned box that cages AND</text>
+<text x="569" y="482" fill="#bfe9cd" font-size="12.5">observes — strace convicts on exfil</text>
+<rect x="40" y="510" width="425" height="60" rx="11" fill="#141b25" stroke="#2a3848"/>
 <text x="56" y="535" fill="#cdd8e6" font-size="13" font-weight="700">Scanner-only tools</text>
 <text x="56" y="554" fill="#8b9bb0" font-size="11.5">flag static patterns; obfuscation hides</text>
-<line x1="444" y1="540.0" x2="504" y2="540.0" stroke="#34c46a" stroke-width="2.4" marker-end="url(#ag)"/>
-<rect x="512" y="510" width="448" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
-<text x="528" y="535" fill="#bfe9cd" font-size="12.5">static signals + dynamic syscall evidence</text>
-<text x="528" y="554" fill="#bfe9cd" font-size="12.5">— you can't hide a connect()</text>
-<text x="40" y="596" fill="#8b9bb0" font-size="12" font-weight="600" letter-spacing="1">THREE CHOICES NOBODY ELSE COMBINES</text>
-<rect x="40" y="608" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
-<circle cx="62" cy="628" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
-<path d="M59,628 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="78" y="632" fill="#e9eef5" font-size="12" font-weight="600">a binary, not an npm package</text>
-<rect x="351" y="608" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
-<circle cx="373" cy="628" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
-<path d="M370,628 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="389" y="632" fill="#e9eef5" font-size="12" font-weight="600">avoid, don't just recover</text>
-<rect x="662" y="608" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
-<circle cx="684" cy="628" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
-<path d="M681,628 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="700" y="632" fill="#e9eef5" font-size="12" font-weight="600">no background process, no cloud</text>
+<rect x="535" y="510" width="425" height="60" rx="11" fill="#0f2319" stroke="#2ea44f"/>
+<circle cx="553" cy="540.0" r="7" fill="none" stroke="#34c46a" stroke-width="1.8"/>
+<path d="M549.5,540.0 l2.4,2.4 l4,-4.6" fill="none" stroke="#34c46a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="569" y="535" fill="#bfe9cd" font-size="12.5">static signals + dynamic syscall evidence</text>
+<text x="569" y="554" fill="#bfe9cd" font-size="12.5">— you can't hide a connect()</text>
+<text x="40" y="598" fill="#8b9bb0" font-size="12" font-weight="600" letter-spacing="1.5">THREE CHOICES NOBODY ELSE COMBINES</text>
+<rect x="40" y="610" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
+<circle cx="62" cy="630" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
+<path d="M59,630 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="78" y="634" fill="#e9eef5" font-size="12" font-weight="600">A binary, not an npm package</text>
+<rect x="351" y="610" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
+<circle cx="373" cy="630" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
+<path d="M370,630 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="389" y="634" fill="#e9eef5" font-size="12" font-weight="600">Avoid, don't just recover</text>
+<rect x="662" y="610" width="297" height="40" rx="20" fill="#0f1a14" stroke="#2ea44f"/>
+<circle cx="684" cy="630" r="6" fill="none" stroke="#34c46a" stroke-width="2"/>
+<path d="M681,630 l2.6,2.6 l4.2,-5" fill="none" stroke="#34c46a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="700" y="634" fill="#e9eef5" font-size="12" font-weight="600">No background process, no cloud</text>
 </svg>
