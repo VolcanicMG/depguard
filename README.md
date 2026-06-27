@@ -24,7 +24,7 @@ Protection fires only when *you* act — install, commit, PR.
 
 - [Why](#why) · [How it works](#how-it-works) · [Quickstart](#quickstart)
 - [The five layers](#the-five-layers) · [What each layer stops](#what-each-layer-stops)
-- [Command reference](#command-reference) · [Per-repo files](#per-repo-files-commit-them) · [Waiving a finding](#waiving-a-reviewed-finding)
+- [Command reference](#command-reference) · [Per-repo files](#per-repo-files-commit-them)
 - [How it's different](#how-its-different) · [Honest limits](#honest-limits)
 - [Tests](#tests) · [Docs](#docs)
 
@@ -259,30 +259,6 @@ respects `NO_COLOR`.
 | `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
-
-## Waiving a reviewed finding
-
-`guard check` gates commit / push / PR / CI on advisories, cooldown, lockfile
-integrity, and secret files. When you have **reviewed** a specific finding and
-accept it, waive that one issue so it stops gating — without weakening the check
-for anything else:
-
-```sh
-guard check                       # prints the exact `guard ignore …` line per finding
-guard ignore cooldown:lodash@4.17.21 --reason "vendored fork, vetted" --expires 90d
-guard ignore secret:.env.example  --reason "template, no real secret"   # deliberate match
-guard ignore --list               # every waiver, tagged active / EXPIRED
-guard ignore --remove cooldown:lodash@4.17.21
-```
-
-A waiver is **purposeful, not a blanket off-switch**: it is pinned to an exact
-`name@version` + finding-kind, so it lapses the moment the package moves to a new
-version (which is then judged on its own). `--expires` makes it self-retiring — an
-expired waiver re-gates (fail closed) and is reported. Waivers live in the
-committed `.guard-ignores`, so the decision *and its reason* travel to teammates
-and CI as reviewable evidence. (The install-time **name** gate — typosquat /
-dependency-confusion — is escaped with `allow:` in `.guardrc`, not here.) Full
-mechanics: [docs/SETUP.md](docs/SETUP.md).
 
 ## How it's different
 
