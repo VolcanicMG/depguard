@@ -9,7 +9,7 @@
 ![version](https://img.shields.io/badge/version-0.9.0-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
-![license](https://img.shields.io/badge/license-MIT-blue)
+![license](https://img.shields.io/badge/license-Apache%202.0-blue)
 
 **Your next `npm install` is the easiest way into your machine. depguard closes it.**
 
@@ -49,6 +49,14 @@ and makes the malicious version something npm **never even sees**.
 
 ## How it works
 
+A package's full journey — from `guard install` through every layer to a trusted merge:
+
+<div align="center">
+  <img src="depguard-pipeline.svg" alt="depguard package lifecycle: guard install → name gate → cooldown + OSV filter → npm resolves → lifecycle scripts? → scan + box + strace → commit/PR re-check → merged. Blocked or contained at each layer." width="860">
+</div>
+
+<details><summary><b>Text version of the flow</b></summary>
+
 ```
  guard install lodash
        │
@@ -69,6 +77,8 @@ and makes the malicious version something npm **never even sees**.
        ▼
  OSV advisory check on the final lockfile
 ```
+
+</details>
 
 See it live: `node demo/run.mjs` ([demo/README.md](demo/README.md)).
 
@@ -299,4 +309,4 @@ What the suite proves, file by file: [test/README.md](test/README.md).
 
 ## License
 
-[MIT](LICENSE) © Ethan Hoffman
+[Apache 2.0](LICENSE) © 2026 Ethan Hoff — see [NOTICE](NOTICE).
