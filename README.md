@@ -48,8 +48,10 @@ and makes the malicious version something npm **never even sees**.
 A package's full journey — from `guard install` through every layer to a trusted merge:
 
 <div align="center">
-  <img src="depguard-pipeline.svg" alt="depguard package lifecycle: guard install → name gate → cooldown + OSV filter → npm resolves → lifecycle scripts? → scan + box + strace → commit/PR re-check → merged. Blocked or contained at each layer." width="860">
+  <img src="depguard-pipeline.svg" alt="depguard how it works: guard install → name gate → cooldown + OSV filter → npm resolves & installs → lifecycle script? → scan + box + strace → commit/PR re-check → installed & trusted. A right-hand column shows what each gate stops." width="860">
 </div>
+
+Each numbered gate is one of depguard's defense layers — see [the five layers](#the-five-layers) and [what each one stops](#what-each-layer-stops) for the deeper dive.
 
 <details><summary><b>Text version of the flow</b></summary>
 
