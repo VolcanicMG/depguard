@@ -147,9 +147,17 @@ moment, grouped here by **when** it runs.
 
 | Layer | Stops |
 |---|---|
-| Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
-| Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
-| Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
+| Ignore-scripts (`guard` + `.npmrc`) | install-time code execution, the #1 npm attack vector — even via plain npm |
+| Static scan at approval | network, child_process, secret-path, and eval signals, **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi, zero-width hiding) for when an agent reviews your deps |
+| Boxed + traced script run | exfil from approved scripts — the container both **cages and watches** (detail below) |
+
+When you approve a script, it runs in a **digest-pinned container**: no network, no
+secrets, no-new-privileges, pids-limited, and **seccomp**-filtered (io_uring, the
+kernel keyring, and bpf/perf are blocked). On top of that, **strace watches every
+syscall**. A `connect()` to a real host or a read of `/root/.ssh` auto-convicts: the
+output is discarded and the approval revoked. The container is named and force-removed
+on timeout; `guard prewarm` builds the image ahead of the first run, `guard clean
+--image` reclaims it.
 
 ### ③ On commit / push / PR — *`guard check`, run by the git hooks & CI gate*
 
@@ -157,16 +165,24 @@ Catches deps that go bad *after* you installed them — and your own secrets on 
 
 | Layer | Stops |
 |---|---|
-| `guard check` (advisories + cooldown re-check) | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds. At a terminal (`--confirm`, which the hooks pass) a cooldown hit offers **accept-all** (waive every violation) or **pin & reinstall** (drop each direct dep to its latest version past the cooldown, then re-verify); CI keeps the strict block |
+| `guard check` (advisories + cooldown) | newly-reported advisories + cooldown violations across **every version** in the tree, on every commit/PR (detail below) |
 | Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
-| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, `*.pem`, keys) staged or already tracked by git — hard-blocks commit/push (leads the exit-code precedence) so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate file with `guard ignore secret:<path>` |
-| License-policy gate (opt-in) | installed packages under a denied — or, in allowlist mode, non-allowed — license (`license-deny` / `license-allow` in .guardrc) |
+| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, keys) staged or already tracked by git — hard-blocks commit/push so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate match with `guard ignore secret:<path>` |
+| License-policy gate (opt-in) | installed packages under a denied (or, in allowlist mode, non-allowed) license — `license-deny` / `license-allow` in .guardrc |
+
+**How `guard check` grades and recovers.** Advisories are tiered: high+/`MAL-*`/unscored
+**block**, moderate/low **warn** (tune with `advisory-threshold`). Cooldown violations
+are caught across every distinct version in the tree, whichever install path introduced
+them; `flag: new-deps` also lists packages a change adds. At a terminal (`--confirm`,
+which the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin &
+reinstall** (drop each direct dep to its latest version past the cooldown, then
+re-verify). CI always keeps the strict block.
 
 ### ④ Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
 
 | Layer | Stops |
 |---|---|
-| Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify — DSSE signature, Fulcio cert chain, or tarball-digest binding — i.e. a tampered provenance claim (`flag: [provenance]`) |
+| Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify (DSSE signature, Fulcio cert chain, or tarball-digest binding) — i.e. a tampered provenance claim (`flag: [provenance]`) |
 | Maintainer-change | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
