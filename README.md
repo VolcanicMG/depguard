@@ -310,18 +310,31 @@ others leave.
 
 ## Tests
 
-Black-box e2e suite in `test/` — vitest spawns the **real compiled binary**
-against a mock npm registry with fabricated publish dates, so the cooldown is
-tested deterministically and nothing touches registry.npmjs.org. Plus Go unit
-tests (`~/.local/go/bin/go test ./...`).
+Three layers of verification, all zero-dep:
+
+- **Go unit tests** — `~/.local/go/bin/go test ./...` covers internal logic in
+  isolation: parsers, matchers, the scan/trace/proxy decision functions, and the
+  fail-closed branches.
+- **Black-box e2e** (`test/`) — vitest spawns the **real compiled binary** against
+  a mock npm registry with fabricated publish dates, so the cooldown is tested
+  deterministically and nothing touches registry.npmjs.org.
+- **Live demo as an acceptance check** (`demo/`) — `node demo/run.mjs` runs a cast
+  of realistic packages (a clean install, a build that *looks* malicious but isn't,
+  real exfil attempts caught by the box, a too-fresh version blocked) through the
+  real binary and **asserts each outcome**, exiting non-zero if any scenario
+  doesn't behave as documented — so it doubles as a smoke test. Safe by
+  construction: the "malicious" packages target unroutable doc IPs and run with
+  `--network none`. ([demo/README.md](demo/README.md))
 
 ```sh
 cd test
 npm install          # vitest only; the harness itself adds zero other deps
 npm test             # builds the binary (globalSetup), runs the e2e suite
+
+node demo/run.mjs    # the narrated demo also self-verifies every scenario
 ```
 
-What the suite proves, file by file: [test/README.md](test/README.md).
+What the e2e suite proves, file by file: [test/README.md](test/README.md).
 
 ## Docs
 
