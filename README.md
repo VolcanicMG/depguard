@@ -115,23 +115,47 @@ The *why* and the per-layer guarantees: **[docs/DESIGN.md](docs/DESIGN.md)** (th
 
 ## What each layer stops
 
+Defense in depth — but the layers don't all fire at once. Each acts at a specific
+moment, grouped here by **when** it runs.
+
+### ① At install · name & version safety — *before npm even resolves*
+
+`guard install` / `guard ci`, via the ephemeral proxy:
+
 | Layer | Stops |
 |---|---|
 | Typosquat / homoglyph name gate | impostor names before any metadata is served: one-edit look-alikes (`lodahs`, `expresss`) and non-ASCII homoglyphs (`reаct`) — blocked fail-closed, cleared via `allow:` |
 | Dependency-confusion gate | `internal-scopes` names blocked from resolving against the public registry |
-| Cooldown (default 14d) | freshly-published malicious versions (most are yanked in days) |
-| OSV at resolve time + on commit | known-bad versions dropped *before* npm resolves (not just flagged after) |
+| Cooldown (default 14d) | freshly-published malicious versions (most are yanked in days) — risky versions made invisible to npm |
+| OSV at resolve time | known-bad versions dropped *before* npm resolves (not just flagged after) |
 | Registry signature verification | a version whose npm ECDSA signature is present-but-invalid (registry/account tampering the integrity hash can't catch) |
-| Build-provenance attestation (opt-in) | a published Sigstore/SLSA attestation that fails to verify — DSSE signature, Fulcio cert chain, or tarball-digest binding — i.e. a tampered provenance claim (`flag: [provenance]`) |
-| Maintainer-change (opt-in) | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
-| Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
-| License-policy gate (opt-in) | installed packages under a denied — or, in allowlist mode, non-allowed — license (`license-deny` / `license-allow` in .guardrc) |
-| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, `*.pem`, keys) staged or already tracked by git — hard-blocks commit/push (leads the exit-code precedence) so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate file with `guard ignore secret:<path>` |
-| Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
 | Exact version pinning (`.npmrc` `save-exact`) | silent range drift — a later `npm install` pulling a freshly-compromised `^`/`~` patch you never chose; deps stay at the version you vetted until you bump manually |
+
+### ② At install · lifecycle scripts — *only the few packages that ship them*
+
+| Layer | Stops |
+|---|---|
+| Ignore-scripts (`guard` + `.npmrc`) | install-time code execution — the #1 npm attack vector — even via plain npm |
 | Static scan at approval | informed yes/no: network, child_process, secret paths, eval — **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi chars, zero-width hiding) in README/markdown/code, for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts: no network, no secrets, digest-pinned image, no-new-privileges, pids-limit, **seccomp** (blocks io_uring + the kernel keyring + bpf/perf) — **and strace watches syscalls**, so a connect() to a real host or a read of `/root/.ssh` auto-convicts, discards the output, and revokes the approval. The container is named + force-removed on a timeout; `guard prewarm` builds the image ahead of the first run and `guard clean --image` reclaims it |
-| `guard check` on commit/PR | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds. At a terminal (`--confirm`, which the hooks pass) a cooldown hit offers **accept-all** (waive every violation) or **pin & reinstall** (drop each direct dep to its latest version past the cooldown, then re-verify); CI keeps the strict block |
+
+### ③ On commit / push / PR — *`guard check`, run by the git hooks & CI gate*
+
+Catches deps that go bad *after* you installed them — and your own secrets on the way out:
+
+| Layer | Stops |
+|---|---|
+| `guard check` (advisories + cooldown re-check) | newly-reported advisories (graded by severity: high+/`MAL-*`/unscored **block**, moderate/low **warn** — tune with `advisory-threshold`) AND cooldown violations across **every distinct version** in the tree, entered via *any* install path; `flag: new-deps` also reports packages a change adds. At a terminal (`--confirm`, which the hooks pass) a cooldown hit offers **accept-all** (waive every violation) or **pin & reinstall** (drop each direct dep to its latest version past the cooldown, then re-verify); CI keeps the strict block |
+| Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
+| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, `*.pem`, keys) staged or already tracked by git — hard-blocks commit/push (leads the exit-code precedence) so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate file with `guard ignore secret:<path>` |
+| License-policy gate (opt-in) | installed packages under a denied — or, in allowlist mode, non-allowed — license (`license-deny` / `license-allow` in .guardrc) |
+
+### ④ Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
+
+| Layer | Stops |
+|---|---|
+| Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify — DSSE signature, Fulcio cert chain, or tarball-digest binding — i.e. a tampered provenance claim (`flag: [provenance]`) |
+| Maintainer-change | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
 HEAD** — each version is vetted once, at the commit that introduces it. `--all`
