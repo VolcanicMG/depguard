@@ -255,8 +255,8 @@ mechanics: [docs/SETUP.md](docs/SETUP.md).
 ## How it's different
 
 Most tools in this space **report** — they tell you, after the fact, that
-something you already installed is bad. depguard sits *in the install path* and
-makes the bad version one npm never resolves in the first place.
+something you already installed is bad. depguard sits *in the install path* — so npm
+never resolves the bad version in the first place.
 
 <div align="center">
   <img src="depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
