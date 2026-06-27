@@ -33,7 +33,7 @@ guards the npm ecosystem must not be installed *through* it.
 cd /path/to/depguard
 go build -o guard .            # zero dependencies
 sudo mv guard /usr/local/bin/  # or anywhere on your PATH
-guard version                  # -> guard 0.9.0
+guard version                  # -> guard 1.0.0
 ```
 
 On this machine Go lives at `~/.local/go/bin/go` (not on PATH), so:

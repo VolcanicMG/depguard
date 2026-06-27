@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-0.9.0-2ea44f)
+![version](https://img.shields.io/badge/version-1.0.0-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
