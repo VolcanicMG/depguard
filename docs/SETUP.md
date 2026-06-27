@@ -29,6 +29,8 @@ guards the npm ecosystem must not be installed *through* it.
 
 ## 1. Install the binary (once per machine)
 
+**Prebuilt:** grab a binary for your OS/arch from the [Releases](https://github.com/VolcanicMG/depguard/releases) page and verify it against `SHA256SUMS` — then skip to §2. To build from source:
+
 ```sh
 cd /path/to/depguard
 go build -o guard .            # zero dependencies

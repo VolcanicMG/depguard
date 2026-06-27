@@ -1,0 +1,56 @@
+name: release
+
+# Publishes cross-compiled `guard` binaries (+ SHA256SUMS) to a GitHub Release
+# whenever a version tag is pushed, e.g.:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # required to create the Release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: for a supply-chain tool these official actions should ideally be
+      # pinned to a commit SHA rather than a moving tag — hardening follow-up.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # single source of truth (currently 1.26.4)
+
+      # Gate the release on the unit suite — a broken commit never ships.
+      - name: Unit tests
+        run: go test ./...
+
+      # Pure Go (no cgo) → cross-compile every major target from one runner.
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build() {
+            out="dist/guard-$1-$2$3"
+            GOOS="$1" GOARCH="$2" go build -trimpath -ldflags "-s -w" -o "$out" .
+            echo "built $out"
+          }
+          build linux   amd64 ""
+          build linux   arm64 ""
+          build darwin  amd64 ""
+          build darwin  arm64 ""
+          build windows amd64 ".exe"
+          build windows arm64 ".exe"
+
+      - name: Checksums
+        run: (cd dist && sha256sum guard-* > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}   # gh is preinstalled on the runner (no 3rd-party action)
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "depguard $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/guard-* dist/SHA256SUMS

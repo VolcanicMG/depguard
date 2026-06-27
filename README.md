@@ -112,7 +112,9 @@ never resolves the bad version in the first place.
 
 ## Quickstart
 
-**Requirements:** Go 1.26.4 to build the binary, `git` for commit-diff scoping, and *optionally* Docker or Podman to sandbox build scripts. End users just need the compiled binary.
+**Requirements:** Go 1.26.4 to build from source, `git` for commit-diff scoping, and *optionally* Docker or Podman to sandbox build scripts.
+
+**Grab a prebuilt binary** for your OS from the [Releases](../../releases) page — linux · macOS · Windows on amd64 + arm64, each with `SHA256SUMS` to verify — or build from source:
 
 ```sh
 # 1. Build the binary once per machine (Go 1.26.4, zero dependencies)
@@ -363,8 +365,9 @@ Directional, not commitments — depguard is **npm-first** today. On the radar:
 - **Unused-dependency detection.** Surface declared deps that nothing actually
   imports — dead weight and needless attack surface — so they can be pruned
   (a `guard unused` report / a non-blocking `guard check` signal).
-- **Signed release binaries.** Published, checksummed builds so you don't have to compile
-  from source.
+- **Signed releases.** Prebuilt, checksummed binaries now ship via CI on each tag
+  (Releases); cosign / Sigstore **signing** of those artifacts is the next step —
+  depguard could then verify its own provenance.
 
 ## Tests
 

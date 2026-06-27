@@ -14,6 +14,8 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  ├── main.go                     CLI dispatch + the install/check orchestration
  ├── mcp.go                      `guard mcp`: stdio JSON-RPC MCP server (zero-dep)
  ├── go.mod                      module def — ZERO dependencies, on purpose
+ ├── .github/workflows/
+ │   └── release.yml            CI: cross-compile + publish binaries on a vX.Y.Z tag
  ├── internal/
  │   ├── config/config.go        .guardrc policy: parse, defaults, validation
  │   ├── approvals/approvals.go  .guard-approvals: ask-once script decisions
