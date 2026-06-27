@@ -136,12 +136,20 @@ moment, grouped here by **when** it runs.
 
 | Layer | Stops |
 |---|---|
-| Typosquat / homoglyph name gate | impostor names before any metadata is served: one-edit look-alikes (`lodahs`, `expresss`) and non-ASCII homoglyphs (`reаct`) — blocked fail-closed, cleared via `allow:` |
-| Dependency-confusion gate | `internal-scopes` names blocked from resolving against the public registry |
-| Cooldown (default 14d) | freshly-published malicious versions (most are yanked in days) — risky versions made invisible to npm |
-| OSV at resolve time | known-bad versions dropped *before* npm resolves (not just flagged after) |
-| Registry signature verification | a version whose npm ECDSA signature is present-but-invalid (registry/account tampering the integrity hash can't catch) |
-| Exact version pinning (`.npmrc` `save-exact`) | silent range drift — a later `npm install` pulling a freshly-compromised `^`/`~` patch you never chose; deps stay at the version you vetted until you bump manually |
+| Typosquat / homoglyph name gate | impostor names: one-edit look-alikes (`lodahs`) and non-ASCII homoglyphs (`reаct`) |
+| Dependency-confusion gate | `internal-scopes` names resolving against the public registry |
+| Cooldown (default 14d) | freshly-published malicious versions (most are yanked within days) |
+| OSV at resolve time | known-bad versions, dropped *before* npm resolves |
+| Registry signature verification | a present-but-invalid npm ECDSA signature on a version |
+| Exact version pinning (`.npmrc` `save-exact`) | silent `^`/`~` range drift on a later `npm install` |
+
+These all run inside the ephemeral proxy, so a blocked version is simply one npm
+never resolves — no error to handle. The name gate is **fail-closed**; clear a false
+match with `allow:`. The cooldown makes too-fresh versions invisible, so npm picks a
+safe one itself. Signature verification catches registry/account tampering the
+integrity hash can't — but only blocks *present-but-invalid* signatures (unsigned
+versions still pass). With `save-exact`, deps stay at the version you vetted until you
+bump them by hand, so a later `npm install` can't pull a freshly-compromised patch.
 
 ### ② At install · lifecycle scripts — *only the few packages that ship them*
 
