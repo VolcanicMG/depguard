@@ -333,6 +333,9 @@ Directional, not commitments — depguard is **npm-first** today. On the radar:
   inside the box.
 - **Deeper provenance.** Verify **Rekor** transparency-log inclusion, the SCT, and **TUF**
   trust-root rotation — closing the gap to the full Sigstore guarantee.
+- **Unused-dependency detection.** Surface declared deps that nothing actually
+  imports — dead weight and needless attack surface — so they can be pruned
+  (a `guard unused` report / a non-blocking `guard check` signal).
 - **Signed release binaries.** Published, checksummed builds so you don't have to compile
   from source.
 
