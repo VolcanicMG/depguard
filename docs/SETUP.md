@@ -2,7 +2,7 @@
 
 Getting depguard protecting a repo, end to end — plus the tips that make it quiet
 and unannoying in day-to-day use. For the *why* behind each layer see
-[DESIGN.md](DESIGN.md); for the command reference see [README.md](README.md).
+[DESIGN.md](DESIGN.md); for the command reference see [README.md](../README.md).
 
 ```
  ① install the binary ONCE on the machine        (global, signed, zero-dep)
@@ -33,7 +33,7 @@ guards the npm ecosystem must not be installed *through* it.
 cd /path/to/depguard
 go build -o guard .            # zero dependencies
 sudo mv guard /usr/local/bin/  # or anywhere on your PATH
-guard version                  # -> guard 0.7.0
+guard version                  # -> guard 0.9.0
 ```
 
 On this machine Go lives at `~/.local/go/bin/go` (not on PATH), so:
@@ -291,7 +291,7 @@ git commit                  # the pre-commit hook runs guard check; a flagged de
 ```
 
 Run the bundled live demo (safe — uses unroutable doc IPs) to watch every layer
-fire: `node demo/run.mjs` ([demo/README.md](demo/README.md)).
+fire: `node demo/run.mjs` ([demo/README.md](../demo/README.md)).
 
 ---
 

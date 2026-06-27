@@ -1,7 +1,7 @@
 # depguard — Code Map
 
 Where everything lives, what calls what, and where to make which kind of change.
-Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md) (the *how to use*).
+Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (the *how to use*).
 
 > **Before you finish a change, update the docs.** [CLAUDE.md](../CLAUDE.md) maps every
 > `.md` file to what triggers an edit (change a flag → README; change a layer guarantee →
@@ -37,9 +37,11 @@ Companion to [DESIGN.md](../DESIGN.md) (the *why*) and [README.md](../README.md)
  │   ├── lockfile/altlock.go     pnpm-lock.yaml + yarn.lock parsers (check path)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
  │   └── tty/                    "is a human attached?" (termios; /dev/null lies)
- ├── docs/CODEMAP.md             this file
- ├── DESIGN.md                   the agreed design contract
- ├── SETUP.md                    step-by-step per-repo onboarding + tips
+ ├── depguard.png                project logo (README header)
+ ├── docs/                       deep docs (linked from README)
+ │   ├── CODEMAP.md              this file
+ │   ├── DESIGN.md               the agreed design contract
+ │   └── SETUP.md                step-by-step per-repo onboarding + tips
  ├── demo/                       runnable live demo (safe; unroutable doc IPs)
  │   ├── packages.mjs            the cast: benign, false-positive, exfil, etc.
  │   └── run.mjs                 narrates guard handling each, asserts outcomes
