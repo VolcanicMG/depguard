@@ -26,7 +26,7 @@ Protection fires only when *you* act — install, commit, PR.
 - [The five layers](#the-five-layers) · [What each layer stops](#what-each-layer-stops)
 - [Command reference](#command-reference) · [Per-repo files](#per-repo-files-commit-them) · [Waiving a finding](#waiving-a-reviewed-finding)
 - [How it's different](#how-its-different) · [Honest limits](#honest-limits)
-- [Build & cross-compile](#build--cross-compile) · [Tests](#tests) · [Docs](#docs)
+- [Tests](#tests) · [Docs](#docs)
 
 ## Why
 
@@ -96,7 +96,7 @@ guard install lodash                # instead of npm install
 ```
 
 End users need only the compiled binary — never Go, never npm packages. Full
-onboarding, tuning, and troubleshooting: **[docs/SETUP.md](docs/SETUP.md)**.
+onboarding, cross-compiling, tuning, and troubleshooting: **[docs/SETUP.md](docs/SETUP.md)**.
 
 ## The five layers
 
@@ -300,29 +300,6 @@ others leave.
   must still be told (as the banner says) not to follow instructions embedded in a
   package's files.
 
-## Build & cross-compile
-
-depguard is pure Go (no cgo), so you can cross-compile to any target from any
-machine; `CGO_ENABLED=0` is implied when `GOOS` differs:
-
-| Target | Command |
-|--------|---------|
-| macOS (Apple silicon) | `GOOS=darwin GOARCH=arm64 go build -o guard .` |
-| macOS (Intel) | `GOOS=darwin GOARCH=amd64 go build -o guard .` |
-| Windows | `GOOS=windows GOARCH=amd64 go build -o guard.exe .` |
-| Linux (x86-64) | `GOOS=linux GOARCH=amd64 go build -o guard .` |
-| Linux (arm64) | `GOOS=linux GOARCH=arm64 go build -o guard .` |
-
-The core (proxy, cooldown, OSV, scan, `why`, `sbom`, license, provenance) runs on
-all of them. **Script sandboxing** additionally needs Docker/Podman — and because
-`strace` + seccomp run *inside* the Linux container (not on the host), it works on
-macOS and Windows hosts too; without a runtime it follows `no-container-fallback`.
-Git hooks are `sh` shims: native on macOS/Linux, Git-for-Windows' bash on Windows.
-
-> **Updating an in-use binary?** Overwriting `guard` while `guard mcp` (the MCP
-> server) is running fails with `Text file busy`. Unlink first — it doesn't disturb
-> the running process: `sudo rm -f /usr/local/bin/guard && sudo cp guard /usr/local/bin/guard`.
-
 ## Tests
 
 Black-box e2e suite in `test/` — vitest spawns the **real compiled binary**
@@ -343,7 +320,7 @@ What the suite proves, file by file: [test/README.md](test/README.md).
 | Doc | For | Covers |
 |---|---|---|
 | **[docs/DESIGN.md](docs/DESIGN.md)** | the contract — the *why* | goals/non-goals, the layered threat model, each layer's guarantee, design stance |
-| **[docs/SETUP.md](docs/SETUP.md)** | onboarding | step-by-step per-repo setup, `.guardrc` tuning, waiving findings, tips, troubleshooting |
+| **[docs/SETUP.md](docs/SETUP.md)** | onboarding | step-by-step setup **& cross-compiling**, `.guardrc` tuning, waiving findings, troubleshooting |
 | **[docs/CODEMAP.md](docs/CODEMAP.md)** | contributors — the *where* | file/dir layout, what calls what, where to make which kind of change |
 | [demo/README.md](demo/README.md) | demo runners | demo commands, scenario cast, safety guarantees |
 | [test/README.md](test/README.md) | test authors | how the black-box suite runs, the mock-registry trick |

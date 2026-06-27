@@ -45,6 +45,26 @@ On this machine Go lives at `~/.local/go/bin/go` (not on PATH), so:
 That single binary is all an end user ever needs. Sign/checksum it if you
 distribute it to a team (the CI gate, §6, will ask for a pinned URL + checksum).
 
+### Cross-compiling for another OS/arch
+
+depguard is pure Go (no cgo), so you can build for any target from any machine —
+`CGO_ENABLED=0` is implied when `GOOS` differs:
+
+| Target | Command |
+|--------|---------|
+| macOS (Apple silicon) | `GOOS=darwin GOARCH=arm64 go build -o guard .` |
+| macOS (Intel) | `GOOS=darwin GOARCH=amd64 go build -o guard .` |
+| Windows | `GOOS=windows GOARCH=amd64 go build -o guard.exe .` |
+| Linux (x86-64) | `GOOS=linux GOARCH=amd64 go build -o guard .` |
+| Linux (arm64) | `GOOS=linux GOARCH=arm64 go build -o guard .` |
+
+The core (proxy, cooldown, OSV, scan, `why`, `sbom`, license, provenance) runs on
+all of them. **Script sandboxing** additionally needs Docker/Podman — and because
+`strace` + seccomp run *inside* the Linux container (not on the host), it works on
+macOS and Windows hosts too; without a runtime it follows `no-container-fallback`
+(§5). Git hooks are `sh` shims: native on macOS/Linux, Git-for-Windows' bash on
+Windows.
+
 ---
 
 ## 2. Initialize a repo
@@ -307,3 +327,4 @@ fire: `node demo/run.mjs` ([demo/README.md](../demo/README.md)).
 | `ignore-scripts …: expected true or false` | a typo'd bool fails closed by design; correct the value |
 | pnpm / yarn project | `guard install` proxies all three managers (auto-detected); boxed **script approval** is npm-only, so under pnpm/yarn scripts stay disabled and the lockfile is re-checked |
 | Waiver isn't suppressing | it may have **expired** (`guard ignore --list` shows EXPIRED) or the package version changed (re-waive the new `name@version`) |
+| `Text file busy` overwriting `guard` | the MCP server (`guard mcp`) is running — unlink first, it won't disturb the live process: `sudo rm -f /usr/local/bin/guard && sudo cp guard /usr/local/bin/guard` |
