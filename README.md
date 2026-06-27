@@ -13,7 +13,7 @@
 
 **Your next `npm install` is the easiest way into your machine. depguard closes it.**
 
-One signed binary · zero dependencies · nothing running in the background.
+One self-contained binary · zero dependencies · nothing running in the background.
 Protection fires only when *you* act — install, commit, PR.
 
 </div>
@@ -22,11 +22,10 @@ Protection fires only when *you* act — install, commit, PR.
 
 ## Contents
 
-- [Why](#why) · [How it works](#how-it-works) · [Quickstart](#quickstart)
+- [Why](#why) · [How it works](#how-it-works) · [How it's different](#how-its-different) · [Quickstart](#quickstart)
 - [The five layers](#the-five-layers) · [What each layer stops](#what-each-layer-stops)
 - [Command reference](#command-reference) · [Per-repo files](#per-repo-files-commit-them)
-- [How it's different](#how-its-different) · [Honest limits](#honest-limits)
-- [Tests](#tests) · [Docs](#docs)
+- [Honest limits](#honest-limits) · [What's next](#whats-next) · [Tests](#tests) · [Docs](#docs)
 
 ## Why
 
@@ -90,7 +89,39 @@ A package's full journey — from `guard install` through every layer to a trust
 
 See it live: `node demo/run.mjs` ([demo/README.md](demo/README.md)).
 
+**What a block looks like** — `guard check` stops a staged secret before it ever leaves your machine:
+
+```console
+$ guard check
+guard: ✗ 1 secret file(s) would be committed/pushed:
+  .env  (matched secret-paths ".env")
+guard: untrack it first — git rm --cached <file> (and add it to .gitignore).
+guard: a deliberate file? → guard ignore secret:.env --reason "..."
+guard: 1 secret file(s) staged or tracked
+```
+
+## How it's different
+
+Most tools in this space **report** — they tell you, after the fact, that
+something you already installed is bad. depguard sits *in the install path* — so npm
+never resolves the bad version in the first place.
+
+<div align="center">
+  <img src="depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
+</div>
+
+| You might use… | What it does | Where depguard differs |
+|---|---|---|
+| **Dependabot / `npm audit`** | alert on known CVEs *after* install, from a public advisory DB | filters bad versions out **before npm resolves**, and adds a **cooldown** that stops day-zero malware no advisory has named yet |
+| **Snyk / socket.dev** | cloud service scans your manifest, dashboards + per-seat pricing, your dep graph leaves the building | **local-first, zero cloud, zero telemetry, no accounts** — state is committed files; nothing about your repo is uploaded |
+| **Lockfile pinning / `npm ci`** | reproducible installs of whatever you already trusted — including a version poisoned before you pinned it | re-checks the locked versions against fresh advisories on **every commit/PR**, and verifies registry signatures + lockfile integrity |
+| **`--ignore-scripts` by hand** | blocks *all* lifecycle scripts; native packages break, so teams turn it back off | ignore-by-default **plus** an ask-once approval that runs the few real build scripts **boxed and syscall-traced** — protection without the breakage |
+| **OS sandboxes / per-OS jails** | contain script execution, but per-OS, escapable, complex to set up | a digest-pinned container that both **cages and observes** (strace convicts on exfil intent) — and when no runtime exists, every other layer still works |
+| **Scanner-only tools** | flag suspicious *static* patterns; obfuscation hides from a code reader | pairs static signals with **dynamic syscall evidence** — you can hide a `connect()` from a reader, not from the trace |
+
 ## Quickstart
+
+**Requirements:** Go 1.26.4 to build the binary, `git` for commit-diff scoping, and *optionally* Docker or Podman to sandbox build scripts. End users just need the compiled binary.
 
 ```sh
 # 1. Build the binary once per machine (Go 1.26.4, zero dependencies)
@@ -123,14 +154,13 @@ The *why* and the per-layer guarantees: **[docs/DESIGN.md](docs/DESIGN.md)** (th
 
 ## What each layer stops
 
-Defense in depth — but the layers don't all fire at once. Each acts at a specific
-moment, grouped here by **when** it runs.
+The same layered defenses — but they don't all fire at once. Here they're grouped by **when** each runs:
 
 <div align="center">
-  <img src="depguard-layers.svg" alt="What each layer stops, grouped by phase: ① at install (name &amp; version) ② at install (lifecycle scripts) ③ on commit/PR (guard check) ④ opt-in flag checks." width="900">
+  <img src="depguard-layers.svg" alt="What each layer stops, grouped by when each fires: at install (name &amp; version), at install (lifecycle scripts), on commit/PR (guard check), and opt-in flag checks." width="900">
 </div>
 
-### ① At install · name & version safety — *before npm even resolves*
+### At install · name & version safety — *before npm even resolves*
 
 `guard install` / `guard ci`, via the ephemeral proxy:
 
@@ -151,7 +181,7 @@ integrity hash can't — but only blocks *present-but-invalid* signatures (unsig
 versions still pass). With `save-exact`, deps stay at the version you vetted until you
 bump them by hand, so a later `npm install` can't pull a freshly-compromised patch.
 
-### ② At install · lifecycle scripts — *only the few packages that ship them*
+### At install · lifecycle scripts — *only the few packages that ship them*
 
 | Layer | Stops |
 |---|---|
@@ -167,7 +197,7 @@ output is discarded and the approval revoked. The container is named and force-r
 on timeout; `guard prewarm` builds the image ahead of the first run, `guard clean
 --image` reclaims it.
 
-### ③ On commit / push / PR — *`guard check`, run by the git hooks & CI gate*
+### On commit / push / PR — *`guard check`, run by the git hooks & CI gate*
 
 Catches deps that go bad *after* you installed them — and your own secrets on the way out:
 
@@ -186,7 +216,7 @@ which the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin
 reinstall** (drop each direct dep to its latest version past the cooldown, then
 re-verify). CI always keeps the strict block.
 
-### ④ Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
+### Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
 
 | Layer | Stops |
 |---|---|
@@ -260,25 +290,6 @@ respects `NO_COLOR`.
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
 
-## How it's different
-
-Most tools in this space **report** — they tell you, after the fact, that
-something you already installed is bad. depguard sits *in the install path* — so npm
-never resolves the bad version in the first place.
-
-<div align="center">
-  <img src="depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
-</div>
-
-| You might use… | What it does | Where depguard differs |
-|---|---|---|
-| **Dependabot / `npm audit`** | alert on known CVEs *after* install, from a public advisory DB | filters bad versions out **before npm resolves**, and adds a **cooldown** that stops day-zero malware no advisory has named yet |
-| **Snyk / socket.dev** | cloud service scans your manifest, dashboards + per-seat pricing, your dep graph leaves the building | **local-first, zero cloud, zero telemetry, no accounts** — state is committed files; nothing about your repo is uploaded |
-| **Lockfile pinning / `npm ci`** | reproducible installs of whatever you already trusted — including a version poisoned before you pinned it | re-checks the locked versions against fresh advisories on **every commit/PR**, and verifies registry signatures + lockfile integrity |
-| **`--ignore-scripts` by hand** | blocks *all* lifecycle scripts; native packages break, so teams turn it back off | ignore-by-default **plus** an ask-once approval that runs the few real build scripts **boxed and syscall-traced** — protection without the breakage |
-| **OS sandboxes / per-OS jails** | contain script execution, but per-OS, escapable, complex to set up | a digest-pinned container that both **cages and observes** (strace convicts on exfil intent) — and when no runtime exists, every other layer still works |
-| **Scanner-only tools** | flag suspicious *static* patterns; obfuscation hides from a code reader | pairs static signals with **dynamic syscall evidence** — you can hide a `connect()` from a reader, not from the trace |
-
 ## Honest limits
 
 No layer claims 100%. Each raises attacker cost; together they close the gaps the
@@ -315,6 +326,24 @@ others leave.
 - The MCP server returns scan/check results wrapped as **untrusted data**; an agent
   must still be told (as the banner says) not to follow instructions embedded in a
   package's files.
+
+## What's next
+
+Directional, not commitments — depguard is **npm-first** today. On the radar:
+
+- **More ecosystems.** PyPI (Python) is the next target — a different registry API and
+  script model — then NuGet (.NET / C#), Cargo (Rust), and RubyGems. The layered model
+  (cooldown, name gate, scan, box, advisory re-check) is ecosystem-agnostic; each needs
+  its own registry + lockfile adapter.
+- **pnpm / yarn parity.** Installs already route through the cooldown proxy for all three;
+  the **boxed lifecycle-script approval** is npm-only today (it reads `package-lock.json`)
+  — extend it to the pnpm/yarn lockgraphs.
+- **Richer tracing.** A kernel-level **eBPF / Falco**-style probe to complement `strace`
+  inside the box.
+- **Deeper provenance.** Verify **Rekor** transparency-log inclusion, the SCT, and **TUF**
+  trust-root rotation — closing the gap to the full Sigstore guarantee.
+- **Signed release binaries.** Published, checksummed builds so you don't have to compile
+  from source.
 
 ## Tests
 
