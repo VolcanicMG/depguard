@@ -148,26 +148,43 @@ non-empty `degraded`.
 
 ## Command reference
 
+<div align="center">
+  <img src="depguard-commands.svg" alt="depguard command reference: setup (init, status), install (install, ci), audit (check, scan, why, sbom), decisions & waivers (approve, ignore, allow, secret-add), config & maintenance (config, prewarm, clean, mcp)" width="900">
+</div>
+
+<details><summary><b>Full reference with every flag (copy-paste)</b></summary>
+
 ```sh
-guard init            # drops .guardrc, .npmrc, pre-commit/pre-push hooks
-#   --ci adds a PR gate; --prebuild-box builds the sandbox image now (skip the first-run wait)
+# ── Setup ──────────────────────────────────────────────────
+guard init [--ci] [--prebuild-box]   # drop .guardrc, .npmrc, git hooks (--ci adds a PR gate;
+                                     #   --prebuild-box builds the sandbox image now)
+guard status                         # offline read: policy, hooks, sandbox, recorded decisions
 #   bypass a hook once (depguard only, other hooks still run): GUARD_SKIP=1 git push
-guard status          # is this repo protected? policy, hooks, sandbox, decisions (offline)
-guard install <pkg>   # instead of npm install
-guard ci              # instead of npm ci (lockfile-exact installs, same protections)
-guard check [--all] [--json] [--confirm]   # advisories + cooldown + integrity (hooks run this)
-guard scan <dir> [--json]      # static-scan one package dir (scripts, caps, injection)
-guard why <package> [--all]    # which direct dep(s) pull a package in (npm lockfile)
-guard sbom [--spdx]            # write an SBOM of installed deps (CycloneDX, or SPDX) to stdout
-guard approve <name@version> [--uncontained|--deny]   # script decisions
-guard ignore <issue-id> [--reason ".."] [--expires 30d]  # waive a REVIEWED check finding (--list, --remove)
-guard allow <pattern>...                 # add a name/scope to .guardrc allow (bypass cooldown)
-guard secret-add <pattern>...            # append a file/dir pattern to .guardrc secret-paths (never-commit gate)
-guard config [get | set <k> <v>]         # show or edit .guardrc policy
-guard prewarm         # build the sandbox image now so the first boxed run isn't slow
-guard clean [--image] # sweep stray containers + run artifacts; --image also reclaims the image
-guard mcp             # run as an MCP server over stdio (tools: scan_package, check_dependencies)
+
+# ── Install · instead of npm ───────────────────────────────
+guard install <pkg>                  # protected install through the cooldown proxy
+guard ci                             # lockfile-exact install (npm ci), same protections
+
+# ── Audit ──────────────────────────────────────────────────
+guard check [--all] [--json] [--confirm]   # advisories + cooldown + integrity + secrets (hooks run this)
+guard scan <dir> [--json]            # static-scan one package dir (scripts, caps, injection)
+guard why <pkg> [--all]              # which direct dep(s) pull a package in (npm lockfile)
+guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to stdout
+
+# ── Decisions & waivers ────────────────────────────────────
+guard approve <name@version> [--uncontained|--deny]            # script decisions
+guard ignore <issue-id> [--reason ".."] [--expires 30d]        # waive a REVIEWED finding (--list, --remove)
+guard allow <pattern>...             # add a name/scope to .guardrc allow (bypass cooldown)
+guard secret-add <pattern>...        # append a file/dir pattern to secret-paths (never-commit gate)
+
+# ── Config & maintenance ───────────────────────────────────
+guard config [get | set <k> <v>]     # show or edit .guardrc policy
+guard prewarm                        # build the sandbox image now so the first boxed run isn't slow
+guard clean [--image]                # sweep stray containers + run artifacts (--image reclaims the image)
+guard mcp                            # MCP server over stdio (tools: scan_package, check_dependencies)
 ```
+
+</details>
 
 Run `guard status` anytime for an offline, instant read on whether the repo is
 protected — policy, the committed files, hooks, sandbox runtime, and recorded

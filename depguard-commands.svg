@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="648" viewBox="0 0 1000 648" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="1000" height="648" rx="20" fill="#0a0f18"/>
+<rect x="1" y="1" width="998" height="646" rx="19" fill="none" stroke="#223145"/>
+<g transform="translate(40,40)">
+<path d="M0,-14 L13,-9 V2 C13,11 7,17 0,20 C-7,17 -13,11 -13,2 V-9 Z" fill="none" stroke="#34c46a" stroke-width="2.2"/>
+<path d="M-5,1 L-1,5 L6,-4" fill="none" stroke="#34c46a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="66" y="46" fill="#e9eef5" font-size="24" font-weight="700">dep<tspan fill="#34c46a">guard</tspan></text>
+<text x="960" y="34" text-anchor="end" fill="#8b9bb0" font-size="12" letter-spacing="3" font-weight="600">COMMAND REFERENCE</text>
+<text x="960" y="52" text-anchor="end" fill="#8b9bb0" font-size="11.5">one binary · per-repo policy · nothing in the background</text>
+<line x1="40" y1="70" x2="960" y2="70" stroke="#223145"/>
+<rect x="36" y="100" width="452" height="128" rx="12" fill="#111b29" stroke="#223145"/>
+<rect x="36" y="100" width="5" height="128" rx="2.5" fill="#34c46a"/>
+<text x="54" y="123" fill="#34c46a" font-size="13" font-weight="700" letter-spacing="1.5">SETUP</text>
+<line x1="54" y1="132" x2="470" y2="132" stroke="#223145"/>
+<text x="54" y="152" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard init [--ci] [--prebuild-box]</text>
+<text x="54" y="167" fill="#8b9bb0" font-size="11.5">drop .guardrc, .npmrc, git hooks · --ci adds a PR gate</text>
+<text x="54" y="192" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard status</text>
+<text x="54" y="207" fill="#8b9bb0" font-size="11.5">offline read — is this repo protected?</text>
+<rect x="36" y="250" width="452" height="128" rx="12" fill="#111b29" stroke="#223145"/>
+<rect x="36" y="250" width="5" height="128" rx="2.5" fill="#34c46a"/>
+<text x="54" y="273" fill="#34c46a" font-size="13" font-weight="700" letter-spacing="1.5">INSTALL   ·   instead of npm</text>
+<line x1="54" y1="282" x2="470" y2="282" stroke="#223145"/>
+<text x="54" y="302" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard install &lt;pkg&gt;</text>
+<text x="54" y="317" fill="#8b9bb0" font-size="11.5">protected install through the cooldown proxy</text>
+<text x="54" y="342" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard ci</text>
+<text x="54" y="357" fill="#8b9bb0" font-size="11.5">lockfile-exact install, same protections</text>
+<rect x="36" y="400" width="452" height="208" rx="12" fill="#111b29" stroke="#223145"/>
+<rect x="36" y="400" width="5" height="208" rx="2.5" fill="#38bdf8"/>
+<text x="54" y="423" fill="#38bdf8" font-size="13" font-weight="700" letter-spacing="1.5">AUDIT</text>
+<line x1="54" y1="432" x2="470" y2="432" stroke="#223145"/>
+<text x="54" y="452" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard check [--all] [--json] [--confirm]</text>
+<text x="54" y="467" fill="#8b9bb0" font-size="11.5">advisories + cooldown + integrity + secrets · hooks run this</text>
+<text x="54" y="492" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard scan &lt;dir&gt; [--json]</text>
+<text x="54" y="507" fill="#8b9bb0" font-size="11.5">static-scan one package dir (scripts, caps, injection)</text>
+<text x="54" y="532" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard why &lt;pkg&gt; [--all]</text>
+<text x="54" y="547" fill="#8b9bb0" font-size="11.5">which direct dep(s) pull a package in</text>
+<text x="54" y="572" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard sbom [--spdx]</text>
+<text x="54" y="587" fill="#8b9bb0" font-size="11.5">write an SBOM (CycloneDX, or SPDX) to stdout</text>
+<rect x="512" y="100" width="452" height="208" rx="12" fill="#111b29" stroke="#223145"/>
+<rect x="512" y="100" width="5" height="208" rx="2.5" fill="#38bdf8"/>
+<text x="530" y="123" fill="#38bdf8" font-size="13" font-weight="700" letter-spacing="1.5">DECISIONS &amp; WAIVERS</text>
+<line x1="530" y1="132" x2="946" y2="132" stroke="#223145"/>
+<text x="530" y="152" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard approve &lt;name@version&gt;</text>
+<text x="530" y="167" fill="#8b9bb0" font-size="11.5">script decision · --uncontained | --deny</text>
+<text x="530" y="192" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard ignore &lt;issue-id&gt;</text>
+<text x="530" y="207" fill="#8b9bb0" font-size="11.5">waive a reviewed finding · --reason --expires --list --remove</text>
+<text x="530" y="232" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard allow &lt;pattern&gt;...</text>
+<text x="530" y="247" fill="#8b9bb0" font-size="11.5">bypass cooldown for a name / scope</text>
+<text x="530" y="272" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard secret-add &lt;pattern&gt;...</text>
+<text x="530" y="287" fill="#8b9bb0" font-size="11.5">add a never-commit file pattern</text>
+<rect x="512" y="330" width="452" height="208" rx="12" fill="#111b29" stroke="#223145"/>
+<rect x="512" y="330" width="5" height="208" rx="2.5" fill="#34c46a"/>
+<text x="530" y="353" fill="#34c46a" font-size="13" font-weight="700" letter-spacing="1.5">CONFIG &amp; MAINTENANCE</text>
+<line x1="530" y1="362" x2="946" y2="362" stroke="#223145"/>
+<text x="530" y="382" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard config [get | set &lt;k&gt; &lt;v&gt;]</text>
+<text x="530" y="397" fill="#8b9bb0" font-size="11.5">show or edit .guardrc policy</text>
+<text x="530" y="422" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard prewarm</text>
+<text x="530" y="437" fill="#8b9bb0" font-size="11.5">build the sandbox image before the first boxed run</text>
+<text x="530" y="462" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard clean [--image]</text>
+<text x="530" y="477" fill="#8b9bb0" font-size="11.5">sweep stray containers + run artifacts</text>
+<text x="530" y="502" fill="#7ee0a3" font-size="13.5" font-weight="600" font-family="Consolas, Menlo, monospace">guard mcp</text>
+<text x="530" y="517" fill="#8b9bb0" font-size="11.5">run as an MCP server over stdio</text>
+</svg>
