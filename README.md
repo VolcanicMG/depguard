@@ -112,14 +112,15 @@ never resolves the bad version in the first place.
 
 ## Quickstart
 
-**Requirements:** Go 1.26.4 to build from source, `git` for commit-diff scoping, and *optionally* Docker or Podman to sandbox build scripts.
-
-**Grab a prebuilt binary** for your OS from the [Releases](../../releases) page — linux · macOS · Windows on amd64 + arm64, each with `SHA256SUMS` to verify — or build from source:
+depguard ships **prebuilt binaries for every major OS** — no build step. Download the
+asset for your platform from the [latest release](../../releases/latest), drop it on your
+`PATH`, and you're set.
 
 ```sh
-# 1. Build the binary once per machine (Go 1.26.4, zero dependencies)
-go build -o guard .
-sudo mv guard /usr/local/bin/      # or anywhere on your PATH
+# 1. Install (Linux x86-64 shown — pick your asset from the release list)
+curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
+chmod +x guard && sudo mv guard /usr/local/bin/
+guard version                       # -> guard 1.0.0
 
 # 2. Protect a repo
 cd your-project
@@ -127,8 +128,10 @@ guard init                          # drops .guardrc, .npmrc, pre-commit/pre-pus
 guard install lodash                # instead of npm install
 ```
 
-End users need only the compiled binary — never Go, never npm packages. Full
-onboarding, cross-compiling, tuning, and troubleshooting: **[docs/SETUP.md](docs/SETUP.md)**.
+**Per-OS install steps** (the right asset for Linux/macOS/Windows, checksum
+verification, macOS Gatekeeper, Windows PATH) and building from source live in
+**[docs/SETUP.md §1](docs/SETUP.md)**. Only the sandboxed-script layer needs
+Docker/Podman — everything else runs from the single binary.
 
 ## The five layers
 

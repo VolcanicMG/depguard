@@ -29,23 +29,66 @@ guards the npm ecosystem must not be installed *through* it.
 
 ## 1. Install the binary (once per machine)
 
-**Prebuilt:** grab a binary for your OS/arch from the [Releases](https://github.com/VolcanicMG/depguard/releases) page and verify it against `SHA256SUMS` — then skip to §2. To build from source:
+depguard ships **prebuilt binaries** on the
+[Releases page](https://github.com/VolcanicMG/depguard/releases/latest) for every major
+OS/arch — no Go toolchain needed. Pick the asset that matches your platform:
+
+| OS | amd64 (Intel / AMD) | arm64 (Apple Silicon / ARM) |
+|---|---|---|
+| Linux | `guard-linux-amd64` | `guard-linux-arm64` |
+| macOS | `guard-darwin-amd64` | `guard-darwin-arm64` |
+| Windows | `guard-windows-amd64.exe` | `guard-windows-arm64.exe` |
+
+### Linux / macOS
+
+```sh
+ASSET=guard-linux-amd64        # ← change to your asset from the table above
+base=https://github.com/VolcanicMG/depguard/releases/latest/download
+
+curl -fsSL -O "$base/$ASSET"
+curl -fsSL -O "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS    # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
+
+chmod +x "$ASSET"
+sudo mv "$ASSET" /usr/local/bin/guard       # or anywhere on your PATH
+guard version                               # -> guard 1.0.0
+```
+
+> **macOS Gatekeeper:** the binary is unsigned, so the first run may be blocked. Clear
+> the quarantine flag once — `xattr -d com.apple.quarantine /usr/local/bin/guard` — or
+> right-click the file in Finder → **Open**.
+
+### Windows (PowerShell)
+
+```powershell
+$asset = "guard-windows-amd64.exe"          # or guard-windows-arm64.exe
+$base  = "https://github.com/VolcanicMG/depguard/releases/latest/download"
+
+Invoke-WebRequest "$base/$asset" -OutFile guard.exe
+(Get-FileHash guard.exe -Algorithm SHA256).Hash.ToLower()   # compare against SHA256SUMS
+
+New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
+Move-Item -Force guard.exe "$env:USERPROFILE\bin\guard.exe"   # a dir already on your PATH
+guard version                               # -> guard 1.0.0
+```
+
+> **Windows:** SmartScreen may warn on the unsigned binary — *More info → Run anyway*.
+> Git hooks run as `sh` shims, so they use Git-for-Windows' bash (ships with Git).
+
+### Build from source (optional)
+
+Needs Go 1.26.4; produces the same single, zero-dependency binary.
 
 ```sh
 cd /path/to/depguard
 go build -o guard .            # zero dependencies
-sudo mv guard /usr/local/bin/  # or anywhere on your PATH
+sudo mv guard /usr/local/bin/
 guard version                  # -> guard 1.0.0
 ```
 
-On this machine Go lives at `~/.local/go/bin/go` (not on PATH), so:
-
-```sh
-~/.local/go/bin/go build -o guard .
-```
-
-That single binary is all an end user ever needs. Sign/checksum it if you
-distribute it to a team (the CI gate, §6, will ask for a pinned URL + checksum).
+(On this machine Go lives at `~/.local/go/bin/go`, not on PATH — use that path to build.)
+Sign/checksum the binary if you distribute it to a team (the CI gate, §6, takes a
+pinned URL + checksum).
 
 ### Cross-compiling for another OS/arch
 
