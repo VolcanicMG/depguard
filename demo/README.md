@@ -31,6 +31,7 @@ the conviction demos). It builds `guard` on first run.
 | `demo-exfil` | convicted | install-time network exfil → caught, output discarded |
 | `demo-snoop` | convicted | credential theft (`/root/.ssh`, `/etc/shadow`) → caught |
 | `demo-too-fresh` | blocked | cooldown stops a 1-day-old version before it runs |
+| `lodahs` | blocked | name-level typosquat defense (one edit from `lodash`) → blocked fail-closed before any version is fetched |
 
 ## The false-positive demo package (`demo-native-build`)
 

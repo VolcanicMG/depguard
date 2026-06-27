@@ -194,7 +194,7 @@ guard install <pkg>                  # protected install through the cooldown pr
 guard ci                             # lockfile-exact install (npm ci), same protections
 
 # ── Audit ──────────────────────────────────────────────────
-guard check [--all] [--json] [--confirm]   # advisories + cooldown + integrity + secrets (hooks run this)
+guard check [--all] [--json] [--confirm] [--quiet]   # advisories + cooldown + integrity + secrets (hooks run this)
 guard scan <dir> [--json]            # static-scan one package dir (scripts, caps, injection)
 guard why <pkg> [--all]              # which direct dep(s) pull a package in (npm lockfile)
 guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to stdout

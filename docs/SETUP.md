@@ -146,10 +146,12 @@ ignore-scripts: true               # never auto-run lifecycle scripts (the defau
 allow: ["@yourco/*"]               # YOUR scopes bypass the cooldown (you publish them)
 internal-scopes: ["@yourco/*"]     # MUST come from a private registry — blocked from public (confusion guard)
 no-container-fallback: warn-approve # no Docker? warn + ask (CI fails closed unless pre-approved) | or: fail
-flag: [new-deps, new-maintainer]   # extra signals guard check surfaces (see below)
+flag: [new-deps, new-maintainer, provenance]  # extra opt-in signals guard check surfaces (see below)
 advisory-threshold: high           # lowest advisory severity that BLOCKS; below it warns | critical|high|moderate|low
 untraced-boxed: run                # box can't build the strace image? run caged-but-unwatched | or: fail
 secret-paths: [".env", ".env.*", "secrets/", "*.pem"]  # files that must NEVER be committed/pushed (off by default)
+license-deny: ["GPL-3.0", "AGPL-3.0"]   # SPDX ids to BLOCK on installed deps (off by default; deny applied first)
+# license-allow: ["MIT", "Apache-2.0", "ISC", "BSD-3-Clause"]  # allowlist mode: ONLY these pass (stricter — pick one mode)
 # registry: https://registry.npmjs.org   # upstream; must be https (loopback http ok for tests)
 ```
 
@@ -167,8 +169,16 @@ Tips:
   cooldown *and* refuse to resolve them from the public registry.
 - **`flag:` is opt-in extra signal.** `new-deps` (on by default) lists packages a
   lockfile change adds — cheap, non-blocking. `new-maintainer` flags publisher
-  changes / long-dormancy republishes (account-takeover fingerprint) but costs one
-  packument fetch per package, so it's off by default.
+  changes / long-dormancy republishes (account-takeover fingerprint). `provenance`
+  verifies a package's npm build-provenance attestation (Sigstore/SLSA — DSSE
+  signature, Fulcio cert chain, tarball-digest binding) and blocks a tampered
+  claim. Both `new-maintainer` and `provenance` fetch per package, so they're off
+  by default.
+- **`license-deny:` / `license-allow:` gate dependency licenses.** Deny-list SPDX
+  ids (`GPL-3.0`, `AGPL-3.0`, …) to BLOCK installed packages that declare them, or
+  switch to allowlist mode with `license-allow:` so only the listed licenses pass
+  (deny is applied first). Off by default; both read each installed package's
+  declared license, so they need `node_modules` present.
 - **`advisory-threshold:` grades advisories.** Hits at/above it BLOCK; below it
   WARN. Default `high` (critical+high block, moderate+low warn). `MAL-*`
   malicious-package hits and advisories OSV couldn't score **always** block,

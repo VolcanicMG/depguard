@@ -25,9 +25,11 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── scanner/tarball.go      scan a published tarball → capability diff
  │   ├── typosquat/typosquat.go  name-level filter: Damerau-1 + homoglyph
  │   ├── provenance/provenance.go npm ECDSA dist.signature verification (stdlib)
+ │   ├── attestation/attestation.go npm build-provenance: Sigstore/SLSA DSSE + Fulcio chain + digest bind (flag:)
  │   ├── maintainer/maintainer.go publisher-change / account-takeover detection
  │   ├── freshness/freshness.go  cooldown re-check on lockfile versions + LatestSafe (pin target)
-│   ├── secrets/secrets.go      secret-file gate: git staged/tracked vs secret-paths globs
+ │   ├── secrets/secrets.go      secret-file gate: git staged/tracked vs secret-paths globs
+ │   ├── license/license.go      license-deny/allow gate on installed deps' SPDX ids
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
  │   │                           Severities = per-vuln detail for tiering; Blocks)
  │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
@@ -35,9 +37,12 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
  │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth)
  │   ├── lockfile/altlock.go     pnpm-lock.yaml + yarn.lock parsers (check path)
+ │   ├── lockfile/graph.go       package-lock graph rebuild for `guard why` (parent→child edges)
+ │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
  │   └── tty/                    "is a human attached?" (termios; /dev/null lies)
  ├── depguard.png                project logo (README header)
+ ├── depguard-*.svg              generated README infographics (pipeline/layers/commands/different)
  ├── docs/                       deep docs (linked from README)
  │   ├── CODEMAP.md              this file
  │   ├── DESIGN.md               the agreed design contract
@@ -49,7 +54,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
      ├── helpers/registry.mjs    mock npm registry w/ fabricated publish ages
      ├── helpers/tar.mjs         hand-rolled USTAR+gzip (zero test deps)
      ├── helpers/run.mjs         temp projects + binary spawner
-     └── *.test.mjs              cooldown / scripts / init suites
+     └── *.test.mjs              cooldown / additions / scripts / init / secrets suites
 ```
 
 ## Flow: `guard install` (and `guard ci`)
@@ -139,6 +144,10 @@ the shared history.
 | New MCP tool | `mcp.go` `toolDefs()` + `callTool()` — keep the untrusted-data banner |
 | Signature/keyring behavior | `provenance/provenance.go`; wired in `proxy.go` `rewrite()` |
 | Maintainer-change heuristic | `maintainer/maintainer.go` `changesFor()` |
+| Build-provenance verification | `attestation/attestation.go` (DSSE + Fulcio chain + digest bind); gated by `flag: provenance`, wired in `main.go` `checkProvenance` |
+| License-policy gate | `license/license.go` (SPDX deny/allow); wired in `main.go` `checkLicenses` |
+| SBOM output (CycloneDX / SPDX) | `sbom/sbom.go`; `main.go` `cmdSBOM` |
+| `guard why` dependency graph | `lockfile/graph.go` (`BuildGraph` / `Paths`); `main.go` `cmdWhy` |
 | Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `Installed()` |
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
@@ -169,182 +178,12 @@ the shared history.
 6. **Approvals/policy are committed files** — changes are PR-reviewable security decisions.
 7. **The trace convicts only on no-build-excuse behavior** (network reach-out, real-secret access). Spawns and writes are context, never convictions — false positives train humans to disable the tool. New `trace` matchers must hold this line.
 8. **The strace log is written to a host-side temp dir** (`/obs`), never inside the package's writable mount — the traced script must not be able to doctor its own evidence.
----
 
-## Generated reference (AST graph)
+## Generated reference
 
-_Auto-generated from a stdlib-only Go AST walk of the source tree (excludes `test/`, `_test.go`). 263 symbols, 290 intra-module call edges, 24 internal imports across 18 packages._
-
-Symbols: **148 funcs, 28 methods, 31 types, 41 consts, 15 vars.**
-
-### Package dependency graph
-
-```mermaid
-graph LR
-  advisory[advisory] --> lockfile[lockfile]
-  box[box] --> trace[trace]
-  freshness[freshness] --> lockfile[lockfile]
-  maintainer[maintainer] --> lockfile[lockfile]
-  registry[registry] --> advisory[advisory]
-  registry[registry] --> config[config]
-  registry[registry] --> provenance[provenance]
-  registry[registry] --> semver[semver]
-  registry[registry] --> typosquat[typosquat]
-  root[(root)] --> advisory[advisory]
-  root[(root)] --> approvals[approvals]
-  root[(root)] --> box[box]
-  root[(root)] --> config[config]
-  root[(root)] --> freshness[freshness]
-  root[(root)] --> hooks[hooks]
-  root[(root)] --> lockfile[lockfile]
-  root[(root)] --> maintainer[maintainer]
-  root[(root)] --> registry[registry]
-  root[(root)] --> scanner[scanner]
-  root[(root)] --> semver[semver]
-  root[(root)] --> tty[tty]
-  root[(root)] --> ui[ui]
-  root[(root)] --> waivers[waivers]
-  ui[ui] --> tty[tty]
-```
-
-### Call-graph hubs
-
-| Most-called (fan-in) | n | Biggest callers (fan-out) | n |
-|---|--:|---|--:|
-| `ui.OK`|10 | `(root).cmdStatus`|18 |
-| `ui.paint`|9 | `(root).gatherCheck`|16 |
-| `approvals.File.Get`|8 | `registry.Proxy.rewrite`|14 |
-| `ui.Warn`|8 | `(root).cmdInstall`|13 |
-| `config.Load`|7 | `(root).handleScripts`|13 |
-| `approvals.File.Set`|6 | `(root).checkLockfileIntegrity`|12 |
-| `lockfile.Installed`|6 | `(root).checkFreshness`|11 |
-| `lockfile.Pkg.Key`|6 | `(root).main`|11 |
-| `ui.Dim`|6 | `(root).checkAdvisories`|9 |
-| `waivers.File.Check`|6 | `(root).cmdCheck`|9 |
-
-### Symbol index
-
-Per package: types and top-level functions/methods, with `file:line`.
-
-<details><summary><code>(root)</code></summary>
-
-**types:** `CheckResult`, `rpcError`, `rpcRequest`, `rpcResponse`  
-**funcs:** `activeAdvisories` (main.go:629), `activeCooldown` (main.go:643), `advisoryWaiverID` (main.go:600), `approvalSummary` (main.go:1494), `boolState` (main.go:1456), `callTool` (mcp.go:142), `checkAdvisories` (main.go:1050), `checkFreshness` (main.go:947), `checkLockfileIntegrity` (main.go:734), `checkMaintainers` (main.go:875), `cmdAllow` (main.go:1541), `cmdApprove` (main.go:1151), `cmdCheck` (main.go:512), `cmdConfig` (main.go:1568), `cmdIgnore` (main.go:1199), `cmdInit` (main.go:112), `cmdInstall` (main.go:164), `cmdMCP` (mcp.go:50), `cmdScan` (main.go:1108), `cmdStatus` (main.go:1353), `cooldownWaiverID` (main.go:605), `dispatchMCP` (mcp.go:73), `fmtCooldown` (main.go:1440), `gatherCheck` (main.go:661), `gitTracked` (main.go:1488), `handleScripts` (main.go:265), `headLockfile` (main.go:1036), `hostOf` (main.go:801), `isLoopbackHost` (main.go:811), `listOrNone` (main.go:1448), `lookState` (main.go:1479), `main` (main.go:44), `npmrcState` (main.go:1464), `offRegistryWaiverID` (main.go:610), `printConfig` (main.go:1598), `priorCapabilityDiff` (main.go:817), `priorVersion` (main.go:850), `promptApproval` (main.go:360), `promptYN` (main.go:1318), `reportNewDeps` (main.go:912), `runApproved` (main.go:405), `runRootScripts` (main.go:476), `stdinIsTTY` (main.go:1314), `tail` (main.go:1338), `toolDefs` (mcp.go:103), `toolError` (mcp.go:210), `toolText` (mcp.go:189), `toolTextNote` (mcp.go:196), `truncate` (main.go:1329), `unhashedWaiverID` (main.go:611), `usage` (main.go:90), `validWaiverID` (main.go:1299), `waivedActive` (main.go:622), `waiverReason` (main.go:614), `waiverSummary` (main.go:1514)
-
-</details>
-
-<details><summary><code>advisory</code></summary>
-
-**types:** `Vuln`  
-**funcs:** `Check` (internal/advisory/osv.go:55), `CheckVersions` (internal/advisory/osv.go:34)
-
-</details>
-
-<details><summary><code>approvals</code></summary>
-
-**types:** `Decision`, `Entry`, `File`  
-**funcs:** `File.Get` (internal/approvals/approvals.go:65), `File.Save` (internal/approvals/approvals.go:81), `File.Set` (internal/approvals/approvals.go:71), `Load` (internal/approvals/approvals.go:46)
-
-</details>
-
-<details><summary><code>box</code></summary>
-
-**types:** `Result`  
-**funcs:** `EnsureObsImage` (internal/box/box.go:109), `Result.Summary` (internal/box/box.go:344), `Run` (internal/box/box.go:153), `RunUncontained` (internal/box/box.go:303), `Runtime` (internal/box/box.go:95), `ensureSeccompProfile` (internal/box/box.go:85), `snapshot` (internal/box/box.go:326)
-
-</details>
-
-<details><summary><code>config</code></summary>
-
-**types:** `Config`, `FallbackMode`  
-**funcs:** `AddAllow` (internal/config/config.go:360), `Config.Allowed` (internal/config/config.go:160), `Config.Flagged` (internal/config/config.go:174), `Config.Internal` (internal/config/config.go:186), `Defaults` (internal/config/config.go:65), `Load` (internal/config/config.go:79), `SetValue` (internal/config/config.go:347), `WriteDefault` (internal/config/config.go:215), `canonicalValue` (internal/config/config.go:379), `parseBool` (internal/config/config.go:203), `parseDays` (internal/config/config.go:311), `parseList` (internal/config/config.go:323), `validateRegistry` (internal/config/config.go:293), `writeKeyLine` (internal/config/config.go:429)
-
-</details>
-
-<details><summary><code>freshness</code></summary>
-
-**types:** `Violation`  
-**funcs:** `Check` (internal/freshness/freshness.go:39), `publishTime` (internal/freshness/freshness.go:83)
-
-</details>
-
-<details><summary><code>hooks</code></summary>
-
-**types:** `InstalledState`  
-**funcs:** `Install` (internal/hooks/hooks.go:136), `Installed` (internal/hooks/hooks.go:195), `hookCallsGuard` (internal/hooks/hooks.go:212), `installHook` (internal/hooks/hooks.go:89), `installNpmrc` (internal/hooks/hooks.go:117)
-
-</details>
-
-<details><summary><code>lockfile</code></summary>
-
-**types:** `Entry`, `Pkg`  
-**funcs:** `Installed` (internal/lockfile/lockfile.go:68), `InstalledBytes` (internal/lockfile/lockfile.go:87), `InstalledPaths` (internal/lockfile/lockfile.go:50), `Pkg.Key` (internal/lockfile/lockfile.go:46), `dedupe` (internal/lockfile/lockfile.go:99), `dedupePkgs` (internal/lockfile/lockfile.go:116), `parse` (internal/lockfile/lockfile.go:131), `parseBytes` (internal/lockfile/lockfile.go:140), `parsePnpm` (internal/lockfile/altlock.go:16), `parseYarn` (internal/lockfile/altlock.go:79), `splitPnpmKey` (internal/lockfile/altlock.go:60), `yarnName` (internal/lockfile/altlock.go:114)
-
-</details>
-
-<details><summary><code>maintainer</code></summary>
-
-**types:** `Change`  
-**funcs:** `Check` (internal/maintainer/maintainer.go:46), `changesFor` (internal/maintainer/maintainer.go:96)
-
-</details>
-
-<details><summary><code>provenance</code></summary>
-
-**types:** `Keyring`, `Signature`  
-**funcs:** `FetchKeyring` (internal/provenance/provenance.go:40), `Keyring.Verify` (internal/provenance/provenance.go:86)
-
-</details>
-
-<details><summary><code>registry</code></summary>
-
-**types:** `Blocked`, `Proxy`  
-**funcs:** `Proxy.BlockedVersions` (internal/registry/proxy.go:97), `Proxy.DeprecatedVersions` (internal/registry/proxy.go:343), `Proxy.Stop` (internal/registry/proxy.go:94), `Proxy.URL` (internal/registry/proxy.go:91), `Proxy.block` (internal/registry/proxy.go:329), `Proxy.handle` (internal/registry/proxy.go:106), `Proxy.keys` (internal/registry/proxy.go:59), `Proxy.note` (internal/registry/proxy.go:336), `Proxy.rewrite` (internal/registry/proxy.go:171), `Proxy.servePackument` (internal/registry/proxy.go:118), `Proxy.streamTarball` (internal/registry/proxy.go:316), `Start` (internal/registry/proxy.go:71), `distSignatures` (internal/registry/proxy.go:351), `hostOf` (internal/registry/proxy.go:378), `humanDays` (internal/registry/proxy.go:391), `isLoopbackHost` (internal/registry/proxy.go:388), `parseTime` (internal/registry/proxy.go:400)
-
-</details>
-
-<details><summary><code>scanner</code></summary>
-
-**types:** `Finding`, `Report`, `Severity`, `finder`  
-**funcs:** `DiffNew` (internal/scanner/tarball.go:81), `FetchReport` (internal/scanner/tarball.go:57), `ReadScripts` (internal/scanner/scanner.go:133), `Report.HasInstallScripts` (internal/scanner/scanner.go:67), `ScanDir` (internal/scanner/scanner.go:155), `ScanTarball` (internal/scanner/tarball.go:24), `Severity.MarshalJSON` (internal/scanner/scanner.go:45), `Severity.String` (internal/scanner/scanner.go:32), `isBidiControl` (internal/scanner/scanner.go:354), `isCodeFile` (internal/scanner/scanner.go:334), `isTextFile` (internal/scanner/scanner.go:338), `isZeroWidth` (internal/scanner/scanner.go:365), `lineAt` (internal/scanner/scanner.go:313), `readCapped` (internal/scanner/scanner.go:318), `scanFile` (internal/scanner/scanner.go:197), `scanInjection` (internal/scanner/scanner.go:263), `scanPatterns` (internal/scanner/scanner.go:243)
-
-</details>
-
-<details><summary><code>semver</code></summary>
-
-**types:** `Version`  
-**funcs:** `Less` (internal/semver/semver.go:52), `MaxStable` (internal/semver/semver.go:78), `Parse` (internal/semver/semver.go:24)
-
-</details>
-
-<details><summary><code>trace</code></summary>
-
-**types:** `Kind`, `Observation`, `Report`  
-**funcs:** `Parse` (internal/trace/trace.go:77), `decodeDNSName` (internal/trace/trace.go:159), `isLoopback` (internal/trace/trace.go:152), `isSecretPath` (internal/trace/trace.go:137)
-
-</details>
-
-<details><summary><code>tty</code></summary>
-
-**funcs:** `IsTerminal` (internal/tty/tty_unix.go:19), `IsTerminal` (internal/tty/tty_windows.go:10), `IsTerminalFd` (internal/tty/tty_unix.go:24), `IsTerminalFd` (internal/tty/tty_windows.go:14)
-
-</details>
-
-<details><summary><code>typosquat</code></summary>
-
-**funcs:** `Suspicion` (internal/typosquat/typosquat.go:51), `abs` (internal/typosquat/typosquat.go:146), `firstNonASCIILetter` (internal/typosquat/typosquat.go:133), `min3` (internal/typosquat/typosquat.go:153), `osaDistance` (internal/typosquat/typosquat.go:91), `quote` (internal/typosquat/typosquat.go:142), `quoteRune` (internal/typosquat/typosquat.go:144)
-
-</details>
-
-<details><summary><code>ui</code></summary>
-
-**funcs:** `Bad` (internal/ui/ui.go:39), `Bold` (internal/ui/ui.go:47), `Dim` (internal/ui/ui.go:46), `Enabled` (internal/ui/ui.go:26), `Green` (internal/ui/ui.go:43), `OK` (internal/ui/ui.go:37), `Red` (internal/ui/ui.go:45), `SetEnabled` (internal/ui/ui.go:23), `Waived` (internal/ui/ui.go:40), `Warn` (internal/ui/ui.go:38), `Yellow` (internal/ui/ui.go:44), `paint` (internal/ui/ui.go:29)
-
-</details>
-
-<details><summary><code>waivers</code></summary>
-
-**types:** `Entry`, `File`, `Status`  
-**funcs:** `File.Check` (internal/waivers/waivers.go:90), `File.IDs` (internal/waivers/waivers.go:139), `File.Remove` (internal/waivers/waivers.go:130), `File.Save` (internal/waivers/waivers.go:150), `File.Set` (internal/waivers/waivers.go:116), `Load` (internal/waivers/waivers.go:55), `normalizeExpiry` (internal/waivers/waivers.go:160)
-
-</details>
+A per-package symbol index (types + funcs with `file:line`), auto-generated from a
+stdlib-only Go AST walk, used to live here. It drifted out of sync with the source
+(line numbers and the package list go stale on every edit), so it was removed rather
+than left misleading — regenerate it from the current tree if you want it back. The
+hand-written map above (layout, flows, where-to-change, invariants) is the durable,
+maintained reference.

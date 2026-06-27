@@ -132,8 +132,12 @@ Inside, per request:
 |---|---|---|
 | Cooldown (age from `time` map) | metadata only | most malware (yanked within days) |
 | Allowlist / scope bypass | trivial | keeps internal dev fast |
+| Name gate (typosquat / homoglyph / confusion) | metadata only | impostor + internal-scope names — fail closed |
 | Advisory / yank feed (OSV etc.) | feed lookup | already-reported malware |
-| Tarball scan | first fetch only, cached | everything in §6 |
+| Registry signature verify | per-version sig | present-but-invalid npm ECDSA signatures |
+
+The static tarball scan (§6) is **not** a proxy filter — the proxy streams tarballs
+through unmodified; the scan runs later, at script-**approval** time.
 
 ---
 
@@ -216,8 +220,11 @@ Only packages with an **approved** install script ever enter the box. It is both
      -v ./node_modules/pkg:/work:rw \   # ONLY this package dir
      -w /work \
      --cap-drop ALL \          # no special powers
-     --user 1000 \             # not root
-     node:20-slim  npm rebuild pkg
+     --user <non-root> \       # os.Getuid(), not root
+     node:20@sha256:…  sh -c 'npm run preinstall install postinstall --if-present'
+                               # digest-pinned image; runs the package's OWN
+                               # lifecycle scripts (not `npm rebuild`). Real flags
+                               # (seccomp, ro node_modules mount, etc.) in §11a–§11b.
 ```
 
 **Watched, not blindly blocked** — run instrumented so we see *intent*:
@@ -229,8 +236,9 @@ Only packages with an **approved** install script ever enter the box. It is both
  ④ DIFF    → project dir before/after                  "wrote outside build output"
 ```
 
-Mechanism on Linux (the container is Linux): **eBPF / seccomp-log / Falco-style**
-passive syscall, exec, and network tracing.
+Mechanism on Linux (the container is Linux): passive syscall, exec, and network
+tracing. **As shipped this is `strace -f` running inside the container** (see §11b);
+a richer eBPF / Falco-style probe stays future work.
 
 **Behavior → verdict:**
 
