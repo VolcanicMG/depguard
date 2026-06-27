@@ -24,7 +24,7 @@ Protection fires only when *you* act — install, commit, PR.
 
 - [Why](#why) · [How it works](#how-it-works) · [How it's different](#how-its-different) · [Quickstart](#quickstart)
 - [The five layers](#the-five-layers) · [What each layer stops](#what-each-layer-stops)
-- [Command reference](#command-reference) · [Per-repo files](#per-repo-files-commit-them)
+- [Command reference](#command-reference) · [Use from an AI agent (MCP)](#use-it-from-your-ai-agent-mcp) · [Per-repo files](#per-repo-files-commit-them)
 - [Honest limits](#honest-limits) · [What's next](#whats-next) · [Tests](#tests) · [Docs](#docs)
 
 ## Why
@@ -271,6 +271,33 @@ Run `guard status` anytime for an offline, instant read on whether the repo is
 protected — policy, the committed files, hooks, sandbox runtime, and recorded
 approvals/waivers (it flags expired ones). Output is colorized on a terminal and
 respects `NO_COLOR`.
+
+## Use it from your AI agent (MCP)
+
+`guard mcp` runs depguard as an MCP server over stdio, exposing two vetting tools —
+`scan_package` (static-scan a package directory) and `check_dependencies` (full
+lockfile check: OSV advisories + cooldown + integrity). Your AI coding agent vets
+dependencies through the **same engine** as the CLI.
+
+```sh
+# Claude Code
+claude mcp add depguard -- guard mcp
+```
+
+Any MCP client (generic stdio):
+
+```json
+{
+  "mcpServers": {
+    "depguard": { "command": "guard", "args": ["mcp"] }
+  }
+}
+```
+
+Every result is wrapped as **untrusted data**, with a banner telling the agent not to
+follow instructions embedded in a package's files — the one spot a dependency could
+attempt prompt injection. The MCP surface is **vetting-only**; state-changing actions
+(`install`, `init`, `approve`, …) stay on the human-driven CLI.
 
 ## Per-repo files (commit them)
 
