@@ -32,12 +32,20 @@ Protection fires only when *you* act — install, commit, PR.
 
 Modern supply-chain attacks don't exploit your code — they *become* your code:
 
+<div align="center">
+  <img src="depguard-why.svg" alt="Four ways your next npm install becomes your problem, with depguard's answer to each: account takeover (cooldown + OSV), typosquat (name gate), install script (scripts off + boxed/traced), latent malware (guard check re-scans every commit)." width="900">
+</div>
+
+<details><summary><b>Text version</b></summary>
+
 ```
  a maintainer account gets phished ──► a "patch" version ships malware
  you typo one letter ──────────────► lodahs installs a credential stealer
  any dep's postinstall script ─────► arbitrary code runs on YOUR machine, as YOU
  a dep you installed last month ───► flagged malicious next week — who tells you?
 ```
+
+</details>
 
 Audits and scanners react *after* the damage. depguard sits in the install path
 and makes the malicious version something npm **never even sees**.

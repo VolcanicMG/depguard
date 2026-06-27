@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="564" viewBox="0 0 1000 564" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="1000" height="564" rx="20" fill="#0a0f18"/>
+<rect x="1" y="1" width="998" height="562" rx="19" fill="none" stroke="#223145"/>
+<g transform="translate(40,40)">
+<path d="M0,-14 L13,-9 V2 C13,11 7,17 0,20 C-7,17 -13,11 -13,2 V-9 Z" fill="none" stroke="#34c46a" stroke-width="2.2"/>
+<path d="M-5,1 L-1,5 L6,-4" fill="none" stroke="#34c46a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="66" y="46" fill="#e9eef5" font-size="24" font-weight="700">dep<tspan fill="#34c46a">guard</tspan></text>
+<text x="960" y="34" text-anchor="end" fill="#8b9bb0" font-size="12" letter-spacing="3" font-weight="600">WHY</text>
+<text x="960" y="52" text-anchor="end" fill="#8b9bb0" font-size="11.5">four ways your next npm install becomes your problem — and the answer</text>
+<line x1="40" y1="70" x2="960" y2="70" stroke="#223145"/>
+<text x="40" y="94" fill="#e9eef5" font-size="13.5">Modern supply-chain attacks don’t exploit your code — <tspan fill="#e86b6b" font-weight="600">they become your code:</tspan></text>
+<rect x="40" y="108" width="452" height="200" rx="13" fill="#111b29" stroke="#223145"/>
+<circle cx="74" cy="142" r="17" fill="#3a2326" stroke="#e86b6b" stroke-width="1.6"/>
+<text x="74" y="148" text-anchor="middle" fill="#e86b6b" font-size="17" font-weight="700">1</text>
+<text x="106" y="138" fill="#e86b6b" font-size="12.5" font-weight="700" letter-spacing="1.5">ACCOUNT TAKEOVER</text>
+<text x="106" y="154" fill="#8b9bb0" font-size="10.5" letter-spacing="1">THE THREAT</text>
+<text x="64" y="186" fill="#e9eef5" font-size="13">A maintainer account gets phished →</text>
+<text x="64" y="206" fill="#e9eef5" font-size="13">a “patch” version ships malware</text>
+<line x1="64" y1="226" x2="468" y2="226" stroke="#223145"/>
+<circle cx="70" cy="248" r="7" fill="none" stroke="#5aa17e" stroke-width="1.8"/>
+<path d="M66.5,248 l2.4,2.4 l4,-4.6" fill="none" stroke="#5aa17e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="84" y="252" fill="#5aa17e" font-size="10.5" letter-spacing="1" font-weight="600">DEPGUARD ANSWERS</text>
+<text x="64" y="278" fill="#e9eef5" font-size="12.5">cooldown hides brand-new versions;</text>
+<text x="64" y="296" fill="#e9eef5" font-size="12.5">OSV drops the ones already flagged</text>
+<rect x="508" y="108" width="452" height="200" rx="13" fill="#111b29" stroke="#223145"/>
+<circle cx="542" cy="142" r="17" fill="#3a2326" stroke="#e86b6b" stroke-width="1.6"/>
+<text x="542" y="148" text-anchor="middle" fill="#e86b6b" font-size="17" font-weight="700">2</text>
+<text x="574" y="138" fill="#e86b6b" font-size="12.5" font-weight="700" letter-spacing="1.5">TYPOSQUAT</text>
+<text x="574" y="154" fill="#8b9bb0" font-size="10.5" letter-spacing="1">THE THREAT</text>
+<text x="532" y="186" fill="#e9eef5" font-size="13">You typo one letter → lodahs</text>
+<text x="532" y="206" fill="#e9eef5" font-size="13">installs a credential stealer</text>
+<line x1="532" y1="226" x2="936" y2="226" stroke="#223145"/>
+<circle cx="538" cy="248" r="7" fill="none" stroke="#5aa17e" stroke-width="1.8"/>
+<path d="M534.5,248 l2.4,2.4 l4,-4.6" fill="none" stroke="#5aa17e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="552" y="252" fill="#5aa17e" font-size="10.5" letter-spacing="1" font-weight="600">DEPGUARD ANSWERS</text>
+<text x="532" y="278" fill="#e9eef5" font-size="12.5">the name gate blocks look-alikes &amp;</text>
+<text x="532" y="296" fill="#e9eef5" font-size="12.5">homoglyphs — fail closed</text>
+<rect x="40" y="324" width="452" height="200" rx="13" fill="#111b29" stroke="#223145"/>
+<circle cx="74" cy="358" r="17" fill="#3a2326" stroke="#e86b6b" stroke-width="1.6"/>
+<text x="74" y="364" text-anchor="middle" fill="#e86b6b" font-size="17" font-weight="700">3</text>
+<text x="106" y="354" fill="#e86b6b" font-size="12.5" font-weight="700" letter-spacing="1.5">INSTALL SCRIPT</text>
+<text x="106" y="370" fill="#8b9bb0" font-size="10.5" letter-spacing="1">THE THREAT</text>
+<text x="64" y="402" fill="#e9eef5" font-size="13">Any dep's postinstall script runs</text>
+<text x="64" y="422" fill="#e9eef5" font-size="13">code on your machine, as YOU</text>
+<line x1="64" y1="442" x2="468" y2="442" stroke="#223145"/>
+<circle cx="70" cy="464" r="7" fill="none" stroke="#5aa17e" stroke-width="1.8"/>
+<path d="M66.5,464 l2.4,2.4 l4,-4.6" fill="none" stroke="#5aa17e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="84" y="468" fill="#5aa17e" font-size="10.5" letter-spacing="1" font-weight="600">DEPGUARD ANSWERS</text>
+<text x="64" y="494" fill="#e9eef5" font-size="12.5">scripts off by default; the few real</text>
+<text x="64" y="512" fill="#e9eef5" font-size="12.5">ones run boxed + syscall-traced</text>
+<rect x="508" y="324" width="452" height="200" rx="13" fill="#111b29" stroke="#223145"/>
+<circle cx="542" cy="358" r="17" fill="#3a2326" stroke="#e86b6b" stroke-width="1.6"/>
+<text x="542" y="364" text-anchor="middle" fill="#e86b6b" font-size="17" font-weight="700">4</text>
+<text x="574" y="354" fill="#e86b6b" font-size="12.5" font-weight="700" letter-spacing="1.5">LATENT MALWARE</text>
+<text x="574" y="370" fill="#8b9bb0" font-size="10.5" letter-spacing="1">THE THREAT</text>
+<text x="532" y="402" fill="#e9eef5" font-size="13">A dep you trust is flagged malicious</text>
+<text x="532" y="422" fill="#e9eef5" font-size="13">weeks later — who tells you?</text>
+<line x1="532" y1="442" x2="936" y2="442" stroke="#223145"/>
+<circle cx="538" cy="464" r="7" fill="none" stroke="#5aa17e" stroke-width="1.8"/>
+<path d="M534.5,464 l2.4,2.4 l4,-4.6" fill="none" stroke="#5aa17e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="552" y="468" fill="#5aa17e" font-size="10.5" letter-spacing="1" font-weight="600">DEPGUARD ANSWERS</text>
+<text x="532" y="494" fill="#e9eef5" font-size="12.5">guard check re-scans the lockfile</text>
+<text x="532" y="512" fill="#e9eef5" font-size="12.5">on every commit / PR</text>
+</svg>
