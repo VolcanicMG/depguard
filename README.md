@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="depguard.png" alt="depguard — protect against supply-chain attacks" width="440">
+<img src="assets/depguard.png" alt="depguard — protect against supply-chain attacks" width="440">
 
 <br>
 
@@ -32,7 +32,7 @@ Protection fires only when *you* act — install, commit, PR.
 Modern supply-chain attacks don't exploit your code — they *become* your code:
 
 <div align="center">
-  <img src="depguard-why.svg" alt="Four ways your next npm install becomes your problem, with depguard's answer to each: account takeover (cooldown + OSV), typosquat (name gate), install script (scripts off + boxed/traced), latent malware (guard check re-scans every commit)." width="900">
+  <img src="assets/depguard-why.svg" alt="Four ways your next npm install becomes your problem, with depguard's answer to each: account takeover (cooldown + OSV), typosquat (name gate), install script (scripts off + boxed/traced), latent malware (guard check re-scans every commit)." width="900">
 </div>
 
 Audits and scanners react *after* the damage. depguard sits in the install path
@@ -48,7 +48,7 @@ and makes the malicious version something npm **never even sees**.
 A package's full journey — from `guard install` through every layer to a trusted merge:
 
 <div align="center">
-  <img src="depguard-pipeline.svg" alt="depguard how it works: guard install → name gate → cooldown + OSV filter → npm resolves & installs → lifecycle script? → scan + box + strace → commit/PR re-check → installed & trusted. A right-hand column shows what each gate stops." width="860">
+  <img src="assets/depguard-pipeline.svg" alt="depguard how it works: guard install → name gate → cooldown + OSV filter → npm resolves & installs → lifecycle script? → scan + box + strace → commit/PR re-check → installed & trusted. A right-hand column shows what each gate stops." width="860">
 </div>
 
 Each numbered gate is one of depguard's defense layers — see [the five layers](#the-five-layers) and [what each one stops](#what-each-layer-stops) for the deeper dive.
@@ -98,7 +98,7 @@ something you already installed is bad. depguard sits *in the install path* — 
 never resolves the bad version in the first place.
 
 <div align="center">
-  <img src="depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
+  <img src="assets/depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
 </div>
 
 | You might use… | What it does | Where depguard differs |
@@ -148,7 +148,7 @@ The *why* and the per-layer guarantees: **[docs/DESIGN.md](docs/DESIGN.md)** (th
 The same layered defenses — but they don't all fire at once. Here they're grouped by **when** each runs:
 
 <div align="center">
-  <img src="depguard-layers.svg" alt="What each layer stops, grouped by when each fires: at install (name &amp; version), at install (lifecycle scripts), on commit/PR (guard check), and opt-in flag checks." width="900">
+  <img src="assets/depguard-layers.svg" alt="What each layer stops, grouped by when each fires: at install (name &amp; version), at install (lifecycle scripts), on commit/PR (guard check), and opt-in flag checks." width="900">
 </div>
 
 ### At install · name & version safety — *before npm even resolves*
@@ -230,7 +230,7 @@ non-empty `degraded`.
 ## Command reference
 
 <div align="center">
-  <img src="depguard-commands.svg" alt="depguard command reference: setup (init, status), install (install, ci), audit (check, scan, why, sbom), decisions & waivers (approve, ignore, allow, secret-add), config & maintenance (config, prewarm, clean, mcp)" width="900">
+  <img src="assets/depguard-commands.svg" alt="depguard command reference: setup (init, status), install (install, ci), audit (check, scan, why, sbom), decisions & waivers (approve, ignore, allow, secret-add), config & maintenance (config, prewarm, clean, mcp)" width="900">
 </div>
 
 <details><summary><b>Full reference with every flag (copy-paste)</b></summary>

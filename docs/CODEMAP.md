@@ -41,8 +41,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
  │   └── tty/                    "is a human attached?" (termios; /dev/null lies)
- ├── depguard.png                project logo (README header)
- ├── depguard-*.svg              generated README infographics (pipeline/layers/commands/different)
+ ├── assets/                     README images (committed)
+ │   ├── depguard.png            project logo (README header)
+ │   └── depguard-*.svg          generated infographics (why/pipeline/layers/commands/different)
  ├── docs/                       deep docs (linked from README)
  │   ├── CODEMAP.md              this file
  │   ├── DESIGN.md               the agreed design contract
