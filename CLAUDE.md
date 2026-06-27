@@ -15,26 +15,31 @@ nicety.
 
 | File | Audience / role | Owns |
 |---|---|---|
-| `DESIGN.md` | **the contract** — the *why* | goals/non-goals, the layered threat model, each defense layer's guarantee, design stance |
-| `README.md` | end users — the *how to use* | install steps, the command list + flags, per-repo files, the "what each layer stops" table |
-| `SETUP.md` | end users — *onboarding* | step-by-step per-repo setup (binary → `init` → workflow → CI), `.guardrc` tuning, waiving findings, tips/tricks, troubleshooting |
+| `docs/DESIGN.md` | **the contract** — the *why* | goals/non-goals, the layered threat model, each defense layer's guarantee, design stance |
+| `README.md` | end users — the *front door & how-to-use* | install steps, the command list + flags, per-repo files, the "what each layer stops" table, the pitch / "how it's different" (absorbed from the old `PITCH.md`), and the section infographics (`depguard-*.svg`, generated — see below) |
+| `docs/SETUP.md` | end users — *onboarding* | step-by-step per-repo setup (binary → `init` → workflow → CI), building & **cross-compiling**, `.guardrc` tuning, waiving findings, tips/tricks, troubleshooting |
 | `docs/CODEMAP.md` | contributors — the *where* | file/dir layout, what calls what, where to make which kind of change |
-| `PITCH.md` | prospective users — the *sell* | problem framing, product summary, value per layer in plain language |
 | `demo/README.md` | demo runners | demo commands, scenario cast, safety guarantees of the demo |
 | `test/README.md` | test authors | how the black-box suite runs, the mock-registry trick, Go-path override |
+
+> **PITCH.md was folded into the README** (2026-06-27) and deleted — the "sell"
+> now lives in the README's intro, "How it's different" table, and infographics.
+> The four `depguard-*.svg` infographics are **generated** (dark/green brand,
+> `#0a0f18`/`#34c46a`); regenerate the matching SVG rather than hand-editing it,
+> and keep all four visually consistent.
 
 ## When you change X, update Y
 
 | You changed… | Update… |
 |---|---|
 | a CLI command, flag, or its output | `README.md` command list **and** `docs/CODEMAP.md` if dispatch moved |
-| a defense layer's behavior or guarantee | `DESIGN.md` (the layer's promise) **and** `README.md` "what each layer stops" |
+| a defense layer's behavior or guarantee | `docs/DESIGN.md` (the layer's promise) **and** `README.md` "what each layer stops" |
 | added/removed/renamed a file or package | `docs/CODEMAP.md` layout + call graph |
-| a new threat covered or a scope boundary | `DESIGN.md` goals/non-goals **and** `PITCH.md` if it changes the pitch |
+| a new threat covered or a scope boundary | `docs/DESIGN.md` goals/non-goals **and** `README.md` (the pitch / "how it's different") if it changes the pitch |
 | a demo scenario or its safety model | `demo/README.md` |
 | how tests are built/run, or the registry mock | `test/README.md` |
 | MCP tools exposed by `guard mcp` | `README.md` (the `guard mcp` line) **and** `docs/CODEMAP.md` (`mcp.go`) |
-| install/onboarding steps, a setup tip, or a new per-repo file | `SETUP.md` |
+| install/onboarding steps, a setup tip, cross-compiling, or a new per-repo file | `docs/SETUP.md` |
 
 Rule of thumb: `DESIGN.md` answers *why/what-guarantee*, `README.md` answers
 *how-to-use*, `CODEMAP.md` answers *where-in-the-code*. A change usually touches at
