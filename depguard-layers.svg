@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="550" viewBox="0 0 1000 550" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="1000" height="550" rx="20" fill="#0a0f18"/>
+<rect x="1" y="1" width="998" height="548" rx="19" fill="none" stroke="#223145"/>
+<g transform="translate(40,40)">
+<path d="M0,-14 L13,-9 V2 C13,11 7,17 0,20 C-7,17 -13,11 -13,2 V-9 Z" fill="none" stroke="#34c46a" stroke-width="2.2"/>
+<path d="M-5,1 L-1,5 L6,-4" fill="none" stroke="#34c46a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="66" y="46" fill="#e9eef5" font-size="24" font-weight="700">dep<tspan fill="#34c46a">guard</tspan></text>
+<text x="960" y="34" text-anchor="end" fill="#8b9bb0" font-size="12" letter-spacing="3" font-weight="600">WHAT EACH LAYER STOPS</text>
+<text x="960" y="52" text-anchor="end" fill="#8b9bb0" font-size="11.5">defense in depth — grouped by when each layer fires</text>
+<line x1="40" y1="70" x2="960" y2="70" stroke="#223145"/>
+<rect x="40" y="96" width="920" height="110" rx="13" fill="#111b29" stroke="#34c46a" stroke-opacity="0.55"/>
+<rect x="40" y="96" width="6" height="110" rx="3" fill="#34c46a"/>
+<circle cx="84" cy="151.0" r="20" fill="none" stroke="#34c46a" stroke-width="2.4"/>
+<text x="84" y="158.0" text-anchor="middle" fill="#34c46a" font-size="21" font-weight="700">1</text>
+<text x="118" y="148.0" fill="#e9eef5" font-size="14.5" font-weight="700" letter-spacing="0.5">AT INSTALL</text>
+<text x="118" y="166.0" fill="#8b9bb0" font-size="12.5">name &amp; version</text>
+<line x1="254" y1="108" x2="254" y2="194" stroke="#223145"/>
+<circle cx="274" cy="117.0" r="3" fill="#34c46a"/>
+<text x="286" y="121.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Name gate</tspan><tspan fill="#8b9bb0">  —  typosquats &amp; homoglyphs</tspan></text>
+<circle cx="619" cy="117.0" r="3" fill="#34c46a"/>
+<text x="631" y="121.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Dep-confusion</tspan><tspan fill="#8b9bb0">  —  internal vs public registry</tspan></text>
+<circle cx="274" cy="147.0" r="3" fill="#34c46a"/>
+<text x="286" y="151.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Cooldown 14d</tspan><tspan fill="#8b9bb0">  —  day-zero bad versions</tspan></text>
+<circle cx="619" cy="147.0" r="3" fill="#34c46a"/>
+<text x="631" y="151.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">OSV @ resolve</tspan><tspan fill="#8b9bb0">  —  known-bad, before npm sees it</tspan></text>
+<circle cx="274" cy="177.0" r="3" fill="#34c46a"/>
+<text x="286" y="181.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Signature verify</tspan><tspan fill="#8b9bb0">  —  invalid npm ECDSA signatures</tspan></text>
+<circle cx="619" cy="177.0" r="3" fill="#34c46a"/>
+<text x="631" y="181.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Exact pinning</tspan><tspan fill="#8b9bb0">  —  silent ^/~ range drift</tspan></text>
+<rect x="40" y="222" width="920" height="80" rx="13" fill="#111b29" stroke="#2bb27f" stroke-opacity="0.55"/>
+<rect x="40" y="222" width="6" height="80" rx="3" fill="#2bb27f"/>
+<circle cx="84" cy="262.0" r="20" fill="none" stroke="#2bb27f" stroke-width="2.4"/>
+<text x="84" y="269.0" text-anchor="middle" fill="#2bb27f" font-size="21" font-weight="700">2</text>
+<text x="118" y="259.0" fill="#e9eef5" font-size="14.5" font-weight="700" letter-spacing="0.5">AT INSTALL</text>
+<text x="118" y="277.0" fill="#8b9bb0" font-size="12.5">lifecycle scripts</text>
+<line x1="254" y1="234" x2="254" y2="290" stroke="#223145"/>
+<circle cx="274" cy="243.0" r="3" fill="#2bb27f"/>
+<text x="286" y="247.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Ignore-scripts</tspan><tspan fill="#8b9bb0">  —  install-time code exec (#1 vector)</tspan></text>
+<circle cx="619" cy="243.0" r="3" fill="#2bb27f"/>
+<text x="631" y="247.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Static scan</tspan><tspan fill="#8b9bb0">  —  net/exec/secrets/eval + injection</tspan></text>
+<circle cx="274" cy="273.0" r="3" fill="#2bb27f"/>
+<text x="286" y="277.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Box + strace</tspan><tspan fill="#8b9bb0">  —  exfil from approved scripts</tspan></text>
+<rect x="40" y="318" width="920" height="80" rx="13" fill="#111b29" stroke="#38bdf8" stroke-opacity="0.55"/>
+<rect x="40" y="318" width="6" height="80" rx="3" fill="#38bdf8"/>
+<circle cx="84" cy="358.0" r="20" fill="none" stroke="#38bdf8" stroke-width="2.4"/>
+<text x="84" y="365.0" text-anchor="middle" fill="#38bdf8" font-size="21" font-weight="700">3</text>
+<text x="118" y="355.0" fill="#e9eef5" font-size="14.5" font-weight="700" letter-spacing="0.5">ON COMMIT / PR</text>
+<text x="118" y="373.0" fill="#8b9bb0" font-size="12.5">guard check</text>
+<line x1="254" y1="330" x2="254" y2="386" stroke="#223145"/>
+<circle cx="274" cy="339.0" r="3" fill="#38bdf8"/>
+<text x="286" y="343.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">guard check</tspan><tspan fill="#8b9bb0">  —  new advisories + cooldown sweep</tspan></text>
+<circle cx="619" cy="339.0" r="3" fill="#38bdf8"/>
+<text x="631" y="343.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Lockfile integrity</tspan><tspan fill="#8b9bb0">  —  off-registry / no-hash entries</tspan></text>
+<circle cx="274" cy="369.0" r="3" fill="#38bdf8"/>
+<text x="286" y="373.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Secret-file gate</tspan><tspan fill="#8b9bb0">  —  your .env / keys leaving the repo</tspan></text>
+<circle cx="619" cy="369.0" r="3" fill="#38bdf8"/>
+<text x="631" y="373.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">License gate</tspan><tspan fill="#8b9bb0">  —  denied / non-allowed licenses</tspan></text>
+<rect x="40" y="414" width="920" height="78" rx="13" fill="#111b29" stroke="#e3b341" stroke-dasharray="6 4" stroke-opacity="0.55"/>
+<rect x="40" y="414" width="6" height="78" rx="3" fill="#e3b341"/>
+<circle cx="84" cy="453.0" r="20" fill="none" stroke="#e3b341" stroke-width="2.4"/>
+<text x="84" y="460.0" text-anchor="middle" fill="#e3b341" font-size="21" font-weight="700">4</text>
+<text x="118" y="450.0" fill="#e9eef5" font-size="14.5" font-weight="700" letter-spacing="0.5">OPT-IN</text>
+<text x="118" y="468.0" fill="#8b9bb0" font-size="12.5">flag: per package</text>
+<line x1="254" y1="426" x2="254" y2="480" stroke="#223145"/>
+<circle cx="274" cy="449.0" r="3" fill="#e3b341"/>
+<text x="286" y="453.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Build-provenance</tspan><tspan fill="#8b9bb0">  —  tampered Sigstore / SLSA attestation</tspan></text>
+<circle cx="619" cy="449.0" r="3" fill="#e3b341"/>
+<text x="631" y="453.0" font-size="12.5"><tspan fill="#e9eef5" font-weight="700">Maintainer-change</tspan><tspan fill="#8b9bb0">  —  account-takeover fingerprint</tspan></text>
+<text x="40" y="516" fill="#8b9bb0" font-size="12">No single layer certifies a package clean — each raises attacker cost; together they close the gaps the others leave.</text>
+</svg>

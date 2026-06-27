@@ -118,6 +118,10 @@ The *why* and the per-layer guarantees: **[docs/DESIGN.md](docs/DESIGN.md)** (th
 Defense in depth — but the layers don't all fire at once. Each acts at a specific
 moment, grouped here by **when** it runs.
 
+<div align="center">
+  <img src="depguard-layers.svg" alt="What each layer stops, grouped by phase: ① at install (name &amp; version) ② at install (lifecycle scripts) ③ on commit/PR (guard check) ④ opt-in flag checks." width="900">
+</div>
+
 ### ① At install · name & version safety — *before npm even resolves*
 
 `guard install` / `guard ci`, via the ephemeral proxy:
@@ -253,6 +257,10 @@ mechanics: [docs/SETUP.md](docs/SETUP.md).
 Most tools in this space **report** — they tell you, after the fact, that
 something you already installed is bad. depguard sits *in the install path* and
 makes the bad version one npm never resolves in the first place.
+
+<div align="center">
+  <img src="depguard-different.svg" alt="How depguard is different: other tools react and report after install; depguard prevents before npm resolves. Per-tool comparison plus three structural choices — a binary not an npm package, avoid don't recover, no background process or cloud." width="900">
+</div>
 
 | You might use… | What it does | Where depguard differs |
 |---|---|---|
