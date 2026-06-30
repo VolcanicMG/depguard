@@ -138,6 +138,49 @@ func CheckVersions(name string, versions []string) (map[string]string, error) {
 	return out, nil
 }
 
+// BlockingVersions queries OSV for several versions of ONE package, scores each
+// hit's severity, and returns only the versions carrying an advisory that BLOCKS
+// under the given threshold (MAL-*, unscored/unknown, or severity >= threshold),
+// mapped to the first blocking hit's id. It is the resolve-time sibling of
+// CheckVersions: the proxy uses it to drop known-bad versions BEFORE npm
+// resolves, applying the SAME severity tiering as `guard check` (DESIGN.md §12a).
+// Without tiering a single moderate/low advisory with a wide affected range
+// would make every old version uninstallable here, while the check path would
+// only WARN — an inconsistency the threshold model exists to prevent.
+//
+// Cost: one extra GET per DISTINCT id, only when there are hits. Fail-closed per
+// id: a fetch that can't score an id leaves it SevUnknown, which blocks — a flaky
+// detail fetch can only make the filter stricter, never leak a hit through.
+func BlockingVersions(name string, versions []string, threshold Severity) (map[string]string, error) {
+	pkgs := make([]lockfile.Pkg, len(versions))
+	for i, v := range versions {
+		pkgs[i] = lockfile.Pkg{Name: name, Version: v}
+	}
+	vulns, err := Check(pkgs)
+	if err != nil {
+		return nil, err
+	}
+	if len(vulns) == 0 {
+		return map[string]string{}, nil
+	}
+	ids := make([]string, len(vulns))
+	for i, vu := range vulns {
+		ids[i] = vu.ID
+	}
+	sevs := Severities(ids)
+	out := map[string]string{}
+	for _, vu := range vulns {
+		vu.Severity = sevs[vu.ID] // absent => SevUnknown => Blocks() (fail closed)
+		if !vu.Blocks(threshold) {
+			continue
+		}
+		if _, ok := out[vu.Version]; !ok {
+			out[vu.Version] = vu.ID
+		}
+	}
+	return out, nil
+}
+
 // Check queries OSV for every name@version pair and returns the hits.
 // pkgs is the distinct set of installed versions — every version is queried,
 // including multiple versions of the same name (see lockfile.Pkg).
@@ -204,8 +247,9 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 
 // Severities fetches each DISTINCT id's detail record from OSV and returns a
 // map id -> Severity. It is the enrichment step the gating path runs AFTER
-// Check (querybatch carries no severity); the proxy's resolve-time path does
-// NOT call it, keeping version filtering to one round-trip.
+// Check (querybatch carries no severity); both the check path and the proxy's
+// resolve-time filter (via BlockingVersions) call it so the two paths tier by
+// the same severity model.
 //
 // Fail-open per id: a network error or a record with no machine-readable
 // severity leaves that id absent from the map, which the caller reads as

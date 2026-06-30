@@ -229,13 +229,18 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 		}
 	}
 
-	// Known-bad filter — AVOID, not just recover. Drop versions OSV already
-	// flags so npm never resolves to a reported-malicious one. Only meaningful
-	// against the real public registry (a local/mock registry's versions aren't
-	// in OSV's npm namespace), and fail OPEN on lookup errors: an OSV outage
-	// must not break every install (the cooldown layer still stands).
+	// Known-bad filter — AVOID, not just recover. Drop versions OSV flags as
+	// BLOCKING under the configured advisory-threshold so npm never resolves to
+	// a reported-malicious or seriously-vulnerable one. Tiered by the SAME model
+	// as `guard check` (DESIGN.md §12a): MAL-*, unscored, and >= threshold block;
+	// a moderate/low advisory below the threshold does NOT gate here (it would
+	// only warn at check time — gating it would make every affected version
+	// uninstallable). Only meaningful against the real public registry (a
+	// local/mock registry's versions aren't in OSV's npm namespace), and fails
+	// OPEN on lookup errors: an OSV outage must not break every install (the
+	// cooldown layer still stands).
 	if !isLoopbackHost(hostOf(p.cfg.Registry)) && len(survivors) > 0 {
-		if flagged, err := advisory.CheckVersions(name, survivors); err == nil && len(flagged) > 0 {
+		if flagged, err := advisory.BlockingVersions(name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
 			kept := survivors[:0]
 			for _, v := range survivors {
 				if id, bad := flagged[v]; bad {

@@ -447,8 +447,12 @@ agents.
      (publish/registry tampering)   dist.signatures (stdlib crypto, zero-dep).
                                     Proxy BLOCKS present-but-invalid; unsigned
                                     passes (warn-not-block — most aren't signed).
-   → OSV at resolve time            proxy now drops OSV-flagged versions BEFORE
-     (avoid, not just recover)      npm resolves (was post-install only).
+   → OSV at resolve time            proxy drops OSV-flagged versions BEFORE npm
+     (avoid, not just recover)      resolves (was post-install only), tiered by
+                                    advisory-threshold like the check path
+                                    (§12a): only BLOCKING hits are hidden, so a
+                                    moderate/low advisory with a wide range
+                                    doesn't make every old version uninstallable.
    → dependency confusion           internal-scopes: names that must come from a
                                     private registry are blocked from the public
                                     one (proxy, fail closed).
@@ -535,6 +539,14 @@ Three invariants keep this fail-closed:
   through as a "low".
 - **Only blockers flip `CheckResult.OK`.** Warnings live in
   `CheckResult.advisoryWarnings`; they are surfaced but never gate on their own.
+
+The **resolve-time proxy filter** applies the same tiering (`advisory.BlockingVersions`):
+it hides only versions whose advisory blocks at the threshold, so a moderate/low
+advisory with a wide affected range doesn't turn into a wall of "no matching
+version" at install time — those versions install and `guard check` warns on them.
+A version blocked here was genuinely too risky to resolve under the policy (e.g. a
+HIGH advisory); the safe move is to pin a fixed version or, deliberately, lower the
+threshold / waive the specific hit.
 
 **Interactive accept-and-record (`guard check --confirm`).** The git hooks pass
 `--confirm`. When the *only* findings are warn-tier and a controlling terminal

@@ -11,7 +11,41 @@ import (
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
 	"depguard/internal/config"
+	"depguard/internal/registry"
 )
+
+// TestDominantBlockedReportsTrueCause pins the install-summary fix: when a
+// package's versions are hidden for mixed reasons, the summary must surface the
+// DOMINANT one, not an arbitrary first entry. (The nodemailer report blamed a
+// 3-version cooldown when an OSV advisory had hidden 300 — misdiagnosing the
+// cause.)
+func TestDominantBlockedReportsTrueCause(t *testing.T) {
+	bs := []registry.Blocked{
+		{Package: "nodemailer", Version: "9.0.1", Reason: "published 13d ago, cooldown is 14d"},
+		{Package: "nodemailer", Version: "6.10.1", Reason: "OSV advisory GHSA-p6gq-j5cr-w38f"},
+		{Package: "nodemailer", Version: "5.0.0", Reason: "OSV advisory GHSA-rcmh-qjqh-p98v"},
+		{Package: "nodemailer", Version: "4.0.0", Reason: "OSV advisory GHSA-48ww-j4fc-435p"},
+	}
+	got := dominantBlocked(bs)
+	if cat := reasonCategory(got.Reason); cat != "advisory" {
+		t.Fatalf("dominant reason = %q (category %q), want an advisory entry", got.Reason, cat)
+	}
+}
+
+// TestReasonCategoryBuckets covers the category map the summary groups by.
+func TestReasonCategoryBuckets(t *testing.T) {
+	cases := map[string]string{
+		"OSV advisory GHSA-xxxx":             "advisory",
+		"published 2d ago, cooldown is 14d":  "cooldown",
+		"registry signature present but INVALID (possible tampering)": "signature",
+		"no publish timestamp in registry time map":                   "no-timestamp",
+	}
+	for reason, want := range cases {
+		if got := reasonCategory(reason); got != want {
+			t.Errorf("reasonCategory(%q) = %q, want %q", reason, got, want)
+		}
+	}
+}
 
 func npmAvailable() bool { _, err := exec.LookPath("npm"); return err == nil }
 

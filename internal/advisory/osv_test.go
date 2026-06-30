@@ -233,3 +233,66 @@ func TestSeveritiesRespectsCap(t *testing.T) {
 		t.Errorf("scored %d ids, want 2", len(got))
 	}
 }
+
+// TestBlockingVersionsTiersBySeverity is the regression for the proxy
+// over-block bug: the resolve-time OSV filter must drop only versions whose
+// advisory BLOCKS under the threshold (MAL-*, unscored, or >= threshold), NOT
+// every version that merely carries an advisory. A moderate-severity advisory
+// with a wide affected range (e.g. nodemailer GHSA-268h-hp4c-crq3, <8.0.9) must
+// NOT make an aged, otherwise-fine version uninstallable when the threshold is
+// the default HIGH — that hit only WARNS at check time (DESIGN.md §12a).
+func TestBlockingVersionsTiersBySeverity(t *testing.T) {
+	// versions are queried positionally in the slice order below.
+	versions := []string{"1.0.0", "2.0.0", "3.0.0", "4.0.0", "5.0.0"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if strings.HasPrefix(r.URL.Path, "/vulns/") {
+			switch strings.TrimPrefix(r.URL.Path, "/vulns/") {
+			case "GHSA-HIGH":
+				w.Write([]byte(`{"database_specific":{"severity":"HIGH"}}`))
+			case "GHSA-MOD":
+				w.Write([]byte(`{"database_specific":{"severity":"MODERATE"}}`))
+			default: // MAL-* and the unknown id carry no scorable severity
+				w.Write([]byte(`{}`))
+			}
+			return
+		}
+		// querybatch: results[i] answers versions[i].
+		w.Write([]byte(`{"results":[` +
+			`{"vulns":[{"id":"GHSA-HIGH"}]},` + // 1.0.0 high -> block
+			`{"vulns":[{"id":"GHSA-MOD"}]},` + // 2.0.0 moderate -> warn-tier, NOT block
+			`{},` + // 3.0.0 clean -> not flagged
+			`{"vulns":[{"id":"MAL-2024-1"}]},` + // 4.0.0 malicious -> always block
+			`{"vulns":[{"id":"GHSA-UNK"}]}` + // 5.0.0 unscored -> fail closed, block
+			`]}`))
+	}))
+	defer srv.Close()
+	ob, ov := osvBatchURL, osvVulnURL
+	osvBatchURL, osvVulnURL = srv.URL+"/querybatch", srv.URL+"/vulns/"
+	defer func() { osvBatchURL, osvVulnURL = ob, ov }()
+
+	// Default HIGH threshold: moderate does NOT gate; clean is absent.
+	got, err := BlockingVersions("pkg", versions, SevHigh)
+	if err != nil {
+		t.Fatalf("BlockingVersions: %v", err)
+	}
+	for _, v := range []string{"1.0.0", "4.0.0", "5.0.0"} {
+		if _, ok := got[v]; !ok {
+			t.Errorf("threshold HIGH: %s should block, missing from %v", v, got)
+		}
+	}
+	for _, v := range []string{"2.0.0", "3.0.0"} {
+		if _, ok := got[v]; ok {
+			t.Errorf("threshold HIGH: %s must NOT block (moderate/clean), got reason %q", v, got[v])
+		}
+	}
+
+	// Lowering the threshold to MODERATE pulls the moderate hit into blocking.
+	got, err = BlockingVersions("pkg", versions, SevModerate)
+	if err != nil {
+		t.Fatalf("BlockingVersions (moderate): %v", err)
+	}
+	if _, ok := got["2.0.0"]; !ok {
+		t.Errorf("threshold MODERATE: 2.0.0 should now block, got %v", got)
+	}
+}

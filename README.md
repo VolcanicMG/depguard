@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-1.0.0-2ea44f)
+![version](https://img.shields.io/badge/version-1.0.1-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
@@ -120,7 +120,7 @@ asset for your platform from the [latest release](../../releases/latest), drop i
 # 1. Install (Linux x86-64 shown — pick your asset from the release list)
 curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
 chmod +x guard && sudo mv guard /usr/local/bin/
-guard version                       # -> guard 1.0.0
+guard version                       # -> guard 1.0.1
 
 # 2. Protect a repo
 cd your-project
@@ -165,7 +165,7 @@ The same layered defenses — but they don't all fire at once. Here they're grou
 | Typosquat / homoglyph name gate | impostor names: one-edit look-alikes (`lodahs`) and non-ASCII homoglyphs (`reаct`) |
 | Dependency-confusion gate | `internal-scopes` names resolving against the public registry |
 | Cooldown (default 14d) | freshly-published malicious versions (most are yanked within days) |
-| OSV at resolve time | known-bad versions, dropped *before* npm resolves |
+| OSV at resolve time | known-bad versions — those carrying an advisory that **blocks** at `advisory-threshold` (MAL-*, unscored, or ≥ threshold) — dropped *before* npm resolves; moderate/low-only versions are left for `guard check` to warn on, same tiering as the check path |
 | Registry signature verification | a present-but-invalid npm ECDSA signature on a version |
 | Exact version pinning (`.npmrc` `save-exact`) | silent `^`/`~` range drift on a later `npm install` |
 
