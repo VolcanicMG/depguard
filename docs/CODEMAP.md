@@ -33,7 +33,8 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── secrets/secrets.go      secret-file gate: git staged/tracked vs secret-paths globs
  │   ├── license/license.go      license-deny/allow gate on installed deps' SPDX ids
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
- │   │                           Severities = per-vuln detail for tiering; Blocks)
+ │   │                           Severities = per-vuln detail for tiering; Blocks;
+ │   │                           BlockingVersions = severity-tiered resolve-time filter)
  │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers

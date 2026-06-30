@@ -44,7 +44,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -393,9 +393,13 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		for _, n := range names {
 			bs := byPkg[n]
 			// One line per package, not per version — npm fetches metadata
-			// for the whole tree and this list gets long.
+			// for the whole tree and this list gets long. Report the DOMINANT
+			// reason, not an arbitrary first entry: a package's versions are
+			// usually hidden for one reason (a wide advisory range, or "all in
+			// cooldown"), and blaming the wrong one misleads diagnosis.
+			ex := dominantBlocked(bs)
 			fmt.Fprintf(os.Stderr, "  %-30s %d version(s), e.g. %s (%s)\n",
-				n, len(bs), bs[0].Version, bs[0].Reason)
+				n, len(bs), ex.Version, ex.Reason)
 		}
 	}
 	// Deprecated default-resolutions (informational, not a failure).
@@ -452,6 +456,49 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		return advErr
 	}
 	return freshErr
+}
+
+// reasonCategory collapses a proxy block reason to a stable category so the
+// install summary can report WHY most of a package's versions were hidden.
+// The raw reasons vary per version (cooldown days, OSV ids), so we bucket them.
+func reasonCategory(r string) string {
+	switch {
+	case strings.HasPrefix(r, "OSV advisory"):
+		return "advisory"
+	case strings.Contains(r, "cooldown is"):
+		return "cooldown"
+	case strings.Contains(r, "signature"):
+		return "signature"
+	case strings.Contains(r, "no publish timestamp"):
+		return "no-timestamp"
+	default:
+		return r
+	}
+}
+
+// dominantBlocked picks a representative Blocked from a package's filtered
+// versions: the first entry of the largest reason-category. Versions are usually
+// hidden for one dominant reason (a wide advisory range, or "all in cooldown"),
+// so surfacing an arbitrary first entry misreports the cause — e.g. blaming
+// cooldown when an OSV advisory hid most versions. Ties break by category name
+// for deterministic output.
+func dominantBlocked(bs []registry.Blocked) registry.Blocked {
+	counts := map[string]int{}
+	rep := map[string]registry.Blocked{}
+	for _, b := range bs {
+		k := reasonCategory(b.Reason)
+		counts[k]++
+		if _, ok := rep[k]; !ok {
+			rep[k] = b
+		}
+	}
+	top := ""
+	for k := range counts {
+		if top == "" || counts[k] > counts[top] || (counts[k] == counts[top] && k < top) {
+			top = k
+		}
+	}
+	return rep[top]
 }
 
 // handleScripts finds every installed package that wanted to run a lifecycle
