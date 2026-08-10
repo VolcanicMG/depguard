@@ -11,29 +11,36 @@ import (
 	"strings"
 )
 
-// hookScript is the shim written to .git/hooks/. It re-checks the lockfile
-// against advisory feeds on every commit/push — that's how a dep that "goes
-// bad later" gets caught at your next action instead of by a daemon.
+// shimVersion is bumped whenever shimBody changes so a re-run of 'guard init'
+// can UPGRADE an already-installed shim in place instead of leaving a stale copy
+// running. v1 was the pre-marker shim (no version line) — treated as foreign and
+// chained onto, since we can't be sure a marker-less block is exclusively ours.
+const shimVersion = "2"
+
+// shimBegin / shimEnd are CONSTANT (version-independent) sentinels wrapping
+// depguard's managed region so a later init can find and REPLACE it. The version
+// line inside decides idempotent (current) vs upgrade (stale).
+const (
+	shimBegin = "# >>> depguard managed shim >>> (do not edit inside — 'guard init' rewrites this block)"
+	shimEnd   = "# <<< depguard managed shim <<<"
+)
+
+// shimBody re-checks the lockfile against advisory feeds on every commit/push —
+// that's how a dep that "goes bad later" gets caught at your next action instead
+// of by a daemon.
 //
-// GUARD_SKIP=1 bypasses just this check for one commit/push (e.g. an urgent
-// hotfix). Unlike git --no-verify it skips depguard ALONE, leaving any other
-// hooks intact. It lives in the shell shim on purpose: CI runs `guard check`
-// directly, so no env var a contributor sets can weaken the PR gate.
+// GUARD_SKIP=1 bypasses just depguard for one commit/push (e.g. an urgent
+// hotfix). It uses if/elif/else (never a bare `exit 0`) so the SAME body works
+// as a standalone hook OR chained onto another: skipping depguard must not skip
+// a sibling hook. The bypass lives in the shim, not the binary, so it can't
+// weaken the CI gate, which calls `guard check` directly.
 //
 // A MISSING guard binary stays fail-open (exit 0 — a teammate without guard
 // installed must still be able to commit) but is LOUD on stderr. Silence there
 // was the bug: the repo looked protected while every commit sailed unchecked.
-const hookScript = `#!/bin/sh
-# depguard shim — installed by 'guard init'. Calls the global guard binary.
-# Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push
-# (Unlike git --no-verify, this skips depguard alone — your other hooks still run.
-# The bypass lives here in the local hook, NOT in the binary, so it can never
-# weaken the CI gate, which calls 'guard check' directly.)
-if [ -n "$GUARD_SKIP" ]; then
+const shimBody = `if [ -n "$GUARD_SKIP" ]; then
   echo "depguard: check skipped (GUARD_SKIP set)." >&2
-  exit 0
-fi
-if command -v guard >/dev/null 2>&1; then
+elif command -v guard >/dev/null 2>&1; then
   guard check --quiet --confirm || {
     echo "depguard: advisory check failed (or warnings not accepted). Run 'guard check' for details." >&2
     echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
@@ -42,8 +49,21 @@ if command -v guard >/dev/null 2>&1; then
 else
   echo "depguard: !! guard binary not found on PATH — depguard check SKIPPED !!" >&2
   echo "depguard: this repo is NOT protected right now. Install guard, or remove the .git/hooks shims." >&2
-fi
-`
+fi`
+
+// managedBlock is the sentinel-wrapped, versioned region installHook writes and
+// upgrades. Both a fresh hook and a chained one carry it, so status + upgrade
+// detection is uniform.
+const managedBlock = shimBegin + "\n" +
+	"# depguard-shim-version: " + shimVersion + "\n" +
+	"# Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push\n" +
+	shimBody + "\n" +
+	shimEnd + "\n"
+
+// hookScript is the full shim for a FRESH .git/hooks file: shebang + managed block.
+const hookScript = "#!/bin/sh\n" +
+	"# depguard shim — installed by 'guard init'. Calls the global guard binary.\n" +
+	managedBlock
 
 // ciWorkflow is the optional PR gate: same check, blocks merge if a dep in
 // the lockfile is now flagged. Runs only on pull_request — no schedules,
@@ -77,39 +97,68 @@ jobs:
       - run: guard check
 `
 
-// hookAppend is chained onto an EXISTING hook (husky, lefthook, a hand-rolled
-// one) instead of clobbering it — no shebang, because the file already has one.
-const hookAppend = `
-# depguard — appended by 'guard init' (chained onto your existing hook).
-# Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push
-if [ -n "$GUARD_SKIP" ]; then
-  echo "depguard: check skipped (GUARD_SKIP set)." >&2
-elif command -v guard >/dev/null 2>&1; then
-  guard check --quiet --confirm || { echo "depguard: advisory check failed or warnings not accepted (bypass once with GUARD_SKIP=1)" >&2; exit 1; }
-else
-  echo "depguard: !! guard binary not found on PATH — depguard check SKIPPED !!" >&2
-  echo "depguard: this repo is NOT protected right now. Install guard, or remove the .git/hooks shims." >&2
-fi
-`
+// hookAppend is the managed block chained onto an EXISTING hook (husky,
+// lefthook, a hand-rolled one) — a leading newline separates it from the file's
+// existing content; no shebang, because the file already has one.
+const hookAppend = "\n" + managedBlock
 
-// installHook writes the guard shim for hook phase h, or APPENDS to an existing
-// hook rather than skipping it. Hook managers (husky &c.) own the file, so we
-// chain onto them — the old behavior silently left those repos unprotected.
-// Returns the path written/updated, or "" if it was already chained.
+// shimSpan returns the [begin,end) byte range of depguard's managed block in s,
+// or (-1,-1) if absent. end is just past the shimEnd sentinel line (incl. its
+// trailing newline), so a replacement slots in without duplicating a blank line.
+func shimSpan(s string) (begin, end int) {
+	b := strings.Index(s, shimBegin)
+	if b < 0 {
+		return -1, -1
+	}
+	e := strings.Index(s[b:], shimEnd)
+	if e < 0 {
+		return -1, -1
+	}
+	end = b + e + len(shimEnd)
+	if end < len(s) && s[end] == '\n' {
+		end++
+	}
+	return b, end
+}
+
+// hasCurrentShim reports whether s carries the CURRENT managed depguard block
+// (sentinels + current version line). Shared by installHook's idempotency check
+// and 'guard status' so both agree on what "up to date" means (F3/F4).
+func hasCurrentShim(s string) bool {
+	b, e := shimSpan(s)
+	if b < 0 {
+		return false
+	}
+	return strings.Contains(s[b:e], "# depguard-shim-version: "+shimVersion)
+}
+
+// installHook writes the guard shim for hook phase h. It (a) UPGRADES our own
+// managed block in place when it's stale, (b) CHAINS onto a foreign/pre-marker
+// hook rather than clobbering it, or (c) writes a fresh standalone shim. Keying
+// off our version marker — not merely "guard check" appears — is what lets a
+// re-run of 'guard init' actually refresh an outdated shim. Returns the path
+// written/updated, or "" if our block was already current.
 func installHook(hookDir, h string) (string, error) {
 	path := filepath.Join(hookDir, h)
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	if os.IsNotExist(err) {
+	// (c) Fresh (or empty) hook: write the standalone shim.
+	if os.IsNotExist(err) || len(existing) == 0 {
 		return path, os.WriteFile(path, []byte(hookScript), 0o755)
 	}
-	if strings.Contains(string(existing), "guard check") {
-		return "", nil // already chained — don't double-append
-	}
 	content := string(existing)
-	if content != "" && !strings.HasSuffix(content, "\n") {
+	// (a) We already manage a block here → idempotent if current, else upgrade.
+	if b, e := shimSpan(content); b >= 0 {
+		if hasCurrentShim(content) {
+			return "", nil // up to date — don't rewrite
+		}
+		updated := content[:b] + managedBlock + content[e:]
+		return path, os.WriteFile(path, []byte(updated), 0o755)
+	}
+	// (b) A foreign/pre-marker hook → chain our block on, never clobber it.
+	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 	content += hookAppend
@@ -215,18 +264,24 @@ func Install(dir string, ci bool) ([]string, error) {
 // raw material for `guard status`. Detection is by content marker (not mere
 // existence), so a hand-removed or husky-chained hook is reported accurately.
 type InstalledState struct {
-	PreCommit  bool // .git/hooks/pre-commit calls guard
-	PrePush    bool // .git/hooks/pre-push calls guard
-	Npmrc      bool // .npmrc pins ignore-scripts=true
-	CIWorkflow bool // .github/workflows/depguard.yml present
-	Husky      bool // a .husky dir exists (hooks chain there instead of .git/hooks)
+	PreCommit        bool // .git/hooks/pre-commit calls guard
+	PrePush          bool // .git/hooks/pre-push calls guard
+	PreCommitCurrent bool // ...and carries depguard's CURRENT managed shim marker
+	PrePushCurrent   bool // ...and carries depguard's CURRENT managed shim marker
+	Npmrc            bool // .npmrc pins ignore-scripts=true
+	CIWorkflow       bool // .github/workflows/depguard.yml present
+	Husky            bool // a .husky dir exists (hooks chain there instead of .git/hooks)
 }
 
 // Installed inspects dir for the artifacts `guard init` drops.
 func Installed(dir string) InstalledState {
 	var s InstalledState
-	s.PreCommit = hookCallsGuard(filepath.Join(dir, ".git", "hooks", "pre-commit"))
-	s.PrePush = hookCallsGuard(filepath.Join(dir, ".git", "hooks", "pre-push"))
+	pc := filepath.Join(dir, ".git", "hooks", "pre-commit")
+	pp := filepath.Join(dir, ".git", "hooks", "pre-push")
+	s.PreCommit = hookCallsGuard(pc)
+	s.PrePush = hookCallsGuard(pp)
+	s.PreCommitCurrent = hookIsCurrent(pc)
+	s.PrePushCurrent = hookIsCurrent(pp)
 	if b, err := os.ReadFile(filepath.Join(dir, ".npmrc")); err == nil {
 		s.Npmrc = strings.Contains(string(b), "ignore-scripts=true")
 	}
@@ -243,4 +298,11 @@ func Installed(dir string) InstalledState {
 func hookCallsGuard(path string) bool {
 	b, err := os.ReadFile(path)
 	return err == nil && strings.Contains(string(b), "guard check")
+}
+
+// hookIsCurrent reports whether the hook file at path carries depguard's CURRENT
+// managed shim marker — the F4 test for "real protection" vs a stale/foreign hook.
+func hookIsCurrent(path string) bool {
+	b, err := os.ReadFile(path)
+	return err == nil && hasCurrentShim(string(b))
 }

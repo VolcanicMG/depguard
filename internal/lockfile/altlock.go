@@ -73,16 +73,32 @@ func parsePnpm(raw []byte) []Pkg {
 
 // pnpmField pulls `key: value` out of a resolution line, stopping at the next
 // ',' or '}' so a combined {integrity: ..., tarball: ...} block splits cleanly.
+// The key must sit at a real field boundary — start-of-content, whitespace,
+// '{' or ',' — so a crafted sibling like `notarball:` or `fakeintegrity:` can't
+// be read as `tarball:`/`integrity:` and spoof a security value.
 func pnpmField(ln, key string) (string, bool) {
-	i := strings.Index(ln, key+":")
-	if i < 0 {
-		return "", false
+	needle := key + ":"
+	for from := 0; ; {
+		rel := strings.Index(ln[from:], needle)
+		if rel < 0 {
+			return "", false
+		}
+		i := from + rel
+		if i == 0 || isPnpmFieldBoundary(ln[i-1]) {
+			val := ln[i+len(needle):]
+			if j := strings.IndexAny(val, ",}"); j >= 0 {
+				val = val[:j]
+			}
+			return strings.Trim(val, " '\""), true
+		}
+		from = i + 1
 	}
-	val := ln[i+len(key)+1:]
-	if j := strings.IndexAny(val, ",}"); j >= 0 {
-		val = val[:j]
-	}
-	return strings.Trim(val, " '\""), true
+}
+
+// isPnpmFieldBoundary reports whether b can precede a field key on a resolution
+// line (so the key isn't just a suffix of a longer, attacker-chosen field name).
+func isPnpmFieldBoundary(b byte) bool {
+	return b == ' ' || b == '\t' || b == '{' || b == ','
 }
 
 // splitPnpmKey turns a pnpm package key into (name, version). Strips a leading
@@ -126,14 +142,18 @@ func parseYarn(raw []byte) []Pkg {
 		if curIdx < 0 {
 			continue
 		}
+		// The field name is the first whitespace-delimited token, compared
+		// EXACTLY — a HasPrefix check would let `integrity-x: …` masquerade as
+		// `integrity`, overwriting a real security value with a crafted one.
 		t := strings.TrimSpace(ln)
-		switch {
-		case strings.HasPrefix(t, "version"):
-			out[curIdx].Version = strings.Trim(strings.TrimSpace(t[len("version"):]), "\"")
-		case strings.HasPrefix(t, "resolved"):
-			out[curIdx].Resolved = strings.Trim(strings.TrimSpace(t[len("resolved"):]), "\"")
-		case strings.HasPrefix(t, "integrity"):
-			out[curIdx].Integrity = strings.TrimSpace(t[len("integrity"):])
+		field, val, _ := strings.Cut(t, " ")
+		switch field {
+		case "version":
+			out[curIdx].Version = strings.Trim(strings.TrimSpace(val), "\"")
+		case "resolved":
+			out[curIdx].Resolved = strings.Trim(strings.TrimSpace(val), "\"")
+		case "integrity":
+			out[curIdx].Integrity = strings.TrimSpace(val)
 		}
 	}
 	return out

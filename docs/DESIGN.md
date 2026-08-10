@@ -323,7 +323,7 @@ Example `.guardrc`:
 
 ```yaml
 cooldown: 14d
-allow: ["@yourco/*"]      # internal scopes bypass cooldown
+allow: ["@yourco/*"]      # bypass cooldown + typosquat ONLY (not OSV/signature/internal)
 ignore-scripts: true       # default; the few approved ones live in .guard-approvals
 no-container-fallback: warn-approve  # warn + prompt; or: fail (always skip)
 flag: [new-network, new-fs, new-deps]
@@ -403,6 +403,12 @@ the one you typed — it's a transitive dep or a look-alike):
    → wired into proxy rewrite() BEFORE version filtering: a suspect name has
      ALL versions emptied → npm "no matching version", fail closed; reason
      rides the install summary; `allow:` in .guardrc is the escape hatch.
+   → `allow:` SCOPE (proxy rewrite): an allowlisted name skips the cooldown loop
+     and the typosquat gate ONLY — its whole purpose ("I want this exact name,
+     it may be fresh"). It still falls THROUGH to the OSV blocking-version filter
+     and the registry-signature filter, and internal-scopes still outranks it: a
+     known-bad or tampered version of an allowed name is still dropped. allow is
+     NOT a blanket "trust everything about this package".
 
  LLM / AGENT-REVIEWER INJECTION (new vector for the MCP future):
    → scanner now sweeps README/markdown/txt/package.json AND code for:
@@ -638,6 +644,11 @@ Five capabilities added in one pass:
      accusation. Fails open like the layer's other degradations.
      Reports the attested source repo + builder.
      Only present-but-INVALID gates (tamper); absent/verified are informational.
+     NONE vs DEGRADED: a clean 404 / empty attestations list = NONE ("nothing
+     published"). A fetch failure, a non-404 HTTP status, or an unparseable
+     response = DEGRADED — "verification couldn't complete", surfaced (in the
+     check summary + --json Result.Reason) but NEVER gating. Splitting the two
+     stops a transient or hostile failure from masquerading as "no attestation".
      LIMITS (documented, like §6 provenance candor): no Rekor inclusion / SCT /
      TUF root rotation yet — a high bar, not the full Sigstore guarantee.
 

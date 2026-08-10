@@ -51,14 +51,21 @@ import (
 type Status string
 
 const (
-	// StatusNone: no attestation published for this version (common — most
-	// packages aren't built with provenance yet). Not a failure.
+	// StatusNone: no attestation published for this version — a CLEAN 404 or an
+	// empty attestations list (common — most packages aren't built with
+	// provenance yet). Not a failure.
 	StatusNone Status = "none"
 	// StatusVerified: signature + cert chain + digest binding all checked out.
 	StatusVerified Status = "verified"
 	// StatusInvalid: an attestation exists but failed verification — a tamper
 	// signal the caller should treat as gating.
 	StatusInvalid Status = "invalid"
+	// StatusDegraded: verification could not COMPLETE — a network error, a
+	// non-404 HTTP status, or an unparseable response. Distinct from None (which
+	// is a clean "nothing published") so a transient or hostile failure to fetch
+	// isn't silently read as "no attestation". Fails OPEN: never gates, but is
+	// surfaced so the human knows a check didn't run.
+	StatusDegraded Status = "degraded"
 )
 
 // Result is the provenance outcome for one installed package.
@@ -68,7 +75,7 @@ type Result struct {
 	Status  Status `json:"status"`
 	Source  string `json:"source,omitempty"`  // attested source repo, when verified
 	Builder string `json:"builder,omitempty"` // attesting CI identity (cert SAN), when verified
-	Reason  string `json:"reason,omitempty"`  // why it's invalid, when StatusInvalid
+	Reason  string `json:"reason,omitempty"`  // why it's invalid/degraded, when StatusInvalid/StatusDegraded
 }
 
 // pinnedRoots is the production Sigstore Fulcio root + intermediate, embedded so
@@ -193,9 +200,10 @@ type inTotoStatement struct {
 
 // Check fetches and verifies provenance for each package whose Integrity is
 // known (the tarball hash we bind to). allowed packages are skipped (your own
-// scopes). Network/parse failures fail OPEN per package (StatusNone with no
-// error) so a registry blip never blocks a commit — the caller distinguishes
-// StatusInvalid (a real tamper signal) from StatusNone. progress, if non-nil,
+// scopes). Network/parse failures fail OPEN per package (StatusDegraded, never
+// gating) so a registry blip never blocks a commit — but the caller can tell a
+// failed fetch (Degraded) from a clean "nothing published" (None) and from a
+// real tamper signal (StatusInvalid). progress, if non-nil,
 // is called once per package (incl. skips) with (done, total) for liveness on
 // a large tree — one registry fetch per package makes this the slow check.
 func Check(client *http.Client, registry string, pkgs []Pkg, allowed func(string) bool, progress func(done, total int)) []Result {
@@ -229,18 +237,21 @@ func verifyOne(client *http.Client, reg string, p Pkg) Result {
 	url := reg + "/-/npm/v1/attestations/" + p.Name + "@" + p.Version
 	resp, err := client.Get(url)
 	if err != nil {
-		return r // network failure → fail open (None)
+		return degraded(r, "attestation fetch failed: "+err.Error()) // transient/hostile, not "none"
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return r // no attestation published
+		return r // clean 404 → no attestation published
 	}
 	if resp.StatusCode != http.StatusOK {
-		return r
+		return degraded(r, fmt.Sprintf("attestations endpoint returned HTTP %d", resp.StatusCode))
 	}
 	var doc attResponse
-	if json.NewDecoder(io.LimitReader(resp.Body, maxAttestationBytes)).Decode(&doc) != nil || len(doc.Attestations) == 0 {
-		return r
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAttestationBytes)).Decode(&doc); err != nil {
+		return degraded(r, "attestation response unparseable: "+err.Error())
+	}
+	if len(doc.Attestations) == 0 {
+		return r // 200 with an empty list → genuinely none published
 	}
 
 	// Prefer the SLSA provenance attestation; fall back to the first one.
@@ -370,6 +381,13 @@ var maxAttestationBytes int64 = 8 << 20 // 8 MiB
 
 func invalid(r Result, reason string) Result {
 	r.Status, r.Reason = StatusInvalid, reason
+	return r
+}
+
+// degraded marks a result as "verification couldn't complete" — fail-open, never
+// gates, but distinct from a clean None so the failure stays visible.
+func degraded(r Result, reason string) Result {
+	r.Status, r.Reason = StatusDegraded, reason
 	return r
 }
 

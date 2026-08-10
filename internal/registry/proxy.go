@@ -36,6 +36,10 @@ import (
 // it cheaply.
 var maxPackumentBytes int64 = 128 << 20 // 128 MiB
 
+// osvBlockingVersions is the OSV advisory lookup, a var so a test can drive the
+// resolve-time known-bad filter without the network.
+var osvBlockingVersions = advisory.BlockingVersions
+
 // Blocked records one version the proxy hid from the package manager,
 // so the install summary can tell the human what was filtered and why.
 type Blocked struct {
@@ -64,6 +68,9 @@ type Proxy struct {
 // installs; the cooldown/OSV layers still stand.
 func (p *Proxy) keys() *provenance.Keyring {
 	p.keyringOnce.Do(func() {
+		if p.keyring != nil {
+			return // pre-injected (tests) — don't fetch
+		}
 		kr, err := provenance.FetchKeyring(p.client, p.cfg.Registry)
 		if err == nil {
 			p.keyring = kr
@@ -206,44 +213,58 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 		return json.Marshal(doc)
 	}
 
-	// Allowlisted packages (your own scopes) bypass every REMAINING filter —
-	// including the typosquat gate below, which is the escape hatch for a
-	// legitimate name that happens to look like a popular one.
-	if p.cfg.Allowed(name) {
-		return raw, nil
-	}
+	// `allow:` is a NARROW escape hatch: "I intentionally want this name, and I
+	// accept it may be fresh." It skips ONLY the cooldown loop and the typosquat
+	// gate — its documented purpose. It does NOT bypass the OSV advisory filter
+	// or the registry-signature tamper check below: an allowlisted name with a
+	// known-malicious or tampered version must still have THAT version dropped
+	// (DESIGN §5). internal stays above — allow can't unlock a confusion block.
+	allowed := p.cfg.Allowed(name)
 
 	// Name-level gate, BEFORE version filtering: if the package NAME itself is
 	// an impostor (typosquat or homoglyph of a popular package), no version of
 	// it is safe to install. Empty the versions + dist-tags so npm resolves to
 	// "no matching version" and fails closed; the reason rides the install
 	// summary so the human can `allow:` it in .guardrc if it was intentional.
-	if reason, bad := typosquat.Suspicion(name); bad {
-		p.block(name, "*", reason)
-		doc["versions"] = map[string]any{}
-		doc["dist-tags"] = map[string]any{}
-		return json.Marshal(doc)
-	}
-
-	cutoff := time.Now().Add(-p.cfg.Cooldown)
-	var survivors []string
-	for v := range versions {
-		published, ok := parseTime(times, v)
-		switch {
-		case !ok:
-			// No publish timestamp — can't prove age, so fail closed.
-			p.block(name, v, "no publish timestamp in registry time map")
-			delete(versions, v)
-		case published.After(cutoff):
-			p.block(name, v, fmt.Sprintf("published %s ago, cooldown is %s",
-				humanDays(time.Since(published)), humanDays(p.cfg.Cooldown)))
-			delete(versions, v)
-		default:
-			survivors = append(survivors, v)
+	// SKIPPED for allowed names — `allow:` is exactly that intentional escape.
+	if !allowed {
+		if reason, bad := typosquat.Suspicion(name); bad {
+			p.block(name, "*", reason)
+			doc["versions"] = map[string]any{}
+			doc["dist-tags"] = map[string]any{}
+			return json.Marshal(doc)
 		}
 	}
 
-	// Known-bad filter — AVOID, not just recover. Drop versions OSV flags as
+	// Cooldown: drop versions too young to trust (or with no provable age).
+	// SKIPPED for allowed names (fresh-on-purpose) — they still fall through to
+	// the OSV + signature filters below.
+	var survivors []string
+	if allowed {
+		for v := range versions {
+			survivors = append(survivors, v)
+		}
+	} else {
+		cutoff := time.Now().Add(-p.cfg.Cooldown)
+		for v := range versions {
+			published, ok := parseTime(times, v)
+			switch {
+			case !ok:
+				// No publish timestamp — can't prove age, so fail closed.
+				p.block(name, v, "no publish timestamp in registry time map")
+				delete(versions, v)
+			case published.After(cutoff):
+				p.block(name, v, fmt.Sprintf("published %s ago, cooldown is %s",
+					humanDays(time.Since(published)), humanDays(p.cfg.Cooldown)))
+				delete(versions, v)
+			default:
+				survivors = append(survivors, v)
+			}
+		}
+	}
+
+	// Known-bad filter — AVOID, not just recover. Runs for ALL names (allowed
+	// included: allow skips cooldown/typosquat, never OSV). Drop versions OSV flags as
 	// BLOCKING under the configured advisory-threshold so npm never resolves to
 	// a reported-malicious or seriously-vulnerable one. Tiered by the SAME model
 	// as `guard check` (DESIGN.md §12a): MAL-*, unscored, and >= threshold block;
@@ -254,7 +275,7 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 	// OPEN on lookup errors: an OSV outage must not break every install (the
 	// cooldown layer still stands).
 	if !isLoopbackHost(hostOf(p.cfg.Registry)) && len(survivors) > 0 {
-		if flagged, err := advisory.BlockingVersions(name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
+		if flagged, err := osvBlockingVersions(name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
 			kept := survivors[:0]
 			for _, v := range survivors {
 				if id, bad := flagged[v]; bad {
@@ -268,8 +289,9 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 		}
 	}
 
-	// Registry signature filter — block a version whose signature is PRESENT
-	// but INVALID (a registry/account-compromise tamper signal that the
+	// Registry signature filter — runs for ALL names (allowed included). Block a
+	// version whose signature is PRESENT but INVALID (a registry/account-
+	// compromise tamper signal that the
 	// integrity hash can't catch). Unsigned versions pass (most of the
 	// ecosystem still is); per-version "unsigned" noise would just train users
 	// to ignore the tool. Public-registry only; fail open if keys won't load.

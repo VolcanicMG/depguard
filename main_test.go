@@ -12,6 +12,7 @@ import (
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
 	"depguard/internal/config"
+	"depguard/internal/hooks"
 	"depguard/internal/lockfile"
 	"depguard/internal/registry"
 	"depguard/internal/waivers"
@@ -38,8 +39,8 @@ func TestDominantBlockedReportsTrueCause(t *testing.T) {
 // TestReasonCategoryBuckets covers the category map the summary groups by.
 func TestReasonCategoryBuckets(t *testing.T) {
 	cases := map[string]string{
-		"OSV advisory GHSA-xxxx":             "advisory",
-		"published 2d ago, cooldown is 14d":  "cooldown",
+		"OSV advisory GHSA-xxxx":                                      "advisory",
+		"published 2d ago, cooldown is 14d":                           "cooldown",
 		"registry signature present but INVALID (possible tampering)": "signature",
 		"no publish timestamp in registry time map":                   "no-timestamp",
 	}
@@ -238,5 +239,37 @@ func TestCheckLockfileIntegrityIgnoresLinkDeps(t *testing.T) {
 	}
 	if err := checkLockfileIntegrity(dir, config.Config{Registry: "https://registry.npmjs.org"}, wf, true); err != nil {
 		t.Errorf("link/file deps must not gate: %v", err)
+	}
+}
+
+// protectionVerdict is the F4 decision core: 'guard status' may only claim
+// "protected" when policy loads, a hook carries the CURRENT managed shim, AND
+// guard is on PATH — a stale/foreign hook or a missing binary is degraded, with
+// a specific reason.
+func TestProtectionVerdict(t *testing.T) {
+	current := hooks.InstalledState{PreCommit: true, PreCommitCurrent: true}
+	stale := hooks.InstalledState{PreCommit: true} // present, no current marker
+	cases := []struct {
+		name        string
+		st          hooks.InstalledState
+		guardOnPath bool
+		policyOK    bool
+		wantOK      bool
+		wantSubstr  string
+	}{
+		{"current marker + guard present", current, true, true, true, "protected"},
+		{"no hook at all", hooks.InstalledState{}, true, true, false, "run 'guard init'"},
+		{"stale/foreign hook", stale, true, true, false, "not depguard's current shim"},
+		{"guard missing", current, false, true, false, "not on PATH"},
+		{"invalid policy", current, true, false, false, "policy invalid"},
+	}
+	for _, c := range cases {
+		ok, msg := protectionVerdict(c.st, c.guardOnPath, c.policyOK)
+		if ok != c.wantOK {
+			t.Errorf("%s: protected = %v, want %v (%q)", c.name, ok, c.wantOK, msg)
+		}
+		if !strings.Contains(msg, c.wantSubstr) {
+			t.Errorf("%s: message %q lacks %q", c.name, msg, c.wantSubstr)
+		}
 	}
 }

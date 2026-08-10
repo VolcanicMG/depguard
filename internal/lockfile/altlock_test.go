@@ -78,6 +78,44 @@ func TestParsePnpmSplitsCombinedResolution(t *testing.T) {
 	}
 }
 
+// A crafted sibling field must NOT be read as a security value: `notarball:`
+// ends in "tarball:" and `fakeintegrity:` ends in "integrity:", but neither
+// sits at a field boundary, so a poisoned lockfile can't spoof Resolved/Integrity.
+func TestParsePnpmRejectsUnanchoredFields(t *testing.T) {
+	raw := []byte("packages:\n  /x@1.0.0:\n    resolution: {notarball: https://evil.example/x.tgz, fakeintegrity: sha512-evil}\n")
+	got := parsePnpm(raw)
+	if len(got) != 1 {
+		t.Fatalf("parsed %d, want 1", len(got))
+	}
+	if got[0].Resolved != "" {
+		t.Errorf("notarball spoofed Resolved = %q, want empty", got[0].Resolved)
+	}
+	if got[0].Integrity != "" {
+		t.Errorf("fakeintegrity spoofed Integrity = %q, want empty", got[0].Integrity)
+	}
+	// The real fields at a boundary must still parse.
+	real := []byte("packages:\n  /y@2.0.0:\n    resolution: {integrity: sha512-real, tarball: https://r.example/y.tgz}\n")
+	g2 := parsePnpm(real)
+	if g2[0].Integrity != "sha512-real" || g2[0].Resolved != "https://r.example/y.tgz" {
+		t.Errorf("real fields at a boundary failed to parse: %+v", g2[0])
+	}
+}
+
+// A crafted yarn field name (`integrity-ish: …`) must not overwrite integrity,
+// while a real `integrity "…"` line still does.
+func TestParseYarnRejectsUnanchoredFields(t *testing.T) {
+	// Real integrity FIRST, crafted sibling LAST: with the old HasPrefix match,
+	// last-write-wins would let integrity-ish clobber the real value.
+	raw := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  integrity sha512-real\n  integrity-ish sha512-evil\n")
+	got := parseYarn(raw)
+	if len(got) != 1 {
+		t.Fatalf("parsed %d, want 1", len(got))
+	}
+	if got[0].Integrity != "sha512-real" {
+		t.Errorf("integrity = %q, want %q (integrity-ish must not overwrite)", got[0].Integrity, "sha512-real")
+	}
+}
+
 // npm's own parser must NOT set FromRegistry: an npm lockfile records the
 // tarball URL for real registry deps, and file:/link: entries legitimately have
 // neither a URL nor a hash.
