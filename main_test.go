@@ -5,13 +5,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
 	"depguard/internal/config"
+	"depguard/internal/lockfile"
 	"depguard/internal/registry"
+	"depguard/internal/waivers"
 )
 
 // TestDominantBlockedReportsTrueCause pins the install-summary fix: when a
@@ -155,5 +158,85 @@ func TestPartitionBySeverity(t *testing.T) {
 	}
 	if len(warns) != 2 {
 		t.Errorf("warnings = %d, want 2 (moderate, low)", len(warns))
+	}
+}
+
+// TestCheckableDep pins which lockfile shapes the integrity gates apply to.
+// The bug: pnpm records no tarball URL, so gating on Resolved alone skipped
+// every pnpm entry — while npm file:/link: deps must STILL be exempt.
+func TestCheckableDep(t *testing.T) {
+	cases := []struct {
+		name string
+		p    lockfile.Pkg
+		want bool
+	}{
+		{"npm registry tarball", lockfile.Pkg{Resolved: "https://registry.npmjs.org/a/-/a-1.tgz"}, true},
+		{"npm link dep", lockfile.Pkg{Resolved: "../local"}, false},
+		{"npm file dep", lockfile.Pkg{Resolved: "file:../local"}, false},
+		{"git dep", lockfile.Pkg{Resolved: "git+ssh://git@github.com/a/b.git#deadbeef"}, false},
+		{"npm entry with no resolved", lockfile.Pkg{}, false},
+		{"pnpm registry entry (no URL)", lockfile.Pkg{FromRegistry: true}, true},
+		{"pnpm entry with foreign tarball", lockfile.Pkg{FromRegistry: true, Resolved: "https://evil.example/x.tgz"}, true},
+	}
+	for _, c := range cases {
+		if got := checkableDep(c.p); got != c.want {
+			t.Errorf("%s: checkableDep = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// End-to-end over the real check loop: a pnpm lockfile with a missing hash and
+// a foreign tarball must both gate; the same run must not invent findings for
+// a well-formed entry.
+func TestCheckLockfileIntegrityCoversPnpm(t *testing.T) {
+	dir := t.TempDir()
+	lock := `lockfileVersion: '6.0'
+
+packages:
+
+  /good@1.0.0:
+    resolution: {integrity: sha512-good}
+
+  /nohash@1.0.0:
+    resolution: {}
+
+  /foreign@1.0.0:
+    resolution: {integrity: sha512-x, tarball: https://evil.example/foreign.tgz}
+`
+	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Registry: "https://registry.npmjs.org"}
+	err = checkLockfileIntegrity(dir, cfg, wf, true)
+	if err == nil {
+		t.Fatal("expected an integrity failure for the unhashed + off-registry pnpm entries")
+	}
+	if !strings.Contains(err.Error(), "1 off-registry") || !strings.Contains(err.Error(), "1 unhashed") {
+		t.Errorf("error = %q, want exactly 1 off-registry and 1 unhashed", err)
+	}
+}
+
+// An npm lockfile of link:/file: deps carries no hashes by design — the loop
+// must not flag them.
+func TestCheckLockfileIntegrityIgnoresLinkDeps(t *testing.T) {
+	dir := t.TempDir()
+	lock := `{"lockfileVersion":3,"packages":{
+	  "":{"name":"root"},
+	  "node_modules/local":{"version":"1.0.0","resolved":"../local","link":true},
+	  "node_modules/tar":{"version":"2.0.0","resolved":"file:../tar.tgz"}
+	}}`
+	if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkLockfileIntegrity(dir, config.Config{Registry: "https://registry.npmjs.org"}, wf, true); err != nil {
+		t.Errorf("link/file deps must not gate: %v", err)
 	}
 }

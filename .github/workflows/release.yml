@@ -6,17 +6,18 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write   # required to create the Release and upload assets
-
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the Release and upload assets
+      id-token: write      # OIDC token the attestation is signed with
+      attestations: write  # publish the build-provenance attestation
     steps:
-      # NOTE: for a supply-chain tool these official actions should ideally be
-      # pinned to a commit SHA rather than a moving tag — hardening follow-up.
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Every action is pinned to a full commit SHA, not a moving tag: a
+      # supply-chain guard must not import one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod   # single source of truth (currently 1.26.4)
 
@@ -45,6 +46,14 @@ jobs:
 
       - name: Checksums
         run: (cd dist && sha256sum guard-* > SHA256SUMS && cat SHA256SUMS)
+
+      # Sign the binaries' digests with the workflow's OIDC identity BEFORE they
+      # ship, so a downloader can prove a release came from this repo's workflow
+      # and not from someone with upload rights: gh attestation verify guard-...
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/guard-*
 
       - name: Publish GitHub Release
         env:

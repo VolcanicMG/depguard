@@ -200,7 +200,7 @@ Catches deps that go bad *after* you installed them — and your own secrets on 
 | Layer | Stops |
 |---|---|
 | `guard check` (advisories + cooldown) | newly-reported advisories + cooldown violations across **every version** in the tree, on every commit/PR (detail below) |
-| Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) |
+| Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) — npm, pnpm and yarn; npm `file:`/`link:`/git deps are exempt by design |
 | Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, keys) staged or already tracked by git — hard-blocks commit/push so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate match with `guard ignore secret:<path>` |
 | License-policy gate (opt-in) | installed packages under a denied (or, in allowlist mode, non-allowed) license — `license-deny` / `license-allow` in .guardrc |
 
@@ -216,7 +216,7 @@ re-verify). CI always keeps the strict block.
 
 | Layer | Stops |
 |---|---|
-| Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify (DSSE signature, Fulcio cert chain, or tarball-digest binding) — i.e. a tampered provenance claim (`flag: [provenance]`) |
+| Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify (DSSE signature, Fulcio cert chain, tarball-digest binding, or a signer identity that doesn't belong to the GitHub source repo it claims) — i.e. a tampered or impersonated provenance claim. Non-GitHub sources report *not bound*, not tampered (`flag: [provenance]`) |
 | Maintainer-change | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 
 `guard check` scopes the cooldown re-check to lockfile versions **added since git
@@ -342,8 +342,11 @@ others leave.
   per-version capability diff, and build-provenance are **opt-in** (`flag:`) — they
   fetch per package, too heavy to run on every commit by default.
 - Build-provenance verification checks the **DSSE signature, the Fulcio cert chain
-  to a pinned Sigstore root, and the subject↔tarball digest binding**, then reports
-  the attested source repo. It does **not** yet verify Rekor transparency-log
+  to a pinned Sigstore root, the subject↔tarball digest binding, and that the
+  signing identity belongs to the source repo the statement claims**, then reports
+  the attested source repo. Identity binding covers **GitHub-sourced** provenance;
+  attestations from other forges are reported as **not bound** (never "verified",
+  and never flagged as tampering either). It does **not** yet verify Rekor transparency-log
   inclusion, the SCT, or rotate trust roots via TUF — a green result is a high bar,
   not the full Sigstore guarantee.
 - The MCP server returns scan/check results wrapped as **untrusted data**; an agent
@@ -368,9 +371,10 @@ Directional, not commitments — depguard is **npm-first** today. On the radar:
 - **Unused-dependency detection.** Surface declared deps that nothing actually
   imports — dead weight and needless attack surface — so they can be pruned
   (a `guard unused` report / a non-blocking `guard check` signal).
-- **Signed releases.** Prebuilt, checksummed binaries now ship via CI on each tag
-  (Releases); cosign / Sigstore **signing** of those artifacts is the next step —
-  depguard could then verify its own provenance.
+- **Signed releases.** Prebuilt binaries ship via CI on each tag with SHA256SUMS
+  **and a GitHub build-provenance attestation** (`gh attestation verify` — see
+  [SETUP.md](docs/SETUP.md)). Full cosign/Sigstore keyless signing of the assets,
+  and depguard verifying its own provenance, are the next step.
 
 ## Tests
 

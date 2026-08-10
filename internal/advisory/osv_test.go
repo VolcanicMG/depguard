@@ -296,3 +296,25 @@ func TestBlockingVersionsTiersBySeverity(t *testing.T) {
 		t.Errorf("threshold MODERATE: 2.0.0 should now block, got %v", got)
 	}
 }
+
+// OSV results are positional. A response with FEWER results than queries would
+// silently score the omitted packages clean; MORE would index past the chunk
+// and panic. Both must be a loud error.
+func TestCheckResultCountMismatch(t *testing.T) {
+	for _, body := range []string{
+		`{"results":[{}]}`,       // one short for a two-query batch
+		`{"results":[{},{},{}]}`, // one extra
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body)) //nolint:errcheck
+		}))
+		old := osvBatchURL
+		osvBatchURL = srv.URL
+		_, err := Check([]lockfile.Pkg{{Name: "a", Version: "1.0.0"}, {Name: "b", Version: "2.0.0"}})
+		osvBatchURL = old
+		srv.Close()
+		if err == nil {
+			t.Errorf("body %s: expected an error, got nil", body)
+		}
+	}
+}

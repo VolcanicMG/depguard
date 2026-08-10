@@ -1070,14 +1070,16 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	}
 	regHost := hostOf(cfg.Registry)
 	for _, p := range pkgs {
-		if cfg.Allowed(p.Name) || (!strings.HasPrefix(p.Resolved, "http://") && !strings.HasPrefix(p.Resolved, "https://")) {
+		if cfg.Allowed(p.Name) || !checkableDep(p) {
 			continue
 		}
-		if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
-			if id := offRegistryWaiverID(p.Key()); waivedActive(wf, id, now) {
-				res.Waived = append(res.Waived, id)
-			} else {
-				res.OffRegistry = append(res.OffRegistry, p.Key())
+		if hasTarballURL(p) {
+			if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
+				if id := offRegistryWaiverID(p.Key()); waivedActive(wf, id, now) {
+					res.Waived = append(res.Waived, id)
+				} else {
+					res.OffRegistry = append(res.OffRegistry, p.Key())
+				}
 			}
 		}
 		if p.Integrity == "" {
@@ -1112,9 +1114,13 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	// Per-package fetch failures are fail-open too — but recorded, not dropped.
 	res.Degraded = append(res.Degraded, warns...)
 	if cfg.Flagged("new-maintainer") {
-		if ch, _ := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, nil); len(ch) > 0 {
+		ch, mwarns := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, nil)
+		if len(ch) > 0 {
 			res.Maintainers = ch
 		}
+		// Fail-open per package, but recorded: a green result must not hide
+		// that the publisher comparison never ran for some of the tree.
+		res.Degraded = append(res.Degraded, mwarns...)
 	}
 	// License gate (no-op unless a deny/allow list is configured). Reads
 	// node_modules; an absent tree is recorded as degraded, not a clean pass.
@@ -1187,14 +1193,16 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 		if cfg.Allowed(p.Name) {
 			continue
 		}
-		// Only http(s) tarballs are comparable; git/file/link deps legitimately
-		// resolve elsewhere and carry no registry host or integrity hash.
-		if !strings.HasPrefix(p.Resolved, "http://") && !strings.HasPrefix(p.Resolved, "https://") {
+		if !checkableDep(p) {
 			continue
 		}
-		if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
-			waiveOrKeep(offRegistryWaiverID(p.Key()),
-				fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost), &offReg)
+		// The host comparison needs an actual tarball URL; pnpm normally records
+		// none, and those entries are still hash-checked below.
+		if hasTarballURL(p) {
+			if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
+				waiveOrKeep(offRegistryWaiverID(p.Key()),
+					fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost), &offReg)
+			}
 		}
 		if p.Integrity == "" {
 			waiveOrKeep(unhashedWaiverID(p.Key()), p.Key(), &noHash)
@@ -1221,6 +1229,22 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 	fmt.Fprintln(os.Stderr, "guard: a tarball off-registry or without a hash can't be verified — allowlist in .guardrc, or — if reviewed — guard ignore off-registry:<name>@<version> / unhashed:<name>@<version>")
 	return fmt.Errorf("lockfile integrity check failed (%d off-registry, %d unhashed)", len(offReg), len(noHash))
 }
+
+// maxPackumentBytes caps bytes read from a registry packument (see
+// internal/freshness). var so a test can lower it cheaply.
+var maxPackumentBytes int64 = 128 << 20 // 128 MiB
+
+// hasTarballURL reports whether the entry records an http(s) tarball — the only
+// shape whose host is comparable against the configured registry.
+func hasTarballURL(p lockfile.Pkg) bool {
+	return strings.HasPrefix(p.Resolved, "http://") || strings.HasPrefix(p.Resolved, "https://")
+}
+
+// checkableDep reports whether the lockfile integrity gates apply to an entry.
+// git/file/link deps legitimately carry no registry host and no hash, so they
+// are exempt — but a pnpm entry (FromRegistry, usually with no Resolved at all)
+// IS a registry dep and must still be hash-checked.
+func checkableDep(p lockfile.Pkg) bool { return p.FromRegistry || hasTarballURL(p) }
 
 // hostOf extracts the hostname from a URL, "" on parse failure.
 func hostOf(rawurl string) string {
@@ -1252,7 +1276,9 @@ func priorCapabilityDiff(cfg config.Config, name, version string, current scanne
 	var doc struct {
 		Versions map[string]json.RawMessage `json:"versions"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&doc) != nil {
+	// Capped like every other registry read; truncation surfaces as a decode
+	// error, which yields no diff (the caller's fail-open path).
+	if json.NewDecoder(io.LimitReader(resp.Body, maxPackumentBytes)).Decode(&doc) != nil {
 		return nil
 	}
 	all := make([]string, 0, len(doc.Versions))

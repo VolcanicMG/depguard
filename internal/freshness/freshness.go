@@ -11,6 +11,7 @@ package freshness
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
@@ -19,6 +20,12 @@ import (
 	"depguard/internal/lockfile"
 	"depguard/internal/semver"
 )
+
+// maxPackumentBytes caps bytes read from a registry packument. Generous —
+// real ones reach tens of MB; it only stops an endless body from a hostile or
+// MITM'd registry. Truncation surfaces as a decode error, so we fail closed.
+// var so a test can lower it cheaply.
+var maxPackumentBytes int64 = 128 << 20 // 128 MiB
 
 // Violation is one lockfile version still inside the cooldown window.
 type Violation struct {
@@ -103,7 +110,7 @@ func publishTime(client *http.Client, registry, name, version string) (time.Time
 	var doc struct {
 		Time map[string]string `json:"time"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPackumentBytes)).Decode(&doc); err != nil {
 		return time.Time{}, fmt.Errorf("packument parse: %w", err)
 	}
 	s, ok := doc.Time[version]
@@ -138,7 +145,7 @@ func LatestSafe(registry, name string, cooldown time.Duration) (string, error) {
 		Versions map[string]json.RawMessage `json:"versions"`
 		Time     map[string]string          `json:"time"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPackumentBytes)).Decode(&doc); err != nil {
 		return "", fmt.Errorf("packument parse: %w", err)
 	}
 	cutoff := time.Now().Add(-cooldown)

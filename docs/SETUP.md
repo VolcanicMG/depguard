@@ -54,6 +54,20 @@ sudo mv "$ASSET" /usr/local/bin/guard       # or anywhere on your PATH
 guard version                               # -> guard 1.0.0
 ```
 
+#### Verify the release came from this repo's CI (recommended)
+
+The checksums prove the file wasn't corrupted; the **build attestation** proves who
+built it. Releases are attested by the tagged GitHub Actions workflow, so with the
+[`gh` CLI](https://cli.github.com):
+
+```sh
+gh attestation verify "$ASSET" --repo VolcanicMG/depguard
+```
+
+A green result means that exact binary was built by depguard's own release workflow —
+not uploaded by someone with write access to the repo. Assets published before attestation
+shipped report none — fall back to `SHA256SUMS` for those.
+
 > **macOS Gatekeeper:** the binary is unsigned, so the first run may be blocked. Clear
 > the quarantine flag once — `xattr -d com.apple.quarantine /usr/local/bin/guard` — or
 > right-click the file in Finder → **Open**.
@@ -382,4 +396,7 @@ fire: `node demo/run.mjs` ([demo/README.md](../demo/README.md)).
 | `ignore-scripts …: expected true or false` | a typo'd bool fails closed by design; correct the value |
 | pnpm / yarn project | `guard install` proxies all three managers (auto-detected); boxed **script approval** is npm-only, so under pnpm/yarn scripts stay disabled and the lockfile is re-checked |
 | Waiver isn't suppressing | it may have **expired** (`guard ignore --list` shows EXPIRED) or the package version changed (re-waive the new `name@version`) |
+| pnpm repo suddenly reports `unhashed:` / `off-registry:` | expected on first `guard check` after upgrading: pnpm entries previously reached NEITHER integrity gate (pnpm records no tarball URL, so both loops skipped them). Review the findings — a missing hash is real — then `guard ignore unhashed:<name>@<version>` / `off-registry:<name>@<version>` for reviewed ones |
+| Private registry / mirror flags off-registry pnpm entries | a pnpm `resolution: {tarball: …}` is now host-checked against `.guardrc` `registry:`. Point `registry:` at your mirror, add the scope to `allow:`, or waive with `guard ignore off-registry:<name>@<version>` |
+| Hooks installed but nothing is checked | the shim now prints `guard binary not found on PATH — depguard check SKIPPED` when `guard` isn't installed (it stays fail-open so a teammate without guard can still commit). Install the binary, or remove the `.git/hooks` shims. Repos initialized before this change have a SILENT shim — re-run `guard init` to refresh it. |
 | `Text file busy` overwriting `guard` | the MCP server (`guard mcp`) is running — unlink first, it won't disturb the live process: `sudo rm -f /usr/local/bin/guard && sudo cp guard /usr/local/bin/guard` |

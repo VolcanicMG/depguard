@@ -15,7 +15,8 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  ├── mcp.go                      `guard mcp`: stdio JSON-RPC MCP server (zero-dep)
  ├── go.mod                      module def — ZERO dependencies, on purpose
  ├── .github/workflows/
- │   └── release.yml            CI: cross-compile + publish binaries on a vX.Y.Z tag
+ │   └── release.yml            CI: cross-compile + attest + publish binaries on a vX.Y.Z tag
+ │                               (all actions SHA-pinned; attest-build-provenance signs dist/guard-*)
  ├── internal/
  │   ├── config/config.go        .guardrc policy: parse, defaults, validation
  │   ├── approvals/approvals.go  .guard-approvals: ask-once script decisions
@@ -39,7 +40,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
  │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth)
- │   ├── lockfile/altlock.go     pnpm-lock.yaml + yarn.lock parsers (check path)
+ │   ├── lockfile/altlock.go     pnpm-lock.yaml + yarn.lock parsers (check path); pnpm
+ │                               entries are marked Pkg.FromRegistry so the integrity
+ │                               gates apply without a tarball URL
  │   ├── lockfile/graph.go       package-lock graph rebuild for `guard why` (parent→child edges)
  │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
@@ -148,11 +151,12 @@ the shared history.
 | New MCP tool | `mcp.go` `toolDefs()` + `callTool()` — keep the untrusted-data banner |
 | Signature/keyring behavior | `provenance/provenance.go`; wired in `proxy.go` `rewrite()` |
 | Maintainer-change heuristic | `maintainer/maintainer.go` `changesFor()` |
-| Build-provenance verification | `attestation/attestation.go` (DSSE + Fulcio chain + digest bind); gated by `flag: provenance`, wired in `main.go` `checkProvenance` |
+| Build-provenance verification | `attestation/attestation.go` — `verifyOne` (DSSE + Fulcio chain) then `bindStatement` (digest bind + signer↔source repo via `githubRepoPath`); gated by `flag: provenance`, wired in `main.go` `checkProvenance` |
 | License-policy gate | `license/license.go` (SPDX deny/allow); wired in `main.go` `checkLicenses` |
 | SBOM output (CycloneDX / SPDX) | `sbom/sbom.go`; `main.go` `cmdSBOM` |
 | `guard why` dependency graph | `lockfile/graph.go` (`BuildGraph` / `Paths`); `main.go` `cmdWhy` |
-| Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `Installed()` |
+| Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `Installed()`; set `Pkg.FromRegistry` if the format omits tarball URLs |
+| Lockfile-integrity gate scope | `main.go` `checkableDep` / `hasTarballURL` — used by BOTH `gatherCheck` and `checkLockfileIntegrity` |
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
 | Cooldown accept-all / auto-pin | `main.go` `confirmCooldown` / `pinAndReinstall` / `pinPackageJSON` / `setDepVersion`; pin target from `freshness.LatestSafe` |

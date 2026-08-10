@@ -14,6 +14,7 @@ package maintainer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -22,6 +23,10 @@ import (
 
 	"depguard/internal/lockfile"
 )
+
+// maxPackumentBytes caps bytes read from a registry packument (see freshness).
+// Truncation surfaces as a decode error → the caller fails closed.
+var maxPackumentBytes int64 = 128 << 20 // 128 MiB
 
 // Change is one publisher transition landing on an installed version.
 type Change struct {
@@ -120,7 +125,7 @@ func changesFor(client *http.Client, registry, name string, installed []string) 
 			} `json:"_npmUser"`
 		} `json:"versions"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPackumentBytes)).Decode(&doc); err != nil {
 		return nil, fmt.Errorf("packument parse: %w", err)
 	}
 

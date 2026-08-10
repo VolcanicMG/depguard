@@ -19,9 +19,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
+
+// maxKeysBytes caps bytes read from the registry's signing-keyring endpoint.
+// The real document is a few KB; the cap only bounds a hostile response.
+var maxKeysBytes int64 = 4 << 20 // 4 MiB
 
 // Signature is one entry from a version's dist.signatures array.
 type Signature struct {
@@ -53,7 +58,7 @@ func FetchKeyring(client *http.Client, registry string) (*Keyring, error) {
 			Key   string `json:"key"` // base64 PKIX/SPKI DER
 		} `json:"keys"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxKeysBytes)).Decode(&doc); err != nil {
 		return nil, err
 	}
 	kr := &Keyring{keys: map[string]*ecdsa.PublicKey{}}
