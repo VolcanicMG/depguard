@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-1.0.1-2ea44f)
+![version](https://img.shields.io/badge/version-1.1.0-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
@@ -120,7 +120,7 @@ asset for your platform from the [latest release](../../releases/latest), drop i
 # 1. Install (Linux x86-64 shown — pick your asset from the release list)
 curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
 chmod +x guard && sudo mv guard /usr/local/bin/
-guard version                       # -> guard 1.0.1
+guard version                       # -> guard 1.1.0
 
 # 2. Protect a repo
 cd your-project
@@ -171,7 +171,12 @@ The same layered defenses — but they don't all fire at once. Here they're grou
 
 These all run inside the ephemeral proxy, so a blocked version is simply one npm
 never resolves — no error to handle. The name gate is **fail-closed**; clear a false
-match with `allow:`. The cooldown makes too-fresh versions invisible, so npm picks a
+match with `allow:`. **`allow:` is a narrow escape hatch — it bypasses the cooldown
+and the typosquat name gate ONLY** ("I want this exact name, and I accept it may be
+fresh"). It does **not** disable OSV advisory blocking, registry-signature
+verification, or the dependency-confusion (`internal-scopes`) gate: an allowlisted
+package with a known-malicious or tampered version still has that version dropped.
+The cooldown makes too-fresh versions invisible, so npm picks a
 safe one itself. Signature verification catches registry/account tampering the
 integrity hash can't — but only blocks *present-but-invalid* signatures (unsigned
 versions still pass). With `save-exact`, deps stay at the version you vetted until you
@@ -260,7 +265,7 @@ guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to std
 # ── Decisions & waivers ────────────────────────────────────
 guard approve <name@version> [--uncontained|--deny]            # script decisions
 guard ignore <issue-id> [--reason ".."] [--expires 30d]        # waive a REVIEWED finding (--list, --remove)
-guard allow <pattern>...             # add a name/scope to .guardrc allow (bypass cooldown)
+guard allow <pattern>...             # add a name/scope to .guardrc allow (bypass cooldown + typosquat ONLY; not OSV/signature/internal)
 guard secret-add <pattern>...        # append a file/dir pattern to secret-paths (never-commit gate)
 
 # ── Config & maintenance ───────────────────────────────────

@@ -44,7 +44,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.0.1"
+const version = "1.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -1134,8 +1134,9 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		}
 	}
 	// Build-provenance gate (flag-gated, opt-in). Only INVALID attestations gate;
-	// verified/absent are informational. One registry fetch per package, so it's
-	// off by default.
+	// verified/absent/degraded are informational (degraded = a fetch/parse that
+	// couldn't complete, surfaced in res.Provenance but never gating). One
+	// registry fetch per package, so it's off by default.
 	invalidProv := 0
 	if cfg.Flagged("provenance") {
 		apkgs := make([]attestation.Pkg, 0, len(pkgs))
@@ -1761,7 +1762,9 @@ func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) 
 // noisy and slow (one registry fetch per package). A VERIFIED result reports
 // the attested source repo; an INVALID one (attestation present but signature,
 // cert chain, or digest binding failed) is a tamper signal that GATES. Absent
-// attestations are not reported and never gate. Network errors fail open.
+// attestations are not reported and never gate. A fetch/parse that couldn't
+// complete is reported as DEGRADED (visible, never gating) — distinct from a
+// clean "none published" so a transient/hostile failure isn't read as absence.
 func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
@@ -1775,7 +1778,7 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 		apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	verified, invalid := 0, 0
+	verified, invalid, degraded := 0, 0, 0
 	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed, progressPrinter("provenance", quiet)) {
 		switch r.Status {
 		case attestation.StatusVerified:
@@ -1786,10 +1789,20 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 		case attestation.StatusInvalid:
 			invalid++
 			fmt.Fprintf(os.Stderr, "guard: %s provenance INVALID for %s@%s — %s\n", ui.Bad(), r.Name, r.Version, r.Reason)
+		case attestation.StatusDegraded:
+			degraded++
+			if !quiet {
+				// Fail-open: a fetch/parse that couldn't complete is NOT a tamper
+				// signal and never gates — but say so, don't read it as "none".
+				fmt.Fprintf(os.Stderr, "guard: %s provenance check degraded for %s@%s — %s\n", ui.Warn(), r.Name, r.Version, r.Reason)
+			}
 		}
 	}
 	if !quiet && verified > 0 {
 		fmt.Printf("guard: %d package(s) with verified build provenance %s\n", verified, ui.OK())
+	}
+	if !quiet && degraded > 0 {
+		fmt.Fprintf(os.Stderr, "guard: %d package(s) with a degraded provenance check (not gated) %s\n", degraded, ui.Warn())
 	}
 	if invalid > 0 {
 		return fmt.Errorf("%d package(s) with INVALID provenance attestation", invalid)
@@ -2418,8 +2431,8 @@ func cmdStatus(args []string) error {
 	// Triggers
 	fmt.Println("\n" + ui.Bold("triggers"))
 	st := hooks.Installed(dir)
-	row("pre-commit hook", boolState(st.PreCommit, "installed", "not installed (guard init)"))
-	row("pre-push hook", boolState(st.PrePush, "installed", "not installed (guard init)"))
+	row("pre-commit hook", hookRow(st.PreCommit, st.PreCommitCurrent))
+	row("pre-push hook", hookRow(st.PrePush, st.PrePushCurrent))
 	row("CI PR gate", boolState(st.CIWorkflow, "installed", "not installed (guard init --ci)"))
 	if st.Husky {
 		row("husky", ui.OK()+" detected (depguard chained onto it)")
@@ -2443,14 +2456,49 @@ func cmdStatus(args []string) error {
 	row("npm", lookState("npm"))
 	row("git", lookState("git"))
 
-	// Verdict — protected means policy loads AND at least one local gate fires.
+	// Verdict — "protected" means policy loads, a hook carries depguard's CURRENT
+	// managed shim, AND the guard binary resolves. A stale/foreign hook or a
+	// missing binary is only PARTIAL protection, so the verdict says which.
 	fmt.Println()
-	if cfgErr == nil && (st.PreCommit || st.PrePush) {
-		fmt.Println(ui.Green("→ this repo is protected ") + ui.OK())
+	_, guardErr := exec.LookPath("guard")
+	if ok, msg := protectionVerdict(st, guardErr == nil, cfgErr == nil); ok {
+		fmt.Println(ui.Green("→ "+msg+" ") + ui.OK())
 	} else {
-		fmt.Println(ui.Yellow("→ not fully set up — run 'guard init'"))
+		fmt.Println(ui.Yellow("→ " + msg))
 	}
 	return nil
+}
+
+// hookRow renders a hook trigger row, distinguishing a current managed shim from
+// a stale/foreign one that mentions guard but lacks the current marker.
+func hookRow(present, current bool) string {
+	switch {
+	case !present:
+		return ui.Dim("— not installed (guard init)")
+	case !current:
+		return ui.Warn() + " present, stale shim — run 'guard init' to refresh"
+	default:
+		return ui.OK() + " installed"
+	}
+}
+
+// protectionVerdict decides the one-line 'guard status' conclusion from the hook
+// state, whether guard is on PATH, and whether policy loaded. Pure (no I/O) so
+// the F4 degraded/stale/missing-binary cases are unit-testable without stdout
+// capture. Returns (protected, message).
+func protectionVerdict(st hooks.InstalledState, guardOnPath, policyOK bool) (bool, string) {
+	switch {
+	case !policyOK:
+		return false, "not fully set up — policy invalid; fix .guardrc"
+	case !(st.PreCommit || st.PrePush):
+		return false, "not fully set up — run 'guard init'"
+	case !(st.PreCommitCurrent || st.PrePushCurrent):
+		return false, "degraded — a hook exists but is not depguard's current shim; run 'guard init' to refresh"
+	case !guardOnPath:
+		return false, "degraded — guard is not on PATH, so the hooks can't run; install the guard binary"
+	default:
+		return true, "this repo is protected"
+	}
 }
 
 // fmtCooldown renders a duration as "Nd" when it's a whole number of days,

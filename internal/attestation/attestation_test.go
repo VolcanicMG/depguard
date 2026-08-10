@@ -4,6 +4,9 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -144,5 +147,42 @@ func TestGithubRepoPath(t *testing.T) {
 		if got := githubRepoPath(in); got != want {
 			t.Errorf("githubRepoPath(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// A fetch/parse that couldn't COMPLETE is StatusDegraded (fail-open, visible),
+// distinct from a clean "no attestation published" (StatusNone) — so a transient
+// or hostile failure isn't silently read as absence.
+func TestVerifyOneDegradedVsNone(t *testing.T) {
+	p := Pkg{Name: "x", Version: "1.0.0", Integrity: "sha512-abc"}
+
+	handlers := []struct {
+		name string
+		fn   http.HandlerFunc
+		want Status
+	}{
+		{"clean 404", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) }, StatusNone},
+		{"200 empty list", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"attestations":[]}`) }, StatusNone},
+		{"HTTP 500", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }, StatusDegraded},
+		{"unparseable body", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "{not json") }, StatusDegraded},
+	}
+	for _, h := range handlers {
+		srv := httptest.NewServer(h.fn)
+		got := verifyOne(srv.Client(), srv.URL, p)
+		srv.Close()
+		if got.Status != h.want {
+			t.Errorf("%s: status = %q, want %q", h.name, got.Status, h.want)
+		}
+		if h.want == StatusDegraded && got.Reason == "" {
+			t.Errorf("%s: degraded result carries no reason", h.name)
+		}
+	}
+
+	// A network error (server already closed) is degraded, not none.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := dead.URL
+	dead.Close()
+	if got := verifyOne(http.DefaultClient, url, p); got.Status != StatusDegraded || got.Reason == "" {
+		t.Errorf("network error: status = %q reason %q, want degraded + reason", got.Status, got.Reason)
 	}
 }

@@ -51,7 +51,7 @@ sha256sum --ignore-missing -c SHA256SUMS    # macOS: shasum -a 256 --ignore-miss
 
 chmod +x "$ASSET"
 sudo mv "$ASSET" /usr/local/bin/guard       # or anywhere on your PATH
-guard version                               # -> guard 1.0.0
+guard version                               # -> guard 1.1.0
 ```
 
 #### Verify the release came from this repo's CI (recommended)
@@ -83,7 +83,7 @@ Invoke-WebRequest "$base/$asset" -OutFile guard.exe
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
 Move-Item -Force guard.exe "$env:USERPROFILE\bin\guard.exe"   # a dir already on your PATH
-guard version                               # -> guard 1.0.0
+guard version                               # -> guard 1.1.0
 ```
 
 > **Windows:** SmartScreen may warn on the unsigned binary — *More info → Run anyway*.
@@ -97,7 +97,7 @@ Needs Go 1.26.4; produces the same single, zero-dependency binary.
 cd /path/to/depguard
 go build -o guard .            # zero dependencies
 sudo mv guard /usr/local/bin/
-guard version                  # -> guard 1.0.0
+guard version                  # -> guard 1.1.0
 ```
 
 (On this machine Go lives at `~/.local/go/bin/go`, not on PATH — use that path to build.)
@@ -135,8 +135,12 @@ guard init --ci     # ALSO writes a GitHub Actions PR gate (.github/workflows/de
 ```
 
 `guard init` is idempotent-ish: it **refuses to overwrite** an existing `.guardrc`
-and never clobbers a human-edited `.npmrc` (it appends, never duplicates). What
-lands:
+and never clobbers a human-edited `.npmrc` (it appends, never duplicates). The git
+hook shims carry a **version marker** (`# depguard-shim-version: N`) wrapped in
+`# >>> depguard managed shim >>>` sentinels: re-running `guard init` **upgrades an
+out-of-date managed shim in place** (and is a no-op when it's already current), so a
+shim can actually be refreshed. A foreign hook that merely mentions `guard` (no
+marker) is chained onto, never clobbered. What lands:
 
 ```
  your-project/
@@ -398,5 +402,6 @@ fire: `node demo/run.mjs` ([demo/README.md](../demo/README.md)).
 | Waiver isn't suppressing | it may have **expired** (`guard ignore --list` shows EXPIRED) or the package version changed (re-waive the new `name@version`) |
 | pnpm repo suddenly reports `unhashed:` / `off-registry:` | expected on first `guard check` after upgrading: pnpm entries previously reached NEITHER integrity gate (pnpm records no tarball URL, so both loops skipped them). Review the findings — a missing hash is real — then `guard ignore unhashed:<name>@<version>` / `off-registry:<name>@<version>` for reviewed ones |
 | Private registry / mirror flags off-registry pnpm entries | a pnpm `resolution: {tarball: …}` is now host-checked against `.guardrc` `registry:`. Point `registry:` at your mirror, add the scope to `allow:`, or waive with `guard ignore off-registry:<name>@<version>` |
-| Hooks installed but nothing is checked | the shim now prints `guard binary not found on PATH — depguard check SKIPPED` when `guard` isn't installed (it stays fail-open so a teammate without guard can still commit). Install the binary, or remove the `.git/hooks` shims. Repos initialized before this change have a SILENT shim — re-run `guard init` to refresh it. |
+| Hooks installed but nothing is checked | the shim now prints `guard binary not found on PATH — depguard check SKIPPED` when `guard` isn't installed (it stays fail-open so a teammate without guard can still commit). Install the binary, or remove the `.git/hooks` shims. The managed shim carries a version marker, so **re-running `guard init` upgrades an out-of-date shim in place** (a pre-marker/old shim is chained onto — the current warning-shim then runs alongside it). |
+| `guard status` says *degraded* / *stale shim* | a hook exists but doesn't carry the **current** managed shim marker (an old or foreign hook), or `guard` isn't on PATH — so it's only partial protection. Re-run `guard init` to refresh the shim, and make sure the `guard` binary is installed. |
 | `Text file busy` overwriting `guard` | the MCP server (`guard mcp`) is running — unlink first, it won't disturb the live process: `sudo rm -f /usr/local/bin/guard && sudo cp guard /usr/local/bin/guard` |
