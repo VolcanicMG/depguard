@@ -455,10 +455,20 @@ agents.
                                     doesn't make every old version uninstallable.
    → dependency confusion           internal-scopes: names that must come from a
                                     private registry are blocked from the public
-                                    one (proxy, fail closed).
+                                    one (proxy, fail closed). Outranks allow: —
+                                    a name in BOTH lists is the attack shape,
+                                    so the allowlist cannot unlock it.
    → lockfile integrity             guard check flags entries whose tarball
                                     resolves OFF the registry or lack an
                                     integrity hash (poisoned-lockfile tells).
+                                    Covers npm, pnpm AND yarn: pnpm records no
+                                    tarball URL, so its parser MARKS entries as
+                                    registry deps (its keys only admit real
+                                    versions) and the unhashed gate applies
+                                    without a URL; a pnpm `tarball:` in the
+                                    resolution block feeds the host check. npm
+                                    file:/link:/git deps stay exempt — they
+                                    legitimately carry neither host nor hash.
    → capability diff vs prev        scans the previous version's tarball and
                                     shows what THIS version added (new socket,
                                     new eval...) at approval. flag: new-network/new-fs.
@@ -614,8 +624,19 @@ Five capabilities added in one pass:
  BUILD PROVENANCE (internal/attestation, flag: [provenance])
    → fetches npm's Sigstore attestation (/-/npm/v1/attestations/<name>@<ver>),
      verifies the DSSE signature over the in-toto SLSA statement, chains the
-     leaf cert to a PINNED Fulcio root, and binds the statement subject digest
-     to the installed tarball hash. Reports the attested source repo + builder.
+     leaf cert to a PINNED Fulcio root, binds the statement subject digest
+     to the installed tarball hash, AND binds the signer to the claimed source:
+     the leaf's SAN URI must be under github.com/<owner>/<repo> of the repo the
+     statement names (host taken from a URL parse, never a substring — else any
+     forge could put "github.com/<victim>" in a path). Without that step any
+     Fulcio-issued identity could self-attest provenance naming someone else's
+     repo and verify green — so VERIFIED now means identity-bound.
+     Signer that doesn't match a GitHub source = INVALID (impersonation).
+     Source on an UNSUPPORTED FORGE (npm carries GitLab-built provenance too)
+     = NONE with a reason, never INVALID: we can't bind it, but calling a
+     legitimate GitLab build "tampered" would gate a commit on a false
+     accusation. Fails open like the layer's other degradations.
+     Reports the attested source repo + builder.
      Only present-but-INVALID gates (tamper); absent/verified are informational.
      LIMITS (documented, like §6 provenance candor): no Rekor inclusion / SCT /
      TUF root rotation yet — a high bar, not the full Sigstore guarantee.

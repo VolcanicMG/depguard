@@ -16,6 +16,9 @@
 //  2. that the leaf cert chains to the PINNED Sigstore Fulcio root (below)
 //  3. that the statement's subject digest equals the installed tarball's hash
 //     (binds the attestation to the artifact we actually have)
+//  4. that the leaf cert's identity (SAN URI) belongs to the SOURCE REPO the
+//     statement claims — without this, any Fulcio-issued identity could
+//     self-attest provenance naming someone else's repo and verify green
 //
 // and then surface the attested source repo + builder identity.
 //
@@ -37,7 +40,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -234,7 +239,7 @@ func verifyOne(client *http.Client, reg string, p Pkg) Result {
 		return r
 	}
 	var doc attResponse
-	if json.NewDecoder(resp.Body).Decode(&doc) != nil || len(doc.Attestations) == 0 {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxAttestationBytes)).Decode(&doc) != nil || len(doc.Attestations) == 0 {
 		return r
 	}
 
@@ -272,20 +277,96 @@ func verifyOne(client *http.Client, reg string, p Pkg) Result {
 	if err := verifyChain(leaf, chain); err != nil {
 		return invalid(r, "cert chain: "+err.Error())
 	}
-	// 4. Bind the statement's subject digest to the installed tarball hash.
 	var stmt inTotoStatement
 	if json.Unmarshal(payload, &stmt) != nil {
 		return invalid(r, "in-toto statement unparseable")
 	}
-	if err := bindDigest(stmt, p.Integrity); err != nil {
-		return invalid(r, err.Error())
+	// 4-5. Bind the statement to the artifact AND the signer to the claimed source.
+	st, reason := bindStatement(stmt, p.Integrity, builderIdentity(leaf))
+	if st == StatusInvalid {
+		return invalid(r, reason)
 	}
-
-	r.Status = StatusVerified
+	r.Status, r.Reason = st, reason
 	r.Source = sourceRepo(stmt)
 	r.Builder = builderIdentity(leaf)
 	return r
 }
+
+// bindStatement is verification steps 4-5, split out so the decision is
+// testable without manufacturing a Fulcio-chaining certificate:
+//
+//   - the statement's subject digest must equal the installed tarball's hash
+//     (mismatch = tamper = INVALID)
+//   - the signing identity must belong to the source repo the statement claims
+//     — otherwise any Fulcio-issued identity could self-attest provenance
+//     naming someone else's repo (mismatch = impersonation = INVALID)
+//
+// Identity binding only works for GitHub-sourced provenance. npm also carries
+// attestations from other forges (GitLab CI); those are reported NONE with a
+// reason — "we couldn't bind this", NOT "this is tampered". Calling a
+// legitimate GitLab-built package INVALID would block commits on a false
+// tamper signal, so that case fails OPEN like the layer's other degradations.
+func bindStatement(stmt inTotoStatement, integrity, identity string) (Status, string) {
+	if err := bindDigest(stmt, integrity); err != nil {
+		return StatusInvalid, err.Error()
+	}
+	claimed := githubRepoPath(sourceRepo(stmt))
+	if claimed == "" {
+		return StatusNone, "provenance from an unsupported forge — not identity-bound"
+	}
+	if signer := githubRepoPath(identity); signer != claimed {
+		return StatusInvalid, fmt.Sprintf("signer %q does not match claimed source repo %q", identity, claimed)
+	}
+	return StatusVerified, ""
+}
+
+// githubRepoPath reduces a GitHub URL or identity to "owner/repo" (lowercased),
+// or "" when it names no GitHub repo. Tolerates the shapes SLSA predicates and
+// Fulcio SANs use: "owner/repo", "https://github.com/owner/repo",
+// "git+https://github.com/owner/repo.git@refs/tags/v1", and a workflow-ref SAN.
+//
+// The host is taken from a real URL PARSE, never a substring search: a SAN like
+// https://evil.example/github.com/expressjs/express/x.yml must not reduce to
+// expressjs/express and bind to someone else's provenance.
+func githubRepoPath(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil || !strings.EqualFold(u.Host, "github.com") {
+			return "" // another forge, or unparseable — not bindable by this rule
+		}
+		// Only the schemes Fulcio SANs and SLSA source URIs actually use.
+		switch strings.ToLower(u.Scheme) {
+		case "https", "git+https":
+		default:
+			return ""
+		}
+		s = strings.TrimPrefix(u.Path, "/")
+	} else {
+		// A scheme-less URI may still lead with the host; bare "owner/repo"
+		// passes through untouched.
+		s = strings.TrimPrefix(s, "github.com/")
+	}
+	s = strings.ToLower(s)
+	parts := strings.SplitN(s, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	// Strip any "@ref"/"#ref" the URI form appends, then a ".git" suffix.
+	repo := parts[1]
+	if i := strings.IndexAny(repo, "@#"); i >= 0 {
+		repo = repo[:i]
+	}
+	repo = strings.TrimSuffix(repo, ".git")
+	if repo == "" {
+		return ""
+	}
+	return parts[0] + "/" + repo
+}
+
+// maxAttestationBytes caps bytes read from the attestations endpoint. Bundles
+// are KB-sized; the cap only bounds a hostile response.
+var maxAttestationBytes int64 = 8 << 20 // 8 MiB
 
 func invalid(r Result, reason string) Result {
 	r.Status, r.Reason = StatusInvalid, reason

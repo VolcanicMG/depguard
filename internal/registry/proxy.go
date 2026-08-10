@@ -30,6 +30,12 @@ import (
 	"depguard/internal/typosquat"
 )
 
+// maxPackumentBytes caps bytes read from an upstream packument. Real ones can
+// be tens of MB, so the cap is generous — it only stops a hostile/MITM'd
+// registry from streaming an endless body into memory. var so a test can lower
+// it cheaply.
+var maxPackumentBytes int64 = 128 << 20 // 128 MiB
+
 // Blocked records one version the proxy hid from the package manager,
 // so the install summary can tell the human what was filtered and why.
 type Blocked struct {
@@ -144,9 +150,15 @@ func (p *Proxy) servePackument(w http.ResponseWriter, r *http.Request) {
 		io.Copy(w, resp.Body) //nolint:errcheck
 		return
 	}
-	body, err := io.ReadAll(resp.Body)
+	// Read cap+1 so an oversized body is DETECTED rather than silently clipped
+	// into a short packument that would filter as if those versions never existed.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPackumentBytes+1))
 	if err != nil {
 		http.Error(w, "upstream read failed", http.StatusBadGateway)
+		return
+	}
+	if int64(len(body)) > maxPackumentBytes {
+		http.Error(w, "upstream packument exceeds size cap", http.StatusBadGateway)
 		return
 	}
 
@@ -182,21 +194,23 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 		return raw, nil // no versions map (weird doc) — nothing to filter
 	}
 
-	// Allowlisted packages (your own scopes) bypass every filter — including
-	// the typosquat gate below, which is the escape hatch for a legitimate
-	// name that happens to look like a popular one.
-	if p.cfg.Allowed(name) {
-		return raw, nil
-	}
-
-	// Dependency-confusion gate: a name the repo declared INTERNAL must come
-	// from a private registry, never the public one this proxy fetches. If it
-	// resolves here, that's the confusion attack — block every version.
+	// Dependency-confusion gate FIRST: a name the repo declared INTERNAL must
+	// come from a private registry, never the public one this proxy fetches. If
+	// it resolves here, that's the confusion attack — block every version. This
+	// outranks the allowlist on purpose: a name in BOTH lists is exactly the
+	// attack shape, and `allow:` must not be able to unlock it.
 	if p.cfg.Internal(name) {
 		p.block(name, "*", "internal scope resolving from the PUBLIC registry (dependency-confusion guard)")
 		doc["versions"] = map[string]any{}
 		doc["dist-tags"] = map[string]any{}
 		return json.Marshal(doc)
+	}
+
+	// Allowlisted packages (your own scopes) bypass every REMAINING filter —
+	// including the typosquat gate below, which is the escape hatch for a
+	// legitimate name that happens to look like a popular one.
+	if p.cfg.Allowed(name) {
+		return raw, nil
 	}
 
 	// Name-level gate, BEFORE version filtering: if the package NAME itself is

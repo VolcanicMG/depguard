@@ -19,6 +19,10 @@ import (
 // hotfix). Unlike git --no-verify it skips depguard ALONE, leaving any other
 // hooks intact. It lives in the shell shim on purpose: CI runs `guard check`
 // directly, so no env var a contributor sets can weaken the PR gate.
+//
+// A MISSING guard binary stays fail-open (exit 0 — a teammate without guard
+// installed must still be able to commit) but is LOUD on stderr. Silence there
+// was the bug: the repo looked protected while every commit sailed unchecked.
 const hookScript = `#!/bin/sh
 # depguard shim — installed by 'guard init'. Calls the global guard binary.
 # Bypass ONLY depguard for one commit/push:  GUARD_SKIP=1 git push
@@ -35,6 +39,9 @@ if command -v guard >/dev/null 2>&1; then
     echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
     exit 1
   }
+else
+  echo "depguard: !! guard binary not found on PATH — depguard check SKIPPED !!" >&2
+  echo "depguard: this repo is NOT protected right now. Install guard, or remove the .git/hooks shims." >&2
 fi
 `
 
@@ -79,6 +86,9 @@ if [ -n "$GUARD_SKIP" ]; then
   echo "depguard: check skipped (GUARD_SKIP set)." >&2
 elif command -v guard >/dev/null 2>&1; then
   guard check --quiet --confirm || { echo "depguard: advisory check failed or warnings not accepted (bypass once with GUARD_SKIP=1)" >&2; exit 1; }
+else
+  echo "depguard: !! guard binary not found on PATH — depguard check SKIPPED !!" >&2
+  echo "depguard: this repo is NOT protected right now. Install guard, or remove the .git/hooks shims." >&2
 fi
 `
 

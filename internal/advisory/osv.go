@@ -230,7 +230,13 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 		if err != nil {
 			return nil, fmt.Errorf("osv response: %w", err)
 		}
-		// Results are positional: results[i] answers queries[i].
+		// Results are positional: results[i] answers queries[i]. A count that
+		// doesn't match the batch means the pairing is unknowable — MORE would
+		// index past chunk (panic), FEWER would score the omitted queries as
+		// clean. Fail closed instead of guessing.
+		if len(parsed.Results) != len(chunk) {
+			return nil, fmt.Errorf("osv response: got %d results for %d queries", len(parsed.Results), len(chunk))
+		}
 		for i, res := range parsed.Results {
 			for _, v := range res.Vulns {
 				vulns = append(vulns, Vuln{

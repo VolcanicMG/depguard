@@ -40,6 +40,12 @@ type Pkg struct {
 	// Integrity is the Subresource-Integrity hash (sha512-...). Its ABSENCE on
 	// a registry dep means npm can't verify the tarball — also checkable.
 	Integrity string
+	// FromRegistry marks an entry the PARSER proved is a plain registry dep
+	// even though the lockfile records no tarball URL (pnpm's normal shape).
+	// Without it an empty Resolved is indistinguishable from an npm file:/link:
+	// dep, which legitimately carries neither a host nor a hash — so the
+	// integrity checks would have to skip both, and pnpm would go unchecked.
+	FromRegistry bool
 }
 
 // Key is the dedupe/identity key for a package version ("name@version").
@@ -100,6 +106,8 @@ func dedupe(entries []Entry) []Pkg {
 	seen := map[string]bool{}
 	var out []Pkg
 	for _, e := range entries {
+		// FromRegistry stays false: an npm lockfile records the tarball URL for
+		// real registry deps, so Resolved alone classifies these.
 		p := Pkg{Name: e.Name, Version: e.Version, Resolved: e.Resolved, Integrity: e.Integrity}
 		if seen[p.Key()] {
 			continue

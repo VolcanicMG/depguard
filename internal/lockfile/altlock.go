@@ -13,6 +13,13 @@ import "strings"
 // `packages:` section, whose 2-space-indented keys are the package identities.
 // Key shapes across pnpm versions: "lodash@4.17.21", "/lodash@4.17.21",
 // "/@scope/name@1.0.0", optionally with a "(peer)" suffix.
+//
+// Every emitted entry is marked FromRegistry: splitPnpmKey only accepts a
+// digit-leading version, so git/link/file deps never make it out of here. That
+// marker is what lets the integrity checks flag a pnpm entry with no hash —
+// pnpm normally records no tarball URL at all, so Resolved can't classify it.
+// A non-registry `tarball:` in the resolution block IS captured into Resolved
+// so the off-registry host check works too.
 func parsePnpm(raw []byte) []Pkg {
 	var out []Pkg
 	curIdx := -1
@@ -36,22 +43,46 @@ func parsePnpm(raw []byte) []Pkg {
 			key = strings.TrimSuffix(key, ":")
 			key = strings.Trim(key, "'\"")
 			if name, ver, ok := splitPnpmKey(key); ok {
-				out = append(out, Pkg{Name: name, Version: ver})
+				out = append(out, Pkg{Name: name, Version: ver, FromRegistry: true})
 				curIdx = len(out) - 1
 			} else {
 				curIdx = -1
 			}
 			continue
 		}
-		// Deeper lines belong to the current package; grab its integrity.
-		if curIdx >= 0 {
-			if i := strings.Index(ln, "integrity:"); i >= 0 {
-				val := strings.TrimSpace(ln[i+len("integrity:"):])
-				out[curIdx].Integrity = strings.Trim(val, " {}'\",")
+		// Deeper lines belong to the current package; grab its integrity and,
+		// when the resolution names one, its tarball URL. Comments must not
+		// supply values: full-line comments are skipped, and a trailing
+		// comment is cut at " #" (YAML needs whitespace before '#', so a '#'
+		// embedded in a value, e.g. a tarball URL fragment, survives).
+		if curIdx >= 0 && !strings.HasPrefix(strings.TrimSpace(ln), "#") {
+			content := ln
+			if j := strings.Index(content, " #"); j >= 0 {
+				content = content[:j]
+			}
+			if v, ok := pnpmField(content, "integrity"); ok {
+				out[curIdx].Integrity = v
+			}
+			if v, ok := pnpmField(content, "tarball"); ok {
+				out[curIdx].Resolved = v
 			}
 		}
 	}
 	return out
+}
+
+// pnpmField pulls `key: value` out of a resolution line, stopping at the next
+// ',' or '}' so a combined {integrity: ..., tarball: ...} block splits cleanly.
+func pnpmField(ln, key string) (string, bool) {
+	i := strings.Index(ln, key+":")
+	if i < 0 {
+		return "", false
+	}
+	val := ln[i+len(key)+1:]
+	if j := strings.IndexAny(val, ",}"); j >= 0 {
+		val = val[:j]
+	}
+	return strings.Trim(val, " '\""), true
 }
 
 // splitPnpmKey turns a pnpm package key into (name, version). Strips a leading
