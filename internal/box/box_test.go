@@ -404,13 +404,20 @@ func TestRestoreKeepsBackupWhenRenameFails(t *testing.T) {
 // Only the recipe is pinnable without Docker; the live behaviour (write → EACCES,
 // read → EACCES, no inherited fd to the pipe) was verified by hand in the box.
 func TestObsImageMakesTracerNonDumpable(t *testing.T) {
-	if !strings.Contains(obsDockerfile, "chmod 0711 /usr/bin/strace") {
-		t.Error("obsDockerfile does not make strace execute-only — /proc/<tracer>/fd stays writable by the tracee and the completion marker is forgeable")
+	// 0111, not 0711: 0711 leaves the OWNER read bit, so a box run as root (sudo
+	// guard, a root CI runner) kept strace dumpable and the forgery worked again.
+	if !strings.Contains(obsDockerfile, "chmod 0111 /usr/bin/strace") {
+		t.Error("obsDockerfile does not make strace execute-only for EVERY uid — /proc/<tracer>/fd stays reachable and the completion marker is forgeable")
+	}
+	if strings.Contains(obsDockerfile, "0711") {
+		t.Error("obsDockerfile still uses 0711, which is owner-readable and therefore dumpable under a root box")
 	}
 	// EnsureObsImage reuses any local image with this tag, so a recipe change
 	// without a tag bump would leave every existing install on the old one.
-	if obsImage == "depguard-box:1" {
-		t.Error("obsImage still :1 — existing installs would keep the old, forgeable image")
+	for _, stale := range []string{"depguard-box:1", "depguard-box:2"} {
+		if obsImage == stale {
+			t.Errorf("obsImage still %s — existing installs would keep the old, forgeable image", stale)
+		}
 	}
 }
 
@@ -453,5 +460,32 @@ func TestVerdictTimeoutIsNotObserverLoss(t *testing.T) {
 	// Without the timeout, the same trace IS observer loss.
 	if _, _, _, lost := verdict(noMarker, false, true, false); !lost {
 		t.Error("a missing marker with no timeout should be observer loss")
+	}
+}
+
+// The uncontained path buffered output with CombinedOutput — unbounded. An
+// uncontained script is the LEAST trustworthy thing guard runs, so it must not
+// be the one place a runaway printer can exhaust the host's memory.
+func TestRunUncontainedBoundsOutput(t *testing.T) {
+	if !hasNpm() {
+		t.Skip("npm not on PATH")
+	}
+	orig := maxScriptOutput
+	maxScriptOutput = 512
+	defer func() { maxScriptOutput = orig }()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "package.json", `{"name":"u","version":"1.0.0","scripts":{"postinstall":"node flood.js"}}`)
+	writeFile(t, dir, "flood.js", `process.stdout.write("x".repeat(200000));`)
+
+	res, err := RunUncontained(dir)
+	if err != nil {
+		t.Fatalf("RunUncontained: %v", err)
+	}
+	if len(res.Output) > maxScriptOutput {
+		t.Errorf("buffered %d bytes, cap is %d", len(res.Output), maxScriptOutput)
+	}
+	if len(res.Truncated) == 0 {
+		t.Error("output was cut but Truncated is empty — the human would never know")
 	}
 }

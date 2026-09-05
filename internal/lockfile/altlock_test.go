@@ -26,7 +26,7 @@ packages:
     resolution: {}
     dev: false
 `)
-	got, err := parsePnpm(raw)
+	got, _, err := parsePnpm(raw)
 	if err != nil {
 		t.Fatalf("parsePnpm: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestParsePnpmIgnoresComments(t *testing.T) {
 	// x: full-line AND trailing comments must not supply values.
 	// y: a '#' embedded in a value (no preceding space) is not a comment.
 	raw := []byte("packages:\n  /x@1.0.0:\n    # integrity: sha512-fake\n    # tarball: https://evil.example/x.tgz\n    resolution: {} # integrity: sha512-fake2\n  /y@2.0.0:\n    resolution: {tarball: https://r.example/y.tgz#sha256=abc}\n")
-	got, err := parsePnpm(raw)
+	got, _, err := parsePnpm(raw)
 	if err != nil {
 		t.Fatalf("parsePnpm: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestParsePnpmIgnoresComments(t *testing.T) {
 // swallow the trailing tarball field.
 func TestParsePnpmSplitsCombinedResolution(t *testing.T) {
 	raw := []byte("packages:\n  /x@1.0.0:\n    resolution: {integrity: sha512-zzz, tarball: https://r.example/x.tgz}\n")
-	got, err := parsePnpm(raw)
+	got, _, err := parsePnpm(raw)
 	if err != nil {
 		t.Fatalf("parsePnpm: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestParsePnpmSplitsCombinedResolution(t *testing.T) {
 // sits at a field boundary, so a poisoned lockfile can't spoof Resolved/Integrity.
 func TestParsePnpmRejectsUnanchoredFields(t *testing.T) {
 	raw := []byte("packages:\n  /x@1.0.0:\n    resolution: {notarball: https://evil.example/x.tgz, fakeintegrity: sha512-evil}\n")
-	got, err := parsePnpm(raw)
+	got, _, err := parsePnpm(raw)
 	if err != nil {
 		t.Fatalf("parsePnpm: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestParsePnpmRejectsUnanchoredFields(t *testing.T) {
 	}
 	// The real fields at a boundary must still parse.
 	real := []byte("packages:\n  /y@2.0.0:\n    resolution: {integrity: sha512-real, tarball: https://r.example/y.tgz}\n")
-	g2, err2 := parsePnpm(real)
+	g2, _, err2 := parsePnpm(real)
 	if err2 != nil {
 		t.Fatalf("parsePnpm: %v", err2)
 	}
@@ -126,7 +126,7 @@ func TestParseYarnRejectsUnanchoredFields(t *testing.T) {
 	// Real integrity FIRST, crafted sibling LAST: with the old HasPrefix match,
 	// last-write-wins would let integrity-ish clobber the real value.
 	raw := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  integrity sha512-real\n  integrity-ish sha512-evil\n")
-	got, err := parseYarn(raw)
+	got, _, err := parseYarn(raw)
 	if err != nil {
 		t.Fatalf("parseYarn: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestNpmEntriesAreNotMarkedFromRegistry(t *testing.T) {
 
 func TestParseYarnSetsResolved(t *testing.T) {
 	raw := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  resolved \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\"\n  integrity sha512-abc\n")
-	got, err := parseYarn(raw)
+	got, _, err := parseYarn(raw)
 	if err != nil {
 		t.Fatalf("parseYarn: %v", err)
 	}
@@ -174,11 +174,11 @@ func TestParseYarnSetsResolved(t *testing.T) {
 // tree and every dependency went unchecked — silently, with no error.
 func TestParsePnpmCRLF(t *testing.T) {
 	lf := "lockfileVersion: '6.0'\n\npackages:\n\n  /lodash@4.17.21:\n    resolution: {integrity: sha512-abc}\n\n  /left-pad@1.3.0:\n    resolution: {integrity: sha512-def}\n"
-	want, err := parsePnpm([]byte(lf))
+	want, _, err := parsePnpm([]byte(lf))
 	if err != nil {
 		t.Fatalf("parsePnpm(LF): %v", err)
 	}
-	got, err := parsePnpm([]byte(strings.ReplaceAll(lf, "\n", "\r\n")))
+	got, _, err := parsePnpm([]byte(strings.ReplaceAll(lf, "\n", "\r\n")))
 	if err != nil {
 		t.Fatalf("parsePnpm(CRLF): %v", err)
 	}
@@ -193,7 +193,7 @@ func TestParsePnpmCRLF(t *testing.T) {
 // A yarn.lock with CRLF line endings parses too.
 func TestParseYarnCRLF(t *testing.T) {
 	lf := "lodash@^4.17.21:\n  version \"4.17.21\"\n  integrity sha512-abc\n"
-	got, err := parseYarn([]byte(strings.ReplaceAll(lf, "\n", "\r\n")))
+	got, _, err := parseYarn([]byte(strings.ReplaceAll(lf, "\n", "\r\n")))
 	if err != nil {
 		t.Fatalf("parseYarn: %v", err)
 	}
@@ -211,14 +211,14 @@ func TestParseYarnCRLF(t *testing.T) {
 func TestParsePnpmUnrecognizedPackagesErrors(t *testing.T) {
 	// A future key shape with no version anywhere in it.
 	raw := []byte("lockfileVersion: '9.0'\n\npackages:\n\n  registry.example/some-future-shape:\n    kind: opaque\n")
-	if got, err := parsePnpm(raw); err == nil {
+	if got, _, err := parsePnpm(raw); err == nil {
 		t.Fatalf("parsePnpm returned (%+v, nil), want an error for an unreadable packages section", got)
 	}
 }
 
 // No packages: section at all is legitimately empty — no error.
 func TestParsePnpmNoPackagesSection(t *testing.T) {
-	got, err := parsePnpm([]byte("lockfileVersion: '6.0'\n\nsettings:\n  autoInstallPeers: true\n"))
+	got, _, err := parsePnpm([]byte("lockfileVersion: '6.0'\n\nsettings:\n  autoInstallPeers: true\n"))
 	if err != nil || got != nil {
 		t.Fatalf("parsePnpm(no packages) = (%+v, %v), want (nil, nil)", got, err)
 	}
@@ -271,7 +271,7 @@ func TestSplitPnpmKeyV5AndV6(t *testing.T) {
 // A whole v5 lockfile parses rather than erroring out.
 func TestParsePnpmV5Lockfile(t *testing.T) {
 	raw := []byte("lockfileVersion: 5.4\n\npackages:\n\n  /lodash/4.17.21:\n    resolution: {integrity: sha512-abc}\n\n  /@scope/name/1.0.0:\n    resolution: {integrity: sha512-def}\n")
-	got, err := parsePnpm(raw)
+	got, _, err := parsePnpm(raw)
 	if err != nil {
 		t.Fatalf("parsePnpm(v5): %v", err)
 	}
@@ -302,7 +302,7 @@ __metadata:
   resolution: "@types/node@npm:20.11.0"
   checksum: 10c0/123456
 `)
-	got, err := parseYarn(raw)
+	got, _, err := parseYarn(raw)
 	if err != nil {
 		t.Fatalf("parseYarn(berry): %v", err)
 	}
@@ -328,7 +328,7 @@ __metadata:
 // Classic v1 still parses (the colon-tolerance must not regress it).
 func TestParseYarnClassicStillWorks(t *testing.T) {
 	raw := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz\"\n  integrity sha512-abc\n")
-	got, err := parseYarn(raw)
+	got, _, err := parseYarn(raw)
 	if err != nil {
 		t.Fatalf("parseYarn(classic): %v", err)
 	}
@@ -340,7 +340,53 @@ func TestParseYarnClassicStillWorks(t *testing.T) {
 // Descriptor lines we could not read at all is an error, not "no dependencies".
 func TestParseYarnUnrecognizedErrors(t *testing.T) {
 	raw := []byte("some-dep@^1.0.0:\n  someFutureField: 3\n  anotherField: x\n")
-	if got, err := parseYarn(raw); err == nil {
+	if got, _, err := parseYarn(raw); err == nil {
 		t.Fatalf("parseYarn = (%+v, nil), want an error when nothing carried a version", got)
+	}
+}
+
+// A key the parser drops silently is a package that escapes EVERY check. Git and
+// file deps are dropped on purpose; anything else is a shape we failed to read,
+// and the caller has to be able to say how much of the lockfile it actually saw.
+func TestParsePnpmCountsUnrecognizedEntries(t *testing.T) {
+	raw := []byte("lockfileVersion: '6.0'\n\npackages:\n\n" +
+		"  /lodash@4.17.21:\n    resolution: {integrity: sha512-abc}\n" +
+		"  /local@link:../x:\n    resolution: {}\n" + // deliberate drop
+		"  github.com/foo/bar/abcdef:\n    resolution: {}\n" + // deliberate drop
+		"  some-future-shape-no-version:\n    resolution: {}\n") // NOT deliberate
+	got, skipped, err := parsePnpm(raw)
+	if err != nil {
+		t.Fatalf("parsePnpm: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("parsed %d packages, want 1: %+v", len(got), got)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1 (git/link deps are intentional drops, the unknown shape is not)", skipped)
+	}
+}
+
+// A yarn descriptor that never got a version drops out of every check too.
+func TestParseYarnCountsVersionlessDescriptors(t *testing.T) {
+	raw := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  integrity sha512-abc\n\n" +
+		"weird@^1.0.0:\n  someFutureField: 3\n")
+	got, skipped, err := parseYarn(raw)
+	if err != nil {
+		t.Fatalf("parseYarn: %v", err)
+	}
+	if len(got) != 2 || skipped != 1 {
+		t.Fatalf("parsed %d entries with skipped=%d, want 2 and 1: %+v", len(got), skipped, got)
+	}
+}
+
+// A clean lockfile reports nothing skipped — the counter must not cry wolf.
+func TestParsersCountZeroOnCleanLockfiles(t *testing.T) {
+	pnpm := []byte("lockfileVersion: '6.0'\n\npackages:\n\n  /lodash@4.17.21:\n    resolution: {integrity: sha512-abc}\n")
+	if _, skipped, err := parsePnpm(pnpm); err != nil || skipped != 0 {
+		t.Errorf("parsePnpm(clean) skipped = %d (err %v), want 0", skipped, err)
+	}
+	yarn := []byte("lodash@^4.17.21:\n  version \"4.17.21\"\n  integrity sha512-abc\n")
+	if _, skipped, err := parseYarn(yarn); err != nil || skipped != 0 {
+		t.Errorf("parseYarn(clean) skipped = %d (err %v), want 0", skipped, err)
 	}
 }

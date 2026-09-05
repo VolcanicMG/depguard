@@ -144,10 +144,18 @@ marker) is chained onto, never clobbered. What lands:
 
 **Where the hooks go.** `guard init` writes to the directory git will actually
 read: `core.hooksPath` if set (husky v9 points it at `.husky/_`, which husky
-regenerates, so guard targets the `.husky` parent instead), else `.husky/` if it
-exists, else `.git/hooks`. `guard status` resolves the same directory and prints
+regenerates, so guard targets the `.husky` parent instead), else `.git/hooks`.
+A bare `.husky` directory does **not** redirect anything — husky only takes
+effect once `husky install` has set `core.hooksPath` — so if one is present while
+that config is unset, `guard init` installs to `.git/hooks` and says so, and
+`guard status` shows the same warning. `guard status` resolves the same directory and prints
 it — and it reports a hook as installed only when it is also **executable**, since
 git skips a non-executable hook in silence.
+
+**Which lockfile the hooks check.** Not the one in your working tree: pre-commit
+checks the **staged** lockfile (the index) and pre-push the **pushed commits**, so
+staging a poisoned lockfile and editing the file back does not slip past. `guard
+check` run by hand checks the working tree.
 
 **Chained pre-push hooks and stdin.** git feeds the pre-push hook its ref lines
 (`<local ref> <local sha> <remote ref> <remote sha>`) on **stdin**, and that

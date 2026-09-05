@@ -58,18 +58,45 @@ No daemon, no cron, no polling. Protection fires on *your* actions.
 
 ```
  you install a dep ─────► filter versions + gate the lockfile + handle scripts
- you commit ───────────► pre-commit: working tree vs git HEAD
- you push ─────────────► pre-push:   the OUTGOING COMMITS vs what the remote has
+ you commit ───────────► pre-commit: the STAGED lockfile (the index)
+ you push ─────────────► pre-push:   the PUSHED commits vs what that remote has
  you open a PR (CI) ───► same check, blocks merge if a dep is now flagged
  you run `guard check` ► on-demand audit, anytime
 ```
 
-The two hook phases are **not** the same check. The shim passes `--hook=<phase>`,
-and at pre-push git also hands the hook its ref lines on stdin, so guard can
-compare against the remote instead of the working tree. That distinction is the
-whole point: after a commit the tree and HEAD agree, so a too-young version or a
-secret that got committed anyway (`GUARD_SKIP`, a teammate without guard) is
-invisible to a HEAD diff — but it is exactly what the push transmits.
+The two hook phases are **not** the same check, and neither of them judges the
+working tree. The shim passes `--hook=<phase>` and `--remote=$1`; at pre-push git
+also hands the hook its ref lines on stdin.
+
+**Every lockfile gate — advisories, integrity, licenses, provenance and the
+cooldown's "current" side — reads the snapshot for the phase**, via
+`lockfile.InstalledAt(dir, ref)`:
+
+```
+ pre-commit  →  git show :package-lock.json        the INDEX: what the commit will contain
+ pre-push    →  git show <local sha>:…             the pushed COMMITS (union across refs)
+ otherwise   →  the working tree
+```
+
+One exception, by necessity: the **license gate always reads the working tree**.
+It opens each package's own `package.json` under `node_modules`, and node_modules
+only ever reflects the tree — pairing a staged or pushed lockfile's paths with
+on-disk files would report "incomplete" for every entry that differs, which is
+noise, not a finding.
+
+The working tree is not what git records or transmits. `git add` a poisoned
+lockfile and edit the file back, and a tree-based gate sees nothing while the
+commit carries it. After a commit the tree and HEAD agree, so a too-young version
+or a secret committed anyway (`GUARD_SKIP`, a teammate without guard) is
+invisible to a HEAD diff — yet it is exactly what the push transmits. The
+snapshot reader dispatches on the lockfile's FILENAME, because bytes from
+`git show` carry no other format hint, so pnpm and yarn snapshots work too.
+
+"Outgoing" is likewise scoped to the **destination**: `--not --remotes=<remote>`,
+not `--remotes`. Excluding commits present on *any* remote meant a branch already
+pushed to a fork looked like nothing-new when first pushed to the real upstream.
+When the named remote has no tracking refs yet nothing is excluded and the whole
+branch is scanned — the conservative direction.
 
 Both commit-hook and PR-check triggers are enabled (chosen): the hook catches your
 own installs and later-flagged deps; the PR check stops a teammate's bad dep before
@@ -276,12 +303,20 @@ reopen it, and a tracee knows its own pid, so it could FORGE its own completion
 marker there and then kill the tracer. What closes that is the image:
 
 ```
- obsDockerfile:  RUN chmod 0711 /usr/bin/strace     ← root-owned, execute-only
+ obsDockerfile:  RUN chmod 0111 /usr/bin/strace     ← execute-only for EVERYONE
    │
    └─ kernel marks the running strace NON-DUMPABLE
         └─ /proc/<strace>/ becomes root:root dr-x------
-             └─ tracee (ordinary uid): write EACCES, read EACCES
+             └─ tracee: write EACCES, read EACCES
 ```
+
+**0111, not 0711.** The box runs as the *invoking* uid, so `sudo guard` or a root
+CI runner puts the tracee at uid 0 — and 0711 leaves the owner read bit, which
+made strace dumpable again and the forgery worked. At 0111 nobody has the read
+bit; uid 0 inside the box cannot bypass that because `--cap-drop ALL` removes
+CAP_DAC_OVERRIDE, and the same cap-drop removes CAP_SYS_PTRACE, which
+`ptrace_may_access` would otherwise let root use to reach a non-dumpable
+process's `/proc` entries.
 
 So the trace can be neither truncated NOR appended to. **The whole guarantee
 rests on that exec-only binary** — without it the marker below is forgeable and
@@ -585,7 +620,37 @@ agents.
                                     the check path.
                                     It also flags a CONFLICT: one name@version
                                     recorded at two lockfile paths with different
-                                    tarballs or hashes. Dedupe has to keep one, so
+                                    tarballs or hashes — or with a hash at one
+                                    path and NONE at the other. A registry dep is
+                                    hashed at every path, so a hashless
+                                    occurrence is the unhashed finding, not a
+                                    field to fill in from a sibling; filling it
+                                    made the missing hash disappear. (Resolved is
+                                    different: pnpm records no tarball URL at all,
+                                    so empty-vs-set is no contradiction there.)
+                                    BUNDLED (inBundle) and LINK entries are not
+                                    occurrences at all and are dropped by the
+                                    parser: npm records a bundled copy with no
+                                    resolved/integrity because the bytes ship
+                                    inside the PARENT's hashed tarball, and a link
+                                    has no registry identity. Counting them would
+                                    make every bundling package look
+                                    self-contradictory — and since the conflict
+                                    verdict is unwaivable, and the advice ("npm
+                                    install regenerates consistent entries")
+                                    reproduces the same file, the repo would
+                                    become un-committable. inBundle is a field
+                                    anyone can write, so the parser trusts the
+                                    SHAPE, not the flag: only an entry with
+                                    neither resolved nor integrity is dropped;
+                                    one that claims inBundle but carries a URL
+                                    or hash is checked like any other. A
+                                    lockfile that EXISTS at the staged/pushed
+                                    ref but cannot be parsed is a gate failure,
+                                    never "no lockfile". Across a MULTI-REF
+                                    push no conflicts are derived either: two
+                                    branches are two lockfiles, each internally
+                                    consistent, and they are allowed to differ. Dedupe has to keep one, so
                                     the disagreement would otherwise vanish
                                     silently — and there is no single truth to
                                     waive, so a conflict is not waivable. Fix the
@@ -873,6 +938,24 @@ own). The pin is not trusted blindly — after reinstall the freshness check
 re-runs, and a surviving violation fails the pin rather than reporting success.
 CI / no-terminal keeps the strict hard block: this is an interactive convenience,
 never an automatic bypass.
+
+## 11f. Known limits (deliberate, v1.2.0)
+
+Named here so they are choices, not oversights:
+
+- **No host disk quota on the box's writable mount.** The package directory is
+  bind-mounted read-write, and a script can fill the host filesystem through it.
+  Memory, CPU, pids and wall-clock are capped; disk is not — there is no portable
+  way to quota a bind mount across Docker/Podman and every filesystem. The blast
+  radius is a full disk, not an escape or a leak.
+- **A legacy approval (no integrity) is bound on first RUN, not on upgrade.**
+  Entries written before approvals recorded a tarball hash keep applying until
+  guard next executes them, at which point the current hash is recorded and
+  annotated `integrity inferred, not reviewed`. Auto-binding them at upgrade time
+  would pin hashes nobody ever looked at.
+- **The pre-push snapshot follows the first parseable lockfile per ref.** A push
+  whose commits change package manager mid-history is scanned per ref, not per
+  commit.
 
 ## 12. Open items
 

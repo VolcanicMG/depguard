@@ -41,8 +41,11 @@ const (
 //
 // --hook="${0##*/}" passes the hook's own filename (pre-commit / pre-push) so
 // guard knows which snapshot to check: at pre-push git also feeds this hook the
-// ref lines on stdin, which guard inherits and reads. ONE shim body serves both
-// phases — the binary decides what the phase means.
+// ref lines on stdin, which guard inherits and reads. --remote="$1" passes the
+// DESTINATION git is pushing to (git's first argument to pre-push; empty for
+// pre-commit) — "what is outgoing" is relative to that remote, not to every
+// remote this clone happens to know. ONE shim body serves both phases — the
+// binary decides what the phase means.
 //
 // A MISSING guard binary stays fail-open (exit 0 — a teammate without guard
 // installed must still be able to commit) but is LOUD on stderr. Silence there
@@ -50,7 +53,7 @@ const (
 const shimBody = `if [ -n "$GUARD_SKIP" ]; then
   echo "depguard: check skipped (GUARD_SKIP set)." >&2
 elif command -v guard >/dev/null 2>&1; then
-  guard check --quiet --confirm --hook="${0##*/}" || {
+  guard check --quiet --confirm --hook="${0##*/}" --remote="$1" || {
     echo "depguard: advisory check failed (or warnings not accepted). Run 'guard check' for details." >&2
     echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
     exit 1
@@ -145,31 +148,40 @@ func hasCurrentShim(s string) bool {
 // only place a shim is worth writing, and the only place `guard status` should
 // look for one. Order:
 //
-//	core.hooksPath   git's own override wins (relative → repo-root relative).
+//	core.hooksPath   git's own override, and the ONLY thing that redirects hooks.
 //	                 husky v9 points it at .husky/_ and REGENERATES that dir on
 //	                 every install, so we target its parent .husky instead.
-//	.husky/          present without core.hooksPath (husky v8 and earlier).
-//	.git/hooks       the default.
+//	.git/hooks       otherwise — always.
 //
-// Install and Installed share this: hard-coding .git/hooks in Installed made
-// `guard status` claim a husky repo was protected by a shim git never runs.
+// A bare `.husky` directory does NOT select it. husky only takes effect by
+// setting core.hooksPath (its `husky install` step); a `.husky` dir left behind
+// by a half-finished setup, or committed by a teammate who never ran it, is not
+// where git looks. Treating it as active installed the shim somewhere git never
+// reads and then reported the repo protected — worse than not installing at all.
+// InstalledState.HuskyInactive flags exactly that situation so init and status
+// can say so out loud.
 func HookDir(dir string) string {
-	if p := gitConfig(dir, "core.hooksPath"); p != "" {
-		if !filepath.IsAbs(p) {
-			// git resolves a relative core.hooksPath against the REPO ROOT, not
-			// the current directory — so must we, or running guard from a
-			// subdirectory writes (and looks for) the shim in the wrong place.
-			p = filepath.Join(repoRoot(dir), p)
-		}
-		if filepath.Base(p) == "_" && filepath.Base(filepath.Dir(p)) == ".husky" {
-			return filepath.Dir(p)
-		}
-		return p
+	p := gitConfig(dir, "core.hooksPath")
+	if p == "" {
+		return filepath.Join(dir, ".git", "hooks")
 	}
-	if fi, err := os.Stat(filepath.Join(dir, ".husky")); err == nil && fi.IsDir() {
-		return filepath.Join(dir, ".husky")
+	if !filepath.IsAbs(p) {
+		// git resolves a relative core.hooksPath against the REPO ROOT, not the
+		// current directory — so must we, or running guard from a subdirectory
+		// writes (and looks for) the shim in the wrong place.
+		p = filepath.Join(repoRoot(dir), p)
 	}
-	return filepath.Join(dir, ".git", "hooks")
+	if filepath.Base(p) == "_" && filepath.Base(filepath.Dir(p)) == ".husky" {
+		return filepath.Dir(p)
+	}
+	return p
+}
+
+// huskyInactive reports a .husky directory that git is NOT configured to use —
+// the shape that silently sends hooks nowhere.
+func huskyInactive(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, ".husky"))
+	return err == nil && fi.IsDir() && gitConfig(dir, "core.hooksPath") == ""
 }
 
 // repoRoot returns the repository's top level, falling back to dir when git
@@ -248,6 +260,29 @@ func installHook(hookDir, h string) (string, error) {
 	return path, writeHook(path, []byte(content))
 }
 
+// endsUnconditionalExit reports whether a hook's last meaningful line is a bare
+// `exit …`. Appending after that is appending after the end: the block is
+// written, the file looks protected, and the check never runs. We still append
+// (rewriting someone's hook is not our call) — but we say so.
+func endsUnconditionalExit(content string) bool {
+	lines := strings.Split(content, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		// Only a top-level, UNINDENTED exit ends the script unconditionally; an
+		// indented one sits inside an if/case/function. Compare against the line
+		// with trailing whitespace stripped — otherwise "exit 0 " looked indented
+		// and escaped the warning.
+		if t != strings.TrimRight(lines[i], " \t") {
+			return false
+		}
+		return t == "exit" || strings.HasPrefix(t, "exit ")
+	}
+	return false
+}
+
 // npmrcSettings are the npm-config keys depguard pins at the .npmrc level. This
 // is the backstop for installs that DON'T go through guard: a teammate running
 // plain `npm install` in this repo still gets these, because npm itself reads
@@ -295,12 +330,15 @@ func installNpmrc(dir string) (bool, error) {
 }
 
 // Install writes the git hooks + .npmrc (always) and CI workflow (when ci is
-// true). Returns a list of what it wrote for the init summary.
-func Install(dir string, ci bool) ([]string, error) {
-	var written []string
+// true). Returns what it wrote for the init summary, plus any warnings about a
+// hook setup that will not actually fire.
+func Install(dir string, ci bool) (written []string, warnings []string, err error) {
+	if huskyInactive(dir) {
+		warnings = append(warnings, "husky dir present but not active (core.hooksPath is unset) — hooks installed to .git/hooks; run 'husky install' if you meant to use husky")
+	}
 
 	if wrote, err := installNpmrc(dir); err != nil {
-		return nil, err
+		return nil, warnings, err
 	} else if wrote {
 		written = append(written, ".npmrc (ignore-scripts + save-exact)")
 	}
@@ -309,12 +347,15 @@ func Install(dir string, ci bool) ([]string, error) {
 	// a shim anywhere else is decoration.
 	hookDir := HookDir(dir)
 	if _, err := os.Stat(hookDir); err != nil {
-		return nil, fmt.Errorf("no %s here — run inside a git repo (or git init first)", filepath.Base(hookDir))
+		return nil, warnings, fmt.Errorf("no %s here — run inside a git repo (or git init first)", filepath.Base(hookDir))
 	}
 	for _, h := range []string{"pre-commit", "pre-push"} {
+		if b, rerr := os.ReadFile(filepath.Join(hookDir, h)); rerr == nil && !hasCurrentShim(string(b)) && endsUnconditionalExit(string(b)) {
+			warnings = append(warnings, h+": the existing hook ends in an unconditional 'exit' — depguard's block was appended after it and may never run")
+		}
 		p, err := installHook(hookDir, h)
 		if err != nil {
-			return written, err
+			return written, warnings, err
 		}
 		if p != "" {
 			rel, _ := filepath.Rel(dir, p)
@@ -325,19 +366,19 @@ func Install(dir string, ci bool) ([]string, error) {
 	if ci {
 		wfDir := filepath.Join(dir, ".github", "workflows")
 		if err := os.MkdirAll(wfDir, 0o755); err != nil {
-			return written, err
+			return written, warnings, err
 		}
 		path := filepath.Join(wfDir, "depguard.yml")
 		if _, err := os.Stat(path); err == nil {
 			fmt.Fprintln(os.Stderr, "guard: .github/workflows/depguard.yml already exists, skipping")
 		} else {
 			if err := os.WriteFile(path, []byte(ciWorkflow), 0o644); err != nil {
-				return written, err
+				return written, warnings, err
 			}
 			written = append(written, ".github/workflows/depguard.yml")
 		}
 	}
-	return written, nil
+	return written, warnings, nil
 }
 
 // InstalledState reports which guard-managed artifacts are present in dir — the
@@ -350,7 +391,10 @@ type InstalledState struct {
 	PrePushCurrent   bool // ...and carries depguard's CURRENT managed shim marker
 	Npmrc            bool // .npmrc pins ignore-scripts=true
 	CIWorkflow       bool // .github/workflows/depguard.yml present
-	Husky            bool // a .husky dir exists (hooks chain there instead of .git/hooks)
+	Husky            bool // a .husky dir exists
+	// HuskyInactive: that .husky dir is NOT what git uses (core.hooksPath unset),
+	// so anything installed there would never run.
+	HuskyInactive bool
 	// HookDir is the directory git will actually read hooks from — reported by
 	// `guard status` so "no hook found" names the place that was searched.
 	HookDir string
@@ -374,6 +418,7 @@ func Installed(dir string) InstalledState {
 	}
 	if fi, err := os.Stat(filepath.Join(dir, ".husky")); err == nil && fi.IsDir() {
 		s.Husky = true
+		s.HuskyInactive = huskyInactive(dir)
 	}
 	return s
 }

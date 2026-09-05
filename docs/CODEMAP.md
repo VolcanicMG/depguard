@@ -42,6 +42,10 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
  │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth);
+ │                               InstalledAt(dir, ref) reads a snapshot from git
+ │                               ("" tree, ":" index, sha commit) and parseNamed
+ │                               dispatches on the FILENAME (git bytes carry no
+ │                               other format hint); Union folds multi-ref pushes;
  │                               dedupe MERGES duplicate records of one
  │                               name@version (union, not first-wins — first-wins
  │                               let an info-empty duplicate erase the real URL and
@@ -128,7 +132,14 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  main.cmdCheck (--confirm enables the interactive warn-tier accept flow;
                 --hook=pre-commit|pre-push names the git phase)
    ├─ parsePushRefs ─── pre-push only: git's "<local ref> <local sha> <remote ref>
-   │                    <remote sha>" lines on stdin (inherited through the shim)
+   │                    <remote sha>" lines on stdin (inherited through the shim);
+   │                    --remote=$1 names the DESTINATION, so "outgoing" means
+   │                    --not --remotes=<remote>, not --remotes (any remote)
+   ├─ hookSnapshot ──── the lockfile state THIS phase acts on: ":" (index) at
+   │                    pre-commit, the pushed shas at pre-push, else the working
+   │                    tree. Every lockfile gate reads it via snapshot.pkgs() →
+   │                    lockfile.InstalledAt; gatePkgs also routes the parsers'
+   │                    unrecognized-entry count through cfg.Degrade
    ├─ checkSecrets ──── secrets.Find (tree) + at pre-push secrets.FindOutgoing over
    │                    outgoingRevArgs(refs): a secret committed then DELETED is
    │                    gone from the index but still rides the outgoing history
@@ -139,7 +150,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │                     → confirmThroughWarnings (--confirm, /dev/tty): on "yes"
    │                       records acceptances via waivers.Set → .guard-ignores
    ├─ checkFreshness ─── scope = the versions THIS action adds:
-   │                     pre-commit → worktree vs HEAD (headLockfile)
+   │                     pre-commit → staged lockfile vs HEAD
    │                     pre-push   → pushed sha vs pushBaseRef (remote sha, or the
    │                                  oldest outgoing commit's parent for a new
    │                                  branch) — refLockfile via `git show <ref>:`
@@ -218,7 +229,7 @@ the shared history.
 | Editable `.guardrc` key (allow/config) | `config/config.go` `canonicalValue` + `writeKeyLine`; surfaced by `cmdAllow`/`cmdConfig` |
 | Terminal color | `internal/ui/ui.go` (gate = NO_COLOR + both streams TTY) |
 | Approval semantics | `approvals/approvals.go` (decisions) + `main.go` `promptApproval`/`runApproved` |
-| Hook/CI behavior | `hooks/hooks.go` (the shims) — they only ever call `guard check --hook=<phase>`; bump `shimVersion` on any body change or installed shims never upgrade. `HookDir` resolves `core.hooksPath` / husky / `.git/hooks` and is shared by `Install` and `Installed` |
+| Hook/CI behavior | `hooks/hooks.go` — `HookDir` follows ONLY `core.hooksPath` (a bare `.husky` dir is inert; `huskyInactive` flags it so init/status say so). `hooks/hooks.go` (the shims) — they only ever call `guard check --hook=<phase>`; bump `shimVersion` on any body change or installed shims never upgrade. `HookDir` resolves `core.hooksPath` / husky / `.git/hooks` and is shared by `Install` and `Installed` |
 | Another ecosystem (PyPI) | new siblings of `registry`/`lockfile`/`scanner`; `main.go` orchestration is npm-shaped today |
 
 ## Invariants — do not break
@@ -230,7 +241,7 @@ the shared history.
 5. **Prompts default to NO** (EOF, garbage input → deny).
 6. **Approvals/policy are committed files** — changes are PR-reviewable security decisions.
 7. **The trace convicts only on no-build-excuse behavior** (network reach-out, real-secret access). Spawns and writes are context, never convictions — false positives train humans to disable the tool. New `trace` matchers must hold this line.
-8. **The strace log leaves the container on its STDOUT**, never through a shared file, and the pipe is **unreachable from the tracee** — it inherits no fd to it (`exec 1>&2`; strace's `-o` fd is CLOEXEC), and `/proc/<tracer>/fd` is root-only because `obsDockerfile` chmods strace to 0711, which makes the kernel mark the running tracer non-dumpable. So the trace can be neither truncated nor appended to by the tracee (guard's own 64 MiB cap is the only truncation, and it counts as unobserved). That is what makes the completion check meaningful: without the exec-only binary a tracee could write its own `+++ exited with 0 +++` (it knows its `$$`) and then `kill -9` the tracer. **Completion is proven, not assumed** — `strace -f -q` (never `-qq`) emits `<root pid> +++ exited with N +++`, and `box.traceComplete` requires that marker for the ROOT tracee (the pid on the first line; a child's marker is not enough). Missing, truncated, or unterminated ⇒ **unobserved**, never "observed clean"; `box.shouldDiscard` then drops the output under `untraced-boxed: fail`, or under ANY policy when the observer was killed or the trace was flooded past its cap (neither has a build-time excuse). `tracedScript` `exec`s strace so it is PID 1 — otherwise dash sits there, dumpable, with the trace pipe as fd 1 (`/proc/1/fd/1` forgery, verified live); PID 1 also cannot be SIGKILLed from inside the namespace, so the tracer is unkillable by the tracee. Changing `obsDockerfile` requires bumping `obsImage`'s tag or existing installs keep the old image.
+8. **The strace log leaves the container on its STDOUT**, never through a shared file, and the pipe is **unreachable from the tracee** — it inherits no fd to it (`exec 1>&2`; strace's `-o` fd is CLOEXEC), and `/proc/<tracer>/fd` is root-only because `obsDockerfile` chmods strace to 0111 (0711 leaves the owner read bit, so a box run as root stayed dumpable), which makes the kernel mark the running tracer non-dumpable. So the trace can be neither truncated nor appended to by the tracee (guard's own 64 MiB cap is the only truncation, and it counts as unobserved). That is what makes the completion check meaningful: without the exec-only binary a tracee could write its own `+++ exited with 0 +++` (it knows its `$$`) and then `kill -9` the tracer. **Completion is proven, not assumed** — `strace -f -q` (never `-qq`) emits `<root pid> +++ exited with N +++`, and `box.traceComplete` requires that marker for the ROOT tracee (the pid on the first line; a child's marker is not enough). Missing, truncated, or unterminated ⇒ **unobserved**, never "observed clean"; `box.shouldDiscard` then drops the output under `untraced-boxed: fail`, or under ANY policy when the observer was killed or the trace was flooded past its cap (neither has a build-time excuse). `tracedScript` `exec`s strace so it is PID 1 — otherwise dash sits there, dumpable, with the trace pipe as fd 1 (`/proc/1/fd/1` forgery, verified live); PID 1 also cannot be SIGKILLed from inside the namespace, so the tracer is unkillable by the tracee. Changing `obsDockerfile` requires bumping `obsImage`'s tag or existing installs keep the old image.
 
 ## Generated reference
 

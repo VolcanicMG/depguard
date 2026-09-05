@@ -149,7 +149,7 @@ describe.skipIf(!hasDocker())('the box', () => {
 describe.skipIf(!hasDocker())('prewarm + clean split', () => {
   const imagePresent = () => {
     try {
-      return execFileSync('docker', ['images', 'depguard-box:2', '--format', '{{.Repository}}'], { encoding: 'utf8' }).includes('depguard-box');
+      return execFileSync('docker', ['images', 'depguard-box:3', '--format', '{{.Repository}}'], { encoding: 'utf8' }).includes('depguard-box');
     } catch {
       return false;
     }
