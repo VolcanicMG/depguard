@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-1.2.0-2ea44f)
+![version](https://img.shields.io/badge/version-1.2.1-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
@@ -120,7 +120,7 @@ asset for your platform from the [latest release](../../releases/latest), drop i
 # 1. Install (Linux x86-64 shown — pick your asset from the release list)
 curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
 chmod +x guard && sudo mv guard /usr/local/bin/
-guard version                       # -> guard 1.2.0
+guard version                       # -> guard 1.2.1
 
 # 2. Protect a repo
 cd your-project

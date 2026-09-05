@@ -46,7 +46,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.2.0"
+const version = "1.2.1"
 
 func main() {
 	if len(os.Args) < 2 {
