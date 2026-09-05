@@ -34,11 +34,12 @@ func lines(raw []byte) []string {
 // It returns an error when a `packages:` section held content but NOTHING in it
 // parsed as a package key: an empty result there means "we didn't understand
 // this file", which must not be reported as "no dependencies to check".
-func parsePnpm(raw []byte) ([]Pkg, error) {
+func parsePnpm(raw []byte) ([]Pkg, int, error) {
 	var out []Pkg
 	curIdx := -1
 	inPackages := false
 	sawEntries := false
+	skipped := 0
 	for _, ln := range lines(raw) {
 		if ln == "" {
 			continue
@@ -62,6 +63,10 @@ func parsePnpm(raw []byte) ([]Pkg, error) {
 				out = append(out, Pkg{Name: name, Version: ver, FromRegistry: true})
 				curIdx = len(out) - 1
 			} else {
+				if !knownNonRegistryKey(key) {
+					skipped++ // a package key we did not understand — not a
+					// non-registry dep we meant to drop
+				}
 				curIdx = -1
 			}
 			continue
@@ -85,9 +90,25 @@ func parsePnpm(raw []byte) ([]Pkg, error) {
 		}
 	}
 	if sawEntries && len(out) == 0 {
-		return nil, errors.New("unrecognized pnpm-lock.yaml packages format")
+		return nil, 0, errors.New("unrecognized pnpm-lock.yaml packages format")
 	}
-	return out, nil
+	return out, skipped, nil
+}
+
+// knownNonRegistryKey reports whether a key splitPnpmKey rejected was one we
+// MEANT to drop — a git/link/file/http dep, which carries no registry identity
+// to check. Anything else is a shape we failed to understand, and silently
+// checking the rest of the lockfile while dropping it is how coverage rots.
+func knownNonRegistryKey(key string) bool {
+	// These appear as a prefix ("github.com/…") or after the version separator
+	// ("/local@link:../x"), so match anywhere. None of them can occur in a plain
+	// "name@version" key: a package name carries no ':' and no bare '/'.
+	for _, marker := range []string{"link:", "file:", "git+", "http:", "https:", "github.com/", "workspace:"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // pnpmField pulls `key: value` out of a resolution line, stopping at the next
@@ -198,7 +219,7 @@ func validPnpmName(name string) bool {
 // Like parsePnpm, it errors rather than returning an empty result when
 // descriptor lines were present but NOTHING got a version: "we didn't understand
 // this file" must never be reported as "no dependencies".
-func parseYarn(raw []byte) ([]Pkg, error) {
+func parseYarn(raw []byte) ([]Pkg, int, error) {
 	var out []Pkg
 	curIdx := -1
 	sawDescriptor := false
@@ -235,9 +256,17 @@ func parseYarn(raw []byte) ([]Pkg, error) {
 		}
 	}
 	if sawDescriptor && !anyVersioned(out) {
-		return nil, errors.New("unrecognized yarn.lock format (no entry carried a version)")
+		return nil, 0, errors.New("unrecognized yarn.lock format (no entry carried a version)")
 	}
-	return out, nil
+	// A descriptor that never got a version is an entry we read but could not
+	// identify — it drops out of every check, so the caller must be able to say so.
+	skipped := 0
+	for _, p := range out {
+		if p.Version == "" {
+			skipped++
+		}
+	}
+	return out, skipped, nil
 }
 
 // anyVersioned reports whether at least one parsed entry got a version.

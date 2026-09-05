@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-1.2.0-2ea44f)
+![version](https://img.shields.io/badge/version-1.2.1-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
@@ -120,7 +120,7 @@ asset for your platform from the [latest release](../../releases/latest), drop i
 # 1. Install (Linux x86-64 shown — pick your asset from the release list)
 curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
 chmod +x guard && sudo mv guard /usr/local/bin/
-guard version                       # -> guard 1.2.0
+guard version                       # -> guard 1.2.1
 
 # 2. Protect a repo
 cd your-project
@@ -238,14 +238,19 @@ re-verify). CI always keeps the strict block.
 | Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify (DSSE signature, Fulcio cert chain, tarball-digest binding, or a signer identity that doesn't belong to the GitHub source repo it claims) — i.e. a tampered or impersonated provenance claim. Non-GitHub sources report *not bound*, not tampered (`flag: [provenance]`) |
 | Maintainer-change | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 
-`guard check` scopes the cooldown re-check to the versions the current action
-**adds** — each version is vetted once, at the change that introduces it. What
-"adds" means depends on the phase, which the hook shim passes as `--hook=`:
-at **pre-commit** it is the working tree vs git HEAD; at **pre-push** it is the
-pushed commits vs what the remote already has (so a too-young version that got
-committed anyway — `GUARD_SKIP`, or a teammate without guard — is still caught on
-the way out). `--all` forces a full-tree sweep. The pre-push snapshots are read
-from `package-lock.json`, so that phase is npm-only.
+**Which lockfile gets checked.** Not the working tree — what git is about to act
+on. The hook shim passes `--hook=` (and `--remote=`), and every lockfile gate
+(advisories, integrity, licenses, provenance, cooldown) reads that snapshot: at
+**pre-commit** the **staged** lockfile, at **pre-push** the **pushed commits**
+(unioned across refs). `git add` a poisoned lockfile and edit the file back and a
+tree-based check sees nothing — this one doesn't. `guard check` by hand, and
+`guard install`, use the working tree.
+
+The cooldown re-check is additionally scoped to the versions the action **adds**,
+so each version is vetted once, at the change that introduces it: vs git HEAD at
+pre-commit, vs what that **specific remote** already has at pre-push (a branch
+already pushed to a fork is still new to upstream). `--all` forces a full-tree
+sweep.
 
 `guard install` runs these same lockfile gates (advisories → integrity →
 cooldown) **before** it replays any lifecycle script: node_modules is on disk, but

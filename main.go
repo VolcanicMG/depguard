@@ -46,7 +46,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.2.0"
+const version = "1.2.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -215,11 +215,14 @@ func cmdInit(args []string) error {
 	} else {
 		fmt.Fprintln(os.Stderr, "guard:", err, "— keeping it")
 	}
-	hookFiles, err := hooks.Install(dir, ci)
+	hookFiles, hookWarnings, err := hooks.Install(dir, ci)
 	if err != nil {
 		return err
 	}
 	wrote = append(wrote, hookFiles...)
+	for _, w := range hookWarnings {
+		fmt.Fprintf(os.Stderr, "guard: %s %s\n", ui.Warn(), w)
+	}
 
 	fmt.Println("depguard initialized:")
 	for _, f := range wrote {
@@ -466,10 +469,20 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 // filter and would otherwise only be caught later at commit/push. There is no
 // interactive confirm — install isn't the commit/push gate.
 func installGates(dir string, cfg config.Config, wf *waivers.File) error {
-	advErr := checkAdvisories(dir, cfg, false, false, wf)
-	intErr := checkLockfileIntegrity(dir, cfg, wf, false)
-	freshErr := checkFreshness(dir, cfg, false, false, false, wf, nil)
-	return firstErr(advErr, intErr, freshErr)
+	// The freshly resolved tree IS the working tree here — nothing is staged or
+	// pushed yet, so there is no other snapshot to judge.
+	snap := worktreeSnapshot(dir)
+	advErr := checkAdvisories(snap, cfg, false, false, wf)
+	intErr := checkLockfileIntegrity(snap, cfg, wf, false)
+	licErr := checkLicenses(snap, cfg, wf, false)
+	var provErr error
+	if cfg.Flagged("provenance") {
+		provErr = checkProvenance(snap, cfg, false)
+	}
+	freshErr := checkFreshness(snap, cfg, false, false, false, wf, nil, "")
+	// Same precedence as cmdCheck, so both commands agree on which finding owns
+	// the exit code.
+	return firstErr(advErr, intErr, licErr, provErr, freshErr)
 }
 
 // firstErr returns the first non-nil error, preserving gate precedence when
@@ -822,7 +835,7 @@ func runRootScripts(dir string) error {
 // npm, a teammate without it) still can't push a too-young version past a
 // commit or PR.
 func cmdCheck(args []string) error {
-	quiet, all, jsonOut, confirm, hook := parseCheckArgs(args)
+	quiet, all, jsonOut, confirm, hook, remote := parseCheckArgs(args)
 	dir, err := os.Getwd()
 	if err != nil {
 		return err
@@ -864,17 +877,25 @@ func cmdCheck(args []string) error {
 	if hook == "pre-push" && !stdinIsTTY() {
 		refs = parsePushRefs(os.Stdin)
 	}
-	if hook == "pre-commit" && !quiet {
-		warnStagedLockfileDiffers(dir)
+	// Every lockfile gate judges the SAME snapshot: the index at pre-commit, the
+	// pushed commits at pre-push, the working tree otherwise.
+	snap := hookSnapshot(dir, hook, refs)
+	if len(snap.refs) > 0 && !quiet {
+		if _, _, err := snap.pkgs(); err != nil && os.IsNotExist(err) {
+			if _, werr := lockfile.Installed(dir); werr == nil {
+				fmt.Fprintf(os.Stderr, "guard: note — no lockfile in the %s; the working tree has one that is not being %s.\n",
+					snap.label, map[bool]string{true: "committed", false: "pushed"}[hook == "pre-commit"])
+			}
+		}
 	}
-	secErr := checkSecrets(dir, cfg, wf, quiet, refs)
-	advErr := checkAdvisories(dir, cfg, quiet, confirm, wf)
-	freshErr := checkFreshness(dir, cfg, quiet, all, confirm, wf, refs)
-	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
-	licErr := checkLicenses(dir, cfg, wf, quiet)
+	secErr := checkSecrets(dir, cfg, wf, quiet, refs, remote)
+	advErr := checkAdvisories(snap, cfg, quiet, confirm, wf)
+	freshErr := checkFreshness(snap, cfg, quiet, all, confirm, wf, refs, remote)
+	intErr := checkLockfileIntegrity(snap, cfg, wf, quiet)
+	licErr := checkLicenses(snap, cfg, wf, quiet)
 	var provErr error
 	if cfg.Flagged("provenance") {
-		provErr = checkProvenance(dir, cfg, quiet)
+		provErr = checkProvenance(snap, cfg, quiet)
 	}
 	// Informational diff signals (never gate the commit/PR). Run here so a
 	// new-deps heads-up rides the same `guard check` the hooks already run.
@@ -927,7 +948,7 @@ func cmdCheck(args []string) error {
 // An unrecognized --hook= value yields "" rather than an error: a future shim
 // naming a phase this binary doesn't know must degrade to the plain check, not
 // break every commit in the repo.
-func parseCheckArgs(args []string) (quiet, all, jsonOut, confirm bool, hook string) {
+func parseCheckArgs(args []string) (quiet, all, jsonOut, confirm bool, hook, remote string) {
 	for _, a := range args {
 		switch {
 		case a == "--quiet":
@@ -945,6 +966,14 @@ func parseCheckArgs(args []string) (quiet, all, jsonOut, confirm bool, hook stri
 			switch v := strings.TrimPrefix(a, "--hook="); v {
 			case "pre-commit", "pre-push":
 				hook = v
+			}
+		case strings.HasPrefix(a, "--remote="):
+			// git hands the pre-push hook the remote NAME as $1. It scopes
+			// "what is outgoing" to the destination actually being pushed to.
+			// Anything not shaped like a remote name is ignored — it reaches
+			// git's argv.
+			if v := strings.TrimPrefix(a, "--remote="); remoteNameRe.MatchString(v) {
+				remote = v
 			}
 		}
 	}
@@ -1006,6 +1035,9 @@ type CheckResult struct {
 	// clean. Surfacing it is what keeps --json/MCP from hiding an outage.
 	Degraded []string `json:"degraded,omitempty"`
 	OK       bool     `json:"ok"`
+	// provenanceInvalid counts INVALID attestations; unexported because the
+	// details already ride in Provenance and only the verdict needs the count.
+	provenanceInvalid int
 }
 
 // ─── waiver identity + filtering ─────────────────────────────────────────────
@@ -1123,6 +1155,20 @@ func partitionBySeverity(vulns []advisory.Vuln, threshold advisory.Severity) (bl
 	return blockers, warnings
 }
 
+// finalOK is the ONE place the overall verdict is computed, so every return path
+// out of gatherCheck agrees. The early "no lockfile" return used to decide on
+// secrets alone, which quietly ignored on-check-error: fail with a non-empty
+// Degraded — a repo with no deps could report ok:true after a check that did not
+// run.
+func finalOK(res CheckResult, cfg config.Config) bool {
+	if cfg.OnCheckErrorFail && len(res.Degraded) > 0 {
+		return false // a check that could not COMPLETE is not a pass
+	}
+	return len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 &&
+		len(res.Unhashed) == 0 && len(res.Conflicting) == 0 && len(res.License) == 0 &&
+		len(res.Secrets) == 0 && res.provenanceInvalid == 0
+}
+
 // gatherCheck runs every check over the lockfile and returns the structured
 // result WITHOUT printing — the single source of truth behind both
 // `guard check --json` and the MCP check tool. The human-prose path in
@@ -1156,7 +1202,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No deps to vet, but a tracked secret still gates.
-			res.OK = len(res.Secrets) == 0
+			res.OK = finalOK(res, cfg)
 			return res, nil
 		}
 		return res, err
@@ -1277,13 +1323,8 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	}
 	// res.Advisories is blockers-only (warnings live in AdvisoryWarnings and do
 	// not gate), so OK keys off it directly.
-	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 &&
-		len(res.Unhashed) == 0 && len(res.Conflicting) == 0 && len(res.License) == 0 &&
-		len(res.Secrets) == 0 && invalidProv == 0
-	// Under on-check-error: fail a check that could not COMPLETE is not a pass.
-	if cfg.OnCheckErrorFail && len(res.Degraded) > 0 {
-		res.OK = false
-	}
+	res.provenanceInvalid = invalidProv
+	res.OK = finalOK(res, cfg)
 	return res, nil
 }
 
@@ -1295,8 +1336,8 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 // tarballs or hashes (Conflict). Only internal-scope names are exempt from the
 // host check — they are declared to live on a private registry. `allow:` is a
 // cooldown escape hatch and exempts NOTHING here. Gates like the advisory layer.
-func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
-	pkgs, err := lockfile.Installed(dir)
+func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, quiet bool) error {
+	pkgs, degraded, err := gatePkgs(snap, cfg)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1344,10 +1385,10 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 		}
 	}
 	if len(offReg) == 0 && len(noHash) == 0 && len(conflict) == 0 {
-		if !quiet {
-			fmt.Printf("guard: lockfile integrity ok (%d version(s)) %s\n", len(pkgs), ui.OK())
+		if !quiet && degraded == nil {
+			fmt.Printf("guard: lockfile integrity ok (%d version(s), %s) %s\n", len(pkgs), snap.label, ui.OK())
 		}
-		return nil
+		return degraded
 	}
 	if len(offReg) > 0 {
 		fmt.Fprintf(os.Stderr, "guard: %d lockfile entr(ies) resolve OFF the configured registry:\n", len(offReg))
@@ -1547,8 +1588,9 @@ func reportNewDeps(dir string, quiet bool) {
 // (GUARD_SKIP, or a teammate without guard) is invisible to a HEAD diff yet is
 // exactly what the push transmits. Comparing against the remote catches it.
 // npm-only — the ref snapshots come from package-lock.json.
-func checkFreshness(dir string, cfg config.Config, quiet, all, confirm bool, wf *waivers.File, refs []pushRef) error {
-	pkgs, err := lockfile.Installed(dir)
+func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, wf *waivers.File, refs []pushRef, remote string) error {
+	dir := snap.dir
+	pkgs, _, err := snap.pkgs()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1569,7 +1611,7 @@ func checkFreshness(dir string, cfg config.Config, quiet, all, confirm bool, wf 
 		// ok is false when no pushed commit had a package-lock.json at all (a
 		// pnpm/yarn repo): fall through to the working-tree view rather than
 		// checking nothing.
-		if np, s, ok := pushNewVersions(dir, refs); ok {
+		if np, s, ok := pushNewVersions(dir, refs, remote); ok {
 			pkgs, scope, scoped = np, s, true
 		}
 	}
@@ -1834,12 +1876,88 @@ func headLockfile(dir string) ([]lockfile.Pkg, bool) { return refLockfile(dir, "
 // refLockfile parses package-lock.json as it exists at a git ref — "HEAD", a
 // sha, or "<sha>^" — without checking anything out. npm-only: InstalledBytes
 // reads npm's lockfile shape, so pnpm/yarn repos fall back to the full tree.
-func refLockfile(dir, ref string) ([]lockfile.Pkg, bool) {
-	out, err := gitOutput(dir, "show", ref+":package-lock.json")
-	if err != nil {
-		return nil, false
+// snapshot names the lockfile state a set of gates must judge. The working tree
+// is NOT that state during a hook: at pre-commit git records the INDEX, and at
+// pre-push it transmits the pushed COMMITS. Checking the tree instead let a
+// staged-but-different lockfile through every gate.
+type snapshot struct {
+	dir string
+	// refs are git refs to read the lockfile from — ":" is the index, a sha is
+	// that commit. Empty means the working tree.
+	refs []string
+	// label says which snapshot this is, for the checkers' own output.
+	label string
+}
+
+// worktreeSnapshot is the plain "what is on disk" view — `guard check` run by
+// hand, `guard install`, and the --json/MCP path.
+func worktreeSnapshot(dir string) snapshot { return snapshot{dir: dir, label: "working tree"} }
+
+// hookSnapshot picks the state the named git phase is actually about to act on.
+func hookSnapshot(dir, hook string, refs []pushRef) snapshot {
+	switch {
+	case hook == "pre-commit":
+		return snapshot{dir: dir, refs: []string{":"}, label: "staged lockfile"}
+	case hook == "pre-push" && len(refs) > 0:
+		var shas []string
+		for _, r := range refs {
+			shas = append(shas, r.localSHA)
+		}
+		return snapshot{dir: dir, refs: shas, label: "pushed commits"}
+	default:
+		return worktreeSnapshot(dir)
 	}
-	prev, err := lockfile.InstalledBytes([]byte(out))
+}
+
+// pkgs returns the distinct name@version set for this snapshot — the union
+// across refs when a push carries several — plus how many lockfile entries the
+// parsers could not recognize.
+//
+// A ref with no lockfile at all is skipped rather than fatal (a branch that
+// predates the lockfile); os.ErrNotExist comes back only when NO ref had one.
+func (s snapshot) pkgs() ([]lockfile.Pkg, int, error) {
+	if len(s.refs) == 0 {
+		return lockfile.InstalledAt(s.dir, "")
+	}
+	var sets [][]lockfile.Pkg
+	skipped := 0
+	for _, ref := range s.refs {
+		p, n, err := lockfile.InstalledAt(s.dir, ref)
+		if os.IsNotExist(err) {
+			continue // this ref carries no lockfile; others may
+		}
+		if err != nil {
+			// A lockfile that EXISTS but can't be parsed is not "nothing to
+			// check" — fail closed like the working-tree path does.
+			return nil, 0, fmt.Errorf("%s: %w", ref, err)
+		}
+		sets = append(sets, p)
+		skipped += n
+	}
+	if len(sets) == 0 {
+		return nil, 0, os.ErrNotExist
+	}
+	return lockfile.Union(sets...), skipped, nil
+}
+
+// gatePkgs is the shared front door for every lockfile gate: the snapshot's
+// package set, with an unreadable-entry count reported through the
+// on-check-error policy so a partially-understood lockfile can gate.
+func gatePkgs(s snapshot, cfg config.Config) ([]lockfile.Pkg, error, error) {
+	pkgs, skipped, err := s.pkgs()
+	if err != nil {
+		return nil, nil, err
+	}
+	var degraded error
+	if skipped > 0 {
+		degraded = cfg.Degrade("lockfile parse",
+			fmt.Errorf("%d unrecognized entr(ies) skipped in the %s", skipped, s.label))
+	}
+	return pkgs, degraded, nil
+}
+
+func refLockfile(dir, ref string) ([]lockfile.Pkg, bool) {
+	prev, _, err := lockfile.InstalledAt(dir, ref)
 	if err != nil {
 		return nil, false
 	}
@@ -1896,6 +2014,10 @@ func isZeroSHA(s string) bool {
 	return len(s) >= 40 && len(s) <= 64 && strings.Trim(s, "0") == ""
 }
 
+// remoteNameRe is what we accept as a git remote name. The value arrives from
+// the hook's argv and is passed back to git, so it is validated, not trusted.
+var remoteNameRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`) // `/` is legal in a remote name and inert in a --remotes= glob
+
 // isSHA validates an object id from the hook's stdin: 40 hex (sha1) to 64 hex
 // (sha256), nothing else. These values are concatenated into git ARGUMENTS, so
 // an unvalidated one is an argument-injection surface — "--output=…" is a
@@ -1935,16 +2057,31 @@ func parsePushRefs(r io.Reader) []pushRef {
 // exactly the commits the push transmits: a "<remote>..<local>" range for a
 // branch the remote already has, and "<local> --not --remotes" for a new one
 // (everything reachable from it that no remote branch already holds).
-func outgoingRevArgs(refs []pushRef) [][]string {
+func outgoingRevArgs(refs []pushRef, remote string) [][]string {
 	var out [][]string
 	for _, r := range refs {
 		if isZeroSHA(r.remoteSHA) {
-			out = append(out, []string{r.localSHA, "--not", "--remotes"})
+			out = append(out, append([]string{r.localSHA, "--not"}, notRemotes(remote)...))
 		} else {
 			out = append(out, []string{r.remoteSHA + ".." + r.localSHA})
 		}
 	}
 	return out
+}
+
+// notRemotes excludes what the DESTINATION already has. Scoping to the named
+// remote matters: "--remotes" excludes commits present on ANY remote, so a
+// branch already pushed to a fork would be treated as nothing-new when pushed to
+// the real upstream for the first time — the exact case a review gate must catch.
+//
+// When the named remote has no tracking refs yet, this excludes nothing and
+// rev-list yields the branch's whole history: a full scan, which is the
+// conservative direction to be wrong in.
+func notRemotes(remote string) []string {
+	if remote == "" {
+		return []string{"--remotes"}
+	}
+	return []string{"--remotes=" + remote}
 }
 
 // pushBaseRef picks the freshness comparison base for one pushed ref: the state
@@ -1954,11 +2091,11 @@ func outgoingRevArgs(refs []pushRef) [][]string {
 //
 // Returns ("", false) when nothing is outgoing, and ("", true) when there is no
 // base at all (a root commit) — then the whole tree counts as new.
-func pushBaseRef(dir string, r pushRef) (base string, full bool) {
+func pushBaseRef(dir string, r pushRef, remote string) (base string, full bool) {
 	if !isZeroSHA(r.remoteSHA) {
 		return r.remoteSHA, false
 	}
-	out, err := gitOutput(dir, "rev-list", r.localSHA, "--not", "--remotes")
+	out, err := gitOutput(dir, append([]string{"rev-list", r.localSHA, "--not"}, notRemotes(remote)...)...)
 	if err != nil {
 		return "", true
 	}
@@ -1982,7 +2119,7 @@ func pushBaseRef(dir string, r pushRef) (base string, full bool) {
 // ok is false when NO pushed commit carried a package-lock.json — a pnpm/yarn
 // repo, where these snapshots don't exist. The caller then falls back to the
 // working-tree scope instead of silently checking an empty set.
-func pushNewVersions(dir string, refs []pushRef) (pkgs []lockfile.Pkg, scope string, ok bool) {
+func pushNewVersions(dir string, refs []pushRef, remote string) (pkgs []lockfile.Pkg, scope string, ok bool) {
 	seen := map[string]bool{}
 	var out []lockfile.Pkg
 	scope = "nothing outgoing"
@@ -1993,7 +2130,7 @@ func pushNewVersions(dir string, refs []pushRef) (pkgs []lockfile.Pkg, scope str
 			continue // no npm lockfile at that commit — nothing to compare
 		}
 		sawSnapshot = true
-		base, full := pushBaseRef(dir, r)
+		base, full := pushBaseRef(dir, r, remote)
 		add := cur
 		switch {
 		case full:
@@ -2020,22 +2157,6 @@ func pushNewVersions(dir string, refs []pushRef) (pkgs []lockfile.Pkg, scope str
 	return out, scope, sawSnapshot
 }
 
-// warnStagedLockfileDiffers notes when the STAGED package-lock.json differs from
-// the working-tree copy the checks actually read. Informational only: the
-// working tree is the right thing to check at pre-commit, but the human should
-// know the snapshot being committed isn't byte-identical to it.
-func warnStagedLockfileDiffers(dir string) {
-	staged, err := gitOutput(dir, "show", ":package-lock.json")
-	if err != nil {
-		return
-	}
-	wt, err := os.ReadFile(filepath.Join(dir, "package-lock.json"))
-	if err != nil || string(wt) == staged {
-		return
-	}
-	fmt.Fprintln(os.Stderr, "guard: note — checks ran on the working-tree package-lock.json; the STAGED copy differs.")
-}
-
 // activeLicense drops license violations an active waiver suppresses, recording
 // each suppressed ID in *waived. Mirrors activeAdvisories/activeCooldown.
 func activeLicense(viol []license.Violation, wf *waivers.File, now time.Time, waived *[]string) []license.Violation {
@@ -2055,10 +2176,17 @@ func activeLicense(viol []license.Violation, wf *waivers.File, now time.Time, wa
 // a no-op when neither list is set. Reads node_modules for each package's
 // declared license; a missing tree DEGRADES the check (warned, never silently
 // green) rather than gating. Non-waived violations fail the commit/PR.
-func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
+func checkLicenses(snap snapshot, cfg config.Config, wf *waivers.File, quiet bool) error {
+	dir := snap.dir
 	if len(cfg.LicenseDeny) == 0 && len(cfg.LicenseAllow) == 0 {
 		return nil // gate disabled
 	}
+	// The license gate is WORKING-TREE shaped, unavoidably: it reads each
+	// package's own package.json out of node_modules, and node_modules only ever
+	// reflects the tree. Pairing a staged or pushed lockfile's paths with
+	// on-disk files would just report "incomplete" for every entry that differs.
+	// So this one gate ignores snap and reads the tree — declared here and in
+	// DESIGN §3 rather than silently approximated.
 	entries, err := lockfile.InstalledPaths(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2115,8 +2243,8 @@ func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) 
 // attestations are not reported and never gate. A fetch/parse that couldn't
 // complete is reported as DEGRADED (visible, never gating) — distinct from a
 // clean "none published" so a transient/hostile failure isn't read as absence.
-func checkProvenance(dir string, cfg config.Config, quiet bool) error {
-	pkgs, err := lockfile.Installed(dir)
+func checkProvenance(snap snapshot, cfg config.Config, quiet bool) error {
+	pkgs, _, err := snap.pkgs()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -2162,18 +2290,20 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 
 // checkAdvisories queries OSV for every installed version and fails when any
 // advisory hits — the "installed last month, reported yesterday" recovery layer.
-func checkAdvisories(dir string, cfg config.Config, quiet, confirm bool, wf *waivers.File) error {
+func checkAdvisories(snap snapshot, cfg config.Config, quiet, confirm bool, wf *waivers.File) error {
+	dir := snap.dir
 	threshold := cfg.AdvisoryThreshold
-	pkgs, err := lockfile.Installed(dir)
+	pkgs, degraded, err := gatePkgs(snap, cfg)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if !quiet {
-				fmt.Println("guard: no package-lock.json here — nothing to check")
+				fmt.Printf("guard: no lockfile in the %s — nothing to check\n", snap.label)
 			}
 			return nil
 		}
 		return err
 	}
+	_ = degraded // reported once, by the integrity gate
 	vulns, err := advisory.Check(pkgs)
 	if err != nil {
 		// Advisory feed unreachable: report, don't block work on a network blip
@@ -2296,7 +2426,7 @@ func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File)
 // secret can't be uploaded. A git error (not a repo, git missing) is fail-open
 // and logged: there's no upload surface to assert about. A deliberate match is
 // waived per-path with 'guard ignore secret:<path>'.
-func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool, refs []pushRef) error {
+func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool, refs []pushRef, remote string) error {
 	if len(cfg.SecretPaths) == 0 {
 		return nil
 	}
@@ -2313,7 +2443,7 @@ func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool, r
 	// can say "rewrite + rotate", not "git rm --cached".
 	var histErr error
 	if len(refs) > 0 {
-		hist, herr := secrets.FindOutgoing(dir, cfg.SecretPaths, outgoingRevArgs(refs))
+		hist, herr := secrets.FindOutgoing(dir, cfg.SecretPaths, outgoingRevArgs(refs, remote))
 		// A range we could not read is "I did not look", not "nothing there" —
 		// a shallow clone fails every range. Report it (and gate under
 		// on-check-error: fail) while still using whatever we did find.
@@ -2847,7 +2977,11 @@ func cmdStatus(args []string) error {
 	row("hook dir", ui.Dim(rel))
 	row("CI PR gate", boolState(st.CIWorkflow, "installed", "not installed (guard init --ci)"))
 	if st.Husky {
-		row("husky", ui.OK()+" detected (depguard chained onto it)")
+		if st.HuskyInactive {
+			row("husky", ui.Warn()+" .husky present but core.hooksPath is unset — git uses .git/hooks, not husky")
+		} else {
+			row("husky", ui.OK()+" detected (depguard chained onto it)")
+		}
 	}
 
 	// Sandbox

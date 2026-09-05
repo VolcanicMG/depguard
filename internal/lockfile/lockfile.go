@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -77,38 +78,95 @@ func InstalledPaths(dir string) ([]Entry, error) {
 // three package managers; `guard install` itself remains npm-shaped because it
 // shells out to npm.
 func Installed(dir string) ([]Pkg, error) {
-	if raw, err := os.ReadFile(filepath.Join(dir, "package-lock.json")); err == nil {
+	pkgs, _, err := InstalledAt(dir, "")
+	return pkgs, err
+}
+
+// lockfileNames is the search order for "which lockfile does this project use".
+var lockfileNames = []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+
+// InstalledAt is Installed for a specific git ref: "" reads the WORKING TREE,
+// ":" reads the index (what a commit would contain), and a sha reads that
+// commit. The hooks need this because the working tree is not what git is about
+// to record or transmit — checking it lets a staged-but-different lockfile
+// through the gates entirely.
+//
+// It also returns how many lockfile entries the parser could not recognize, so
+// the caller can report an incompletely-understood lockfile instead of quietly
+// checking a subset of it.
+func InstalledAt(dir, ref string) (pkgs []Pkg, skipped int, err error) {
+	for _, name := range lockfileNames {
+		raw, rerr := readLockfile(dir, ref, name)
+		if rerr != nil {
+			continue
+		}
+		return parseNamed(name, raw)
+	}
+	return nil, 0, os.ErrNotExist // no recognized lockfile — callers treat as "nothing to check"
+}
+
+// readLockfile reads one lockfile from the working tree (ref "") or from git.
+func readLockfile(dir, ref, name string) ([]byte, error) {
+	if ref == "" {
+		return os.ReadFile(filepath.Join(dir, name))
+	}
+	// A trailing ':' is already the separator ("" ref + ':' is git's spelling of
+	// the index), so don't double it.
+	return exec.Command("git", "-C", dir, "show", strings.TrimSuffix(ref, ":")+":"+name).Output()
+}
+
+// parseNamed dispatches on the lockfile's FILENAME — the only thing that
+// identifies the format when the bytes come from git rather than from disk.
+func parseNamed(name string, raw []byte) (pkgs []Pkg, skipped int, err error) {
+	switch filepath.Base(name) {
+	case "pnpm-lock.yaml":
+		p, n, perr := parsePnpm(raw)
+		if perr != nil {
+			return nil, 0, perr
+		}
+		return dedupePkgs(p), n, nil
+	case "yarn.lock":
+		p, n, perr := parseYarn(raw)
+		if perr != nil {
+			return nil, 0, perr
+		}
+		return dedupePkgs(p), n, nil
+	default:
 		entries, perr := parseBytes(raw)
 		if perr != nil {
-			return nil, perr
+			return nil, 0, perr
 		}
-		return dedupe(entries), nil
+		return dedupe(entries), 0, nil
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "pnpm-lock.yaml")); err == nil {
-		pkgs, perr := parsePnpm(raw)
-		if perr != nil {
-			return nil, perr
+}
+
+// Union folds several snapshots (one per pushed ref) into one distinct
+// name@version set. Unlike dedupe it does NOT derive conflicts: see mergeAcross.
+func Union(sets ...[]Pkg) []Pkg {
+	at := map[string]int{}
+	var out []Pkg
+	for _, set := range sets {
+		for _, p := range set {
+			if p.Name == "" || p.Version == "" {
+				continue
+			}
+			if i, ok := at[p.Key()]; ok {
+				mergeAcross(&out[i], p)
+				continue
+			}
+			at[p.Key()] = len(out)
+			out = append(out, p)
 		}
-		return dedupePkgs(pkgs), nil
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "yarn.lock")); err == nil {
-		pkgs, perr := parseYarn(raw)
-		if perr != nil {
-			return nil, perr
-		}
-		return dedupePkgs(pkgs), nil
-	}
-	return nil, os.ErrNotExist // no recognized lockfile — callers treat as "nothing to check"
+	sort.Slice(out, func(i, j int) bool { return out[i].Key() < out[j].Key() })
+	return out
 }
 
 // InstalledBytes parses lockfile content directly — used to diff the staged
 // lockfile against the one in git HEAD without checking files out.
 func InstalledBytes(raw []byte) ([]Pkg, error) {
-	entries, err := parseBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-	return dedupe(entries), nil
+	pkgs, _, err := parseNamed("package-lock.json", raw)
+	return pkgs, err
 }
 
 // dedupe flattens entries to distinct name@version pairs, preserving every
@@ -142,26 +200,46 @@ func dedupe(entries []Entry) []Pkg {
 
 // merge folds a duplicate record of the same name@version into the survivor.
 // It is a UNION, not a first-wins pick: an omitted field is filled in from the
-// duplicate, and only two non-empty differing values are a Conflict.
+// duplicate. Resolved may legitimately be absent (pnpm records no tarball URL),
+// so empty-vs-set is no contradiction there; Integrity may not (see below).
 //
 // Collapsing by "first wins" was a gate bypass. A crafted lockfile could add an
 // information-EMPTY duplicate (`{"version":"6.0.0"}`) at a path that sorts
 // first; the real record — the one with the evil tarball URL and the hash — was
 // discarded, the survivor had neither, checkableDep went false, and BOTH
 // integrity checks skipped the package while printing "integrity ok".
-func merge(dst *Pkg, src Pkg) {
+func merge(dst *Pkg, src Pkg) { mergeInto(dst, src, true) }
+
+// mergeAcross folds a record from a DIFFERENT snapshot (another pushed ref) into
+// the survivor. It unions the fields and carries over a conflict already found
+// inside a ref, but derives no new ones: two lockfiles that are each internally
+// consistent are allowed to disagree with each other. Branch A predating a hash
+// that branch B added is ordinary history, not a corrupt lockfile — and since
+// the conflict verdict is unwaivable, inventing one there is a dead end blaming
+// a file that is fine.
+func mergeAcross(dst *Pkg, src Pkg) { mergeInto(dst, src, false) }
+
+func mergeInto(dst *Pkg, src Pkg, sameFile bool) {
 	if dst.Resolved == "" {
 		dst.Resolved = src.Resolved
-	} else if src.Resolved != "" && src.Resolved != dst.Resolved {
+	} else if sameFile && src.Resolved != "" && src.Resolved != dst.Resolved {
 		dst.Conflict = true
 	}
-	if dst.Integrity == "" {
+	// Integrity is different from Resolved: a registry dep is hashed at EVERY
+	// path it appears, so an occurrence without a hash is not "less information",
+	// it is the unhashed finding. Filling it in from a sibling hid exactly that.
+	// The value is still unioned so the survivor stays checkable, but the
+	// disagreement is recorded.
+	if dst.Integrity == "" && src.Integrity != "" {
 		dst.Integrity = src.Integrity
-	} else if src.Integrity != "" && src.Integrity != dst.Integrity {
+		dst.Conflict = dst.Conflict || sameFile
+	} else if sameFile && src.Integrity != dst.Integrity {
 		dst.Conflict = true
 	}
-	// Either record proving this is a registry dep is enough to keep it in scope.
+	// Either record proving this is a registry dep is enough to keep it in scope,
+	// and a conflict seen in either input survives the fold.
 	dst.FromRegistry = dst.FromRegistry || src.FromRegistry
+	dst.Conflict = dst.Conflict || src.Conflict
 }
 
 // dedupePkgs is dedupe for parsers (pnpm/yarn) that already produce []Pkg.
@@ -202,6 +280,13 @@ func parseBytes(raw []byte) ([]Entry, error) {
 			Version   string `json:"version"`
 			Resolved  string `json:"resolved"`
 			Integrity string `json:"integrity"`
+			// InBundle: this copy ships INSIDE its parent's tarball, so npm
+			// records no resolved/integrity for it — the parent's hash already
+			// covers the bytes.
+			InBundle bool `json:"inBundle"`
+			// Link: a symlink to a workspace or a local path; no registry
+			// identity to check at all.
+			Link bool `json:"link"`
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal(raw, &lock); err != nil {
@@ -215,6 +300,19 @@ func parseBytes(raw []byte) ([]Entry, error) {
 	for path, p := range lock.Packages {
 		if path == "" || p.Version == "" {
 			continue // "" is the root project itself
+		}
+		// A bundled copy and a link are not independently-fetched packages:
+		// neither carries a resolved URL or a hash, by design. Treating them as
+		// occurrences of the name would make every bundling package's tree look
+		// self-contradictory (hashed at one path, hashless at the bundled one) —
+		// and that verdict is unwaivable, so the repo could not be committed at
+		// all, while the advice ("npm install regenerates consistent entries")
+		// reproduces the very same lockfile.
+		// inBundle is attacker-writable, so trust the SHAPE, not the flag: a
+		// genuine bundled copy records neither a URL nor a hash. An entry that
+		// claims inBundle but carries a fetchable resolved/integrity is checked.
+		if p.Link || (p.InBundle && p.Resolved == "" && p.Integrity == "") {
+			continue
 		}
 		// The package name is everything after the LAST "node_modules/",
 		// which handles nested deps like "node_modules/a/node_modules/b".

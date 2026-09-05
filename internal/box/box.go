@@ -49,8 +49,9 @@ const buildImage = "node:20.20.2@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2
 // The tag is VERSIONED: EnsureObsImage reuses whatever is already local, so a
 // change to obsDockerfile that isn't accompanied by a bump here would leave
 // every existing install silently running the old recipe. :2 added the
-// non-dumpable strace below.
-const obsImage = "depguard-box:2"
+// non-dumpable strace below; :3 tightened it from 0711 to 0111 so it holds for a
+// box run as root too.
+const obsImage = "depguard-box:3"
 
 // obsDockerfile builds obsImage. Kept in source (not a file) so the binary
 // stays self-contained and the recipe is reviewable right here.
@@ -59,16 +60,24 @@ const obsImage = "depguard-box:2"
 // own pid, so it can WRITE a forged completion marker into the trace
 // ("printf '%d +++ exited with 0 +++' $$ > /proc/<tracer>/fd/1") and only then
 // kill the tracer — defeating any check made on the trace's contents alone.
-// Making the strace binary root-owned and execute-only (0711, no read bit)
-// causes the kernel to mark the running strace process NON-DUMPABLE, which flips
-// /proc/<tracer>/ to root:root dr-x------. The tracee runs as an ordinary uid, so
-// its fds are unreachable: writing there is EACCES, reading is EACCES. Combined
-// with the tracee holding no inherited fd to the trace pipe (`exec 1>&2` replaces
-// fd 1, and strace's -o fd is CLOEXEC), the trace becomes genuinely
-// write-unreachable — which is what makes the completion marker trustworthy.
+// Making the strace binary execute-only causes the kernel to mark the running
+// strace process NON-DUMPABLE, which flips /proc/<tracer>/ to root:root
+// dr-x------ so the tracee cannot reach the tracer's fds: writing is EACCES,
+// reading is EACCES. Combined with the tracee holding no inherited fd to the
+// trace pipe (`exec 1>&2` replaces fd 1, and strace's -o fd is CLOEXEC), the
+// trace becomes genuinely write-unreachable — which is what makes the completion
+// marker trustworthy.
+//
+// The mode is 0111, not 0711: with 0711 the OWNER keeps the read bit, so a box
+// run as root (`sudo guard`, a root CI runner — the box runs as the INVOKING
+// uid) left strace dumpable and the forgery worked again. At 0111 nobody has the
+// read bit, and uid 0 inside the box has no CAP_DAC_OVERRIDE to bypass it
+// (--cap-drop ALL), so the tracer is non-dumpable for every uid. The same
+// cap-drop removes CAP_SYS_PTRACE, which ptrace_may_access would otherwise let
+// root use to reach a non-dumpable process's /proc entries.
 const obsDockerfile = `FROM ` + buildImage + `
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends strace && rm -rf /var/lib/apt/lists/*
-RUN chmod 0711 /usr/bin/strace
+RUN chmod 0111 /usr/bin/strace
 `
 
 // seccompProfile blocks the syscalls that would let a script either evade the
@@ -599,8 +608,15 @@ func RunUncontained(pkgDir string) (Result, error) {
 		`for s in preinstall install postinstall; do npm run "$s" --if-present --foreground-scripts || exit $?; done`)
 	cmd.Dir = pkgDir
 	cmd.Env = scrubbedEnv()
-	out, runErr := cmd.CombinedOutput()
-	res := Result{Output: string(out)}
+	// Bounded like the boxed path: an uncontained script's output is even less
+	// trustworthy, so it must not sit in an unbounded host-side buffer either.
+	outBuf := &capWriter{max: maxScriptOutput}
+	cmd.Stdout, cmd.Stderr = outBuf, outBuf
+	runErr := cmd.Run()
+	res := Result{Output: outBuf.String()}
+	if outBuf.truncated {
+		res.Truncated = append(res.Truncated, "output")
+	}
 	if exitErr, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = exitErr.ExitCode()
 	} else if runErr != nil {

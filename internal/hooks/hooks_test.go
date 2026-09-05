@@ -155,6 +155,12 @@ func TestShimIsPhaseAware(t *testing.T) {
 	if !strings.Contains(shimBody, `--hook="${0##*/}"`) {
 		t.Error("shim body does not pass --hook= (the check can't tell pre-commit from pre-push)")
 	}
+	if !strings.Contains(shimBody, `--remote="$1"`) {
+		t.Error("shim body does not pass --remote=$1 (the pre-push scan can't scope to the destination)")
+	}
+	if !strings.Contains(shimBody, `--remote="$1"`) {
+		t.Error("shim body does not pass --remote=$1 (the pre-push scan can't scope to the destination)")
+	}
 	if shimVersion != "3" {
 		t.Errorf("shimVersion = %q, want 3 — a body change must bump it or installed shims never upgrade", shimVersion)
 	}
@@ -210,7 +216,7 @@ func TestHookDirFollowsCoreHooksPath(t *testing.T) {
 	if got, want := HookDir(dir), filepath.Join(dir, "myhooks"); got != want {
 		t.Fatalf("HookDir = %q, want %q", got, want)
 	}
-	if _, err := Install(dir, false); err != nil {
+	if _, _, err := Install(dir, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "myhooks", "pre-commit")); err != nil {
@@ -290,5 +296,110 @@ func TestHookDirRelativePathResolvesFromRepoRoot(t *testing.T) {
 	want := filepath.Join(repoRoot(dir), "myhooks")
 	if got := HookDir(sub); got != want {
 		t.Errorf("HookDir(subdir) = %q, want %q (relative hooksPath is repo-root relative)", got, want)
+	}
+}
+
+// husky only takes effect by setting core.hooksPath. A bare .husky dir — a
+// half-finished setup, or one committed by a teammate who never ran `husky
+// install` — is NOT where git looks, so installing there wrote a shim nowhere
+// and then reported the repo protected.
+func TestHookDirIgnoresInactiveHusky(t *testing.T) {
+	dir := gitRepo(t, "")
+	if err := os.MkdirAll(filepath.Join(dir, ".husky"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := HookDir(dir), filepath.Join(dir, ".git", "hooks"); got != want {
+		t.Errorf("HookDir = %q, want %q — .husky without core.hooksPath is inert", got, want)
+	}
+	if !huskyInactive(dir) {
+		t.Error("huskyInactive = false, so nothing would warn the user")
+	}
+	_, warnings, err := Install(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, w := range warnings {
+		if strings.Contains(w, "husky") && strings.Contains(w, ".git/hooks") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Install warnings = %v, want one about the inactive husky dir", warnings)
+	}
+	// The shim really landed where git reads.
+	if !Installed(dir).PreCommit {
+		t.Error("no pre-commit shim in .git/hooks")
+	}
+	// And with core.hooksPath actually set, husky IS honoured.
+	active := gitRepo(t, ".husky")
+	if err := os.MkdirAll(filepath.Join(active, ".husky"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := HookDir(active), filepath.Join(active, ".husky"); got != want {
+		t.Errorf("HookDir(active husky) = %q, want %q", got, want)
+	}
+	if huskyInactive(active) {
+		t.Error("huskyInactive = true for a repo that really uses husky")
+	}
+}
+
+// Appending after an unconditional `exit` writes a block that never runs. We
+// still append — rewriting someone's hook is not our call — but silence there
+// would leave the repo looking protected while nothing fires.
+func TestInstallWarnsOnTrailingExit(t *testing.T) {
+	dir := gitRepo(t, "")
+	hookDir := filepath.Join(dir, ".git", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "#!/bin/sh\nrun-my-linter\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(hookDir, "pre-commit"), []byte(foreign), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, warnings, err := Install(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, w := range warnings {
+		if strings.Contains(w, "pre-commit") && strings.Contains(w, "exit") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Install warnings = %v, want one about the trailing exit", warnings)
+	}
+	// Appended anyway — we warn, we don't rewrite.
+	b, _ := os.ReadFile(filepath.Join(hookDir, "pre-commit"))
+	if !strings.Contains(string(b), "run-my-linter") || !hasCurrentShim(string(b)) {
+		t.Error("the foreign hook was clobbered, or our block was not appended")
+	}
+}
+
+func TestEndsUnconditionalExit(t *testing.T) {
+	cases := map[string]bool{
+		"#!/bin/sh\nfoo\nexit 0\n":               true,
+		"#!/bin/sh\nfoo\nexit 0   \n":            true, // trailing space is not indentation
+		"#!/bin/sh\nfoo\nexit\n":                 true,
+		"#!/bin/sh\nfoo\nexit 1\n\n# trailing\n": true, // comments/blanks don't count
+		"#!/bin/sh\nfoo\n":                       false,
+		"#!/bin/sh\nif x; then\n  exit 1\nfi\n":  false, // indented = inside a branch
+		"#!/bin/sh\nexec other-hook\n":           false,
+	}
+	for content, want := range cases {
+		if got := endsUnconditionalExit(content); got != want {
+			t.Errorf("endsUnconditionalExit(%q) = %v, want %v", content, got, want)
+		}
+	}
+}
+
+// The shim must pass the remote name: "outgoing" is relative to the destination.
+func TestShimPassesRemote(t *testing.T) {
+	if !strings.Contains(shimBody, `--remote="$1"`) {
+		t.Error("shim body does not pass --remote=$1; the pre-push scan can't scope to the destination")
+	}
+	if !strings.Contains(shimBody, `--hook="${0##*/}"`) {
+		t.Error("shim body lost --hook=")
 	}
 }
