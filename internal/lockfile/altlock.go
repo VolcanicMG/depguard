@@ -7,7 +7,17 @@ package lockfile
 // own lockfile gives us. These are deliberately tolerant: an unrecognized line
 // is skipped, never fatal, because a check must degrade gracefully.
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
+
+// lines splits a lockfile into lines, normalizing CRLF first. Without this a
+// Windows-authored pnpm-lock.yaml left a '\r' on every line, so no key ended in
+// ':' and the parser silently returned an EMPTY tree — an unchecked lockfile.
+func lines(raw []byte) []string {
+	return strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+}
 
 // parsePnpm extracts installed packages from a pnpm-lock.yaml. It reads the
 // `packages:` section, whose 2-space-indented keys are the package identities.
@@ -20,11 +30,16 @@ import "strings"
 // pnpm normally records no tarball URL at all, so Resolved can't classify it.
 // A non-registry `tarball:` in the resolution block IS captured into Resolved
 // so the off-registry host check works too.
-func parsePnpm(raw []byte) []Pkg {
+//
+// It returns an error when a `packages:` section held content but NOTHING in it
+// parsed as a package key: an empty result there means "we didn't understand
+// this file", which must not be reported as "no dependencies to check".
+func parsePnpm(raw []byte) ([]Pkg, error) {
 	var out []Pkg
 	curIdx := -1
 	inPackages := false
-	for _, ln := range strings.Split(string(raw), "\n") {
+	sawEntries := false
+	for _, ln := range lines(raw) {
 		if ln == "" {
 			continue
 		}
@@ -37,6 +52,7 @@ func parsePnpm(raw []byte) []Pkg {
 		if !inPackages {
 			continue
 		}
+		sawEntries = true
 		// A package key is indented exactly two spaces and ends with ':'.
 		if strings.HasPrefix(ln, "  ") && !strings.HasPrefix(ln, "   ") && strings.HasSuffix(strings.TrimRight(ln, " "), ":") {
 			key := strings.TrimSpace(ln)
@@ -68,7 +84,10 @@ func parsePnpm(raw []byte) []Pkg {
 			}
 		}
 	}
-	return out
+	if sawEntries && len(out) == 0 {
+		return nil, errors.New("unrecognized pnpm-lock.yaml packages format")
+	}
+	return out, nil
 }
 
 // pnpmField pulls `key: value` out of a resolution line, stopping at the next
@@ -101,32 +120,89 @@ func isPnpmFieldBoundary(b byte) bool {
 	return b == ' ' || b == '\t' || b == '{' || b == ','
 }
 
-// splitPnpmKey turns a pnpm package key into (name, version). Strips a leading
-// "/" and any "(peerDeps)" suffix, then splits on the '@' that precedes the
-// version (the scope's leading '@' is ignored).
+// splitPnpmKey turns a pnpm package key into (name, version), across every key
+// shape pnpm has shipped:
+//
+//	v6+ (pnpm 8/9):  "lodash@4.17.21"   "/@scope/name@1.0.0"   "…@1.0.0(peer@2)"
+//	v5  (pnpm 7):    "/lodash/4.17.21"  "/@scope/name/1.0.0"   "/lodash/4.17.21_react@17.0.0"
+//
+// The last '@' is tried FIRST, with the '/' shape as fallback, and both
+// candidates must pass validPnpmName. Slash-first was wrong: it split
+// "@scope/2fa@1.0.0" into name "@scope" / version "2fa@1.0.0" (the version is
+// digit-leading, so nothing caught it) and that package then went entirely
+// unchecked — a silent fail-open. The fallback still handles the v5 peer suffix,
+// because "react-dom/18.2.0_react@18.2.0" fails the '@' attempt on its name
+// (a bare '/') and only then reaches the '/' split.
 func splitPnpmKey(key string) (name, version string, ok bool) {
 	if i := strings.IndexByte(key, '('); i >= 0 {
-		key = key[:i] // drop peer-deps suffix
+		key = key[:i] // drop v6 peer-deps suffix
 	}
 	key = strings.TrimPrefix(key, "/")
-	at := strings.LastIndex(key, "@")
-	if at <= 0 { // no version separator, or starts with '@' only
-		return "", "", false
+	if at := strings.LastIndex(key, "@"); at > 0 {
+		if n, v, ok := pnpmNameVersion(key[:at], key[at+1:]); ok {
+			return n, v, true
+		}
 	}
-	name, version = key[:at], key[at+1:]
-	if name == "" || version == "" || !(version[0] >= '0' && version[0] <= '9') {
+	if sl := strings.LastIndex(key, "/"); sl > 0 {
+		return pnpmNameVersion(key[:sl], key[sl+1:])
+	}
+	return "", "", false
+}
+
+// pnpmNameVersion validates a candidate split. The version must be digit-leading
+// — that is what keeps git/link/file deps out of the registry-marked results —
+// and a v5 "_peer@x" suffix is trimmed off it.
+func pnpmNameVersion(name, version string) (string, string, bool) {
+	if i := strings.IndexByte(version, '_'); i >= 0 {
+		version = version[:i]
+	}
+	if version == "" || version[0] < '0' || version[0] > '9' || !validPnpmName(name) {
 		return "", "", false
 	}
 	return name, version, true
 }
 
-// parseYarn extracts installed packages from a yarn.lock (classic v1 format):
-// a non-indented descriptor line (one or more comma-separated specifiers,
-// ending ':') followed by indented `version`, `resolved`, `integrity` lines.
-func parseYarn(raw []byte) []Pkg {
+// validPnpmName reports whether name is shaped like an npm package name: at most
+// one '/', and only as a scope separator. Without this a pnpm GIT dep key
+// ("github.com/user/repo/<sha>") whose sha happens to start with a digit parsed
+// as a registry package — marked FromRegistry with no hash, so the unhashed gate
+// blocked every commit in that repo.
+func validPnpmName(name string) bool {
+	if name == "" {
+		return false
+	}
+	i := strings.IndexByte(name, '/')
+	if i < 0 {
+		return true
+	}
+	return name[0] == '@' && i > 1 && !strings.Contains(name[i+1:], "/")
+}
+
+// parseYarn extracts installed packages from a yarn.lock — both dialects:
+//
+//	classic (v1):  `  version "4.17.21"`     + `resolved` / `integrity`
+//	berry  (v2+):  `  version: 4.17.21`      + `resolution:` / `checksum:`
+//
+// The field name is compared EXACTLY (modulo an optional trailing ':') — a
+// HasPrefix check would let `integrity-x: …` masquerade as `integrity` and
+// overwrite a real security value with a crafted one. Accepting only the bare
+// form was itself a silent-drop bug: every berry entry writes `version:`, so
+// nothing ever got a version and the whole lockfile parsed to zero packages.
+//
+// Berry's `checksum` is NOT an SRI hash (it is yarn's own "10c0/<hex>" cache
+// key), so it is deliberately NOT mapped to Integrity — a berry entry carries no
+// tarball URL either, so checkableDep leaves it out of the integrity gates. It
+// still gets a name and a version, which is what the advisory and cooldown
+// layers need.
+//
+// Like parsePnpm, it errors rather than returning an empty result when
+// descriptor lines were present but NOTHING got a version: "we didn't understand
+// this file" must never be reported as "no dependencies".
+func parseYarn(raw []byte) ([]Pkg, error) {
 	var out []Pkg
 	curIdx := -1
-	for _, ln := range strings.Split(string(raw), "\n") {
+	sawDescriptor := false
+	for _, ln := range lines(raw) {
 		if strings.TrimSpace(ln) == "" || strings.HasPrefix(strings.TrimSpace(ln), "#") {
 			continue
 		}
@@ -135,6 +211,11 @@ func parseYarn(raw []byte) []Pkg {
 			desc := strings.TrimSuffix(strings.TrimSpace(ln), ":")
 			first := strings.TrimSpace(strings.SplitN(desc, ",", 2)[0])
 			first = strings.Trim(first, "\"")
+			if first == "__metadata" {
+				curIdx = -1 // berry's header block, not a package
+				continue
+			}
+			sawDescriptor = true
 			out = append(out, Pkg{Name: yarnName(first)})
 			curIdx = len(out) - 1
 			continue
@@ -142,12 +223,9 @@ func parseYarn(raw []byte) []Pkg {
 		if curIdx < 0 {
 			continue
 		}
-		// The field name is the first whitespace-delimited token, compared
-		// EXACTLY — a HasPrefix check would let `integrity-x: …` masquerade as
-		// `integrity`, overwriting a real security value with a crafted one.
 		t := strings.TrimSpace(ln)
 		field, val, _ := strings.Cut(t, " ")
-		switch field {
+		switch strings.TrimSuffix(field, ":") {
 		case "version":
 			out[curIdx].Version = strings.Trim(strings.TrimSpace(val), "\"")
 		case "resolved":
@@ -156,7 +234,20 @@ func parseYarn(raw []byte) []Pkg {
 			out[curIdx].Integrity = strings.TrimSpace(val)
 		}
 	}
-	return out
+	if sawDescriptor && !anyVersioned(out) {
+		return nil, errors.New("unrecognized yarn.lock format (no entry carried a version)")
+	}
+	return out, nil
+}
+
+// anyVersioned reports whether at least one parsed entry got a version.
+func anyVersioned(pkgs []Pkg) bool {
+	for _, p := range pkgs {
+		if p.Version != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // yarnName extracts the package name from a yarn specifier like

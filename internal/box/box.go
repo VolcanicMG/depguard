@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,12 +45,30 @@ const buildImage = "node:20.20.2@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2
 // from signed Debian packages on first boxed run. Nothing is installed on
 // the host and nothing is pulled from an unofficial source — the only
 // network trust added is Debian's apt repos, signature-verified by apt.
-const obsImage = "depguard-box:1"
+//
+// The tag is VERSIONED: EnsureObsImage reuses whatever is already local, so a
+// change to obsDockerfile that isn't accompanied by a bump here would leave
+// every existing install silently running the old recipe. :2 added the
+// non-dumpable strace below.
+const obsImage = "depguard-box:2"
 
 // obsDockerfile builds obsImage. Kept in source (not a file) so the binary
 // stays self-contained and the recipe is reviewable right here.
+//
+// The chmod is load-bearing security, not tidiness. A traced script knows its
+// own pid, so it can WRITE a forged completion marker into the trace
+// ("printf '%d +++ exited with 0 +++' $$ > /proc/<tracer>/fd/1") and only then
+// kill the tracer — defeating any check made on the trace's contents alone.
+// Making the strace binary root-owned and execute-only (0711, no read bit)
+// causes the kernel to mark the running strace process NON-DUMPABLE, which flips
+// /proc/<tracer>/ to root:root dr-x------. The tracee runs as an ordinary uid, so
+// its fds are unreachable: writing there is EACCES, reading is EACCES. Combined
+// with the tracee holding no inherited fd to the trace pipe (`exec 1>&2` replaces
+// fd 1, and strace's -o fd is CLOEXEC), the trace becomes genuinely
+// write-unreachable — which is what makes the completion marker trustworthy.
 const obsDockerfile = `FROM ` + buildImage + `
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends strace && rm -rf /var/lib/apt/lists/*
+RUN chmod 0711 /usr/bin/strace
 `
 
 // seccompProfile blocks the syscalls that would let a script either evade the
@@ -177,7 +196,7 @@ func SweepContainers(runtime string) int {
 // behind — the normal run path already cleans these via defer, so this is the
 // recovery hook for a guard process killed mid-run:
 //   - "*.guard-backup" sibling dirs anywhere under node_modules (pre-run backups)
-//   - "guard-obs-*" temp dirs (strace logs)
+//   - "guard-obs-*" temp dirs (strace logs written by guard <= 1.1.0)
 //   - the shared seccomp profile temp file
 //
 // Returns the count removed. Best-effort: an unremovable item is skipped, never
@@ -223,8 +242,139 @@ type Result struct {
 	// Unsafe: the trace showed behavior with no legitimate build-time
 	// explanation. The package dir has been restored to its pre-run state.
 	Unsafe bool
-	// Traced reports whether strace observation was active for this run.
+	// Traced reports whether strace observation was COMPLETE for this run. A
+	// missing or truncated trace clears it: we did not see everything.
 	Traced bool
+	// Requested records that tracing was ASKED for. Traced=false alone can't be
+	// read as a problem (an untraced box never asked); the pair can.
+	Requested bool
+	// Discarded: the output was rolled back because the run could not be
+	// observed and policy is strict. Not evidence of malice — evidence of a
+	// blind spot.
+	Discarded bool
+	// Truncated names the host-side buffers that hit their cap, if any.
+	Truncated []string
+	// ObserverLost: the trace ended without the root tracee's exit marker — the
+	// script very likely killed strace and kept running unwatched.
+	ObserverLost bool
+}
+
+// Output and trace caps. The container's pipes are attacker-controllable
+// firehoses; these bound what guard buffers in RAM. var so a test can trip them.
+var (
+	maxScriptOutput = 4 << 20  // 4 MiB of script stdout/stderr
+	maxTraceBytes   = 64 << 20 // 64 MiB of strace lines
+)
+
+// capWriter is a bounded in-memory sink: it accepts every write so the child
+// never blocks or sees EPIPE, but keeps at most max bytes and records that it
+// dropped the rest.
+type capWriter struct {
+	max       int
+	buf       []byte
+	truncated bool
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if room := w.max - len(w.buf); room > 0 {
+		if len(p) <= room {
+			w.buf = append(w.buf, p...)
+		} else {
+			w.buf = append(w.buf, p[:room]...)
+			w.truncated = true
+		}
+	} else if len(p) > 0 {
+		w.truncated = true
+	}
+	return len(p), nil
+}
+
+func (w *capWriter) String() string { return string(w.buf) }
+
+// verdict turns the raw trace pipe into the observation verdict. It is the
+// whole post-run decision, kept pure so every branch is testable without Docker.
+//
+// Traced is TRUE only when tracing was requested AND we hold a complete trace:
+// an empty one (strace never ran — the container died first) and a truncated one
+// (we stopped reading) both mean we did not see everything, so we must not claim
+// we did. A truncated trace is still PARSED — evidence already captured convicts
+// even though the observation is incomplete.
+func verdict(traceBytes []byte, truncated, tracedRequested, timedOut bool) (traced bool, findings []trace.Observation, unsafe, observerLost bool) {
+	if !tracedRequested || len(strings.TrimSpace(string(traceBytes))) == 0 {
+		return false, nil, false, false
+	}
+	rep := trace.Parse(traceBytes)
+	complete := traceComplete(traceBytes)
+	// Three different reasons for a missing ending, and only one of them is the
+	// script's doing:
+	//   truncated → we stopped reading (our cap)
+	//   timedOut  → WE killed the container at the wall-clock limit, so of course
+	//               strace never got to write its exit line
+	//   otherwise → nobody but the script can explain it
+	// Traced is false in all three (we did not see the end); ObserverLost — which
+	// discards output under every policy — is reserved for the last.
+	return !truncated && complete, rep.Observations, rep.Unsafe, !truncated && !timedOut && !complete
+}
+
+// shouldDiscard decides whether the script's output survives the box.
+//
+// strict is `untraced-boxed: fail` — "I don't keep what I couldn't watch".
+// observerLost overrides policy entirely: killing your own tracer has no
+// build-time excuse, so that output is never kept, even under
+// `untraced-boxed: run`. It is still not an auto-CONVICTION (the approval stands)
+// — a hung build we killed ourselves can look similar from the outside, which is
+// why the timeout is excluded from observerLost upstream.
+func shouldDiscard(strict, tracedRequested, observed, observerLost, traceTruncated bool) bool {
+	if !tracedRequested || observed {
+		return false
+	}
+	// A killed observer and a flooded one are the same class: no build emits
+	// 64 MiB of network/exec/open syscalls by accident, so neither gets to
+	// keep its output — under ANY policy. Only an innocent gap (no strace
+	// image) is left to the untraced-boxed setting.
+	return strict || observerLost || traceTruncated
+}
+
+// rootPidRe grabs the pid `strace -f` prefixes every line with.
+var rootPidRe = regexp.MustCompile(`(?m)^(\d+)\s`)
+
+// traceComplete reports whether the trace proves the OBSERVER outlived the
+// script it was observing.
+//
+// The tracee can kill its tracer — `kill -9 $PPID` from the install script.
+// strace dies, its pipe closes, and what guard reads is a perfectly ordinary
+// trace: non-empty, under the cap, nothing incriminating in it. The script is
+// DETACHED by that kill, not stopped: everything it does afterwards is invisible
+// and, without this check, accepted. So absence of evidence is not enough — the
+// trace has to carry positive proof of a clean ending.
+//
+// That proof is strace's own exit line for the ROOT tracee (the pid on the first
+// line): "<pid> +++ exited with N +++" or "<pid> +++ killed by SIGx +++". A child
+// pid's marker will not do — a script can arrange for a child to exit before it
+// kills the tracer.
+func traceComplete(log []byte) bool {
+	m := rootPidRe.FindSubmatch(log)
+	if m == nil {
+		return false // can't identify the root tracee → can't prove completion
+	}
+	done := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(string(m[1])) + `\s+\+\+\+ (?:exited with \d+|killed by SIG\w+)`)
+	return done.Match(log)
+}
+
+// restore rolls the package dir back to its pre-run backup — what makes
+// "the output was discarded" real rather than aspirational.
+//
+// keepBackup is true when the rename FAILED: the package dir is already gone and
+// the backup is the only surviving copy, so the caller's deferred cleanup must
+// not delete it. Removing it there would turn a recoverable error into data loss.
+func restore(pkgDir, backupDir string) (keepBackup bool, err error) {
+	if err := os.RemoveAll(pkgDir); err != nil {
+		return false, fmt.Errorf("discarding box output: %w", err)
+	}
+	if err := os.Rename(backupDir, pkgDir); err != nil {
+		return true, fmt.Errorf("restoring pre-run state: %w (pre-run copy preserved at %s)", err, backupDir)
+	}
+	return false, nil
 }
 
 // Run executes the package's install scripts inside the sealed container,
@@ -240,8 +390,10 @@ type Result struct {
 // fails AND — under strace — is captured as evidence with the destination.
 //
 // When the trace verdict is UNSAFE the package directory is rolled back to
-// its pre-run state: the script's output never survives.
-func Run(runtime, image string, traced bool, projectDir, relPath string) (Result, error) {
+// its pre-run state: the script's output never survives. strict does the same
+// for a run we could not fully OBSERVE (untraced-boxed: fail) — not because the
+// script misbehaved, but because we can't say that it didn't.
+func Run(runtime, image string, traced, strict bool, projectDir, relPath string) (Result, error) {
 	pkgDir := filepath.Join(projectDir, relPath)
 	before, err := snapshot(pkgDir)
 	if err != nil {
@@ -254,7 +406,14 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 	if err := os.CopyFS(backupDir, os.DirFS(pkgDir)); err != nil {
 		return Result{}, fmt.Errorf("pre-run backup: %w", err)
 	}
-	defer os.RemoveAll(backupDir) // no-op after a restore renames it away
+	keepBackup := false
+	defer func() {
+		// No-op after a successful restore renames it away; skipped entirely
+		// when the restore failed and this is the only copy left.
+		if !keepBackup {
+			os.RemoveAll(backupDir)
+		}
+	}()
 
 	// Keep the node_modules dir name in the container path so Node's
 	// upward require() resolution finds siblings naturally.
@@ -264,20 +423,23 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 	// npm itself inside the container so package.json semantics hold.
 	script := `cd "$WORK" && for s in preinstall install postinstall; do npm run "$s" --if-present --foreground-scripts || exit $?; done`
 
-	// Observation dir: strace writes its log here; guard reads it after the
-	// container is gone. Host-side temp, never inside the package dir (the
-	// script can write there and must not be able to doctor its own trace
-	// pre-emptively — see the tamper note in docs/CODEMAP.md).
-	var obsDir string
+	// Evidence path: strace writes the trace to the container's STDOUT, which
+	// guard reads over a pipe, and the traced shell's own output is redirected to
+	// stderr so the two streams never mix. A file in a shared bind mount was the
+	// old design and was tamperable: the script runs as the same uid, so it could
+	// truncate or rewrite its own trace, and an unreadable trace downgraded to
+	// "untraced".
+	//
+	// The pipe is UNREACHABLE from the tracee, in both directions: it holds no
+	// inherited fd to it (`exec 1>&2` replaces fd 1; strace's -o fd is CLOEXEC),
+	// and /proc/<tracer>/fd is root-only because the image's strace is
+	// execute-only, so the kernel marks the tracer non-dumpable (see
+	// obsDockerfile). So the trace can be neither truncated NOR appended to —
+	// which is precisely what makes the root-exit marker worth checking. Without
+	// the exec-only binary the marker would be forgeable and this whole guarantee
+	// would collapse.
 	if traced {
-		obsDir, err = os.MkdirTemp("", "guard-obs-")
-		if err != nil {
-			return Result{}, err
-		}
-		defer os.RemoveAll(obsDir)
-		// %network covers connect/sendto/recvfrom — destinations AND DNS
-		// payloads; openat covers file access; execve covers spawns.
-		script = `strace -f -qq -e trace=%network,execve,openat -s 512 -o /obs/trace.log sh -c '` + script + `'`
+		script = tracedScript(script)
 	}
 
 	// Name the container so a timed-out (SIGKILL'd) run can still be force-removed
@@ -304,12 +466,9 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 		// the script can only write its own package.
 		"-v", pkgDir + ":" + workDir + ":rw",
 	}
-	if traced {
-		args = append(args, "-v", obsDir+":/obs:rw")
-	}
 	args = append(args,
 		"-w", workDir,
-		"--cap-drop", "ALL", // no special powers (own-child ptrace needs none)
+		"--cap-drop", "ALL", // no special powers (own-child ptrace needs none); also drops CAP_DAC_OVERRIDE so even uid 0 cannot open the non-dumpable tracer's /proc fds — load-bearing for the trace-forgery defense
 		"--security-opt", "no-new-privileges", // setuid binaries can't escalate
 		"--pids-limit", "512", // fork bombs die at the fence
 		"--memory", boxMemory, // OOM a memory bomb instead of the host
@@ -331,43 +490,52 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 	ctx, cancel := context.WithTimeout(context.Background(), boxTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, runtime, args...)
-	out, runErr := cmd.CombinedOutput()
+	// Both sinks are BOUNDED: a script that prints forever must not grow guard's
+	// heap without limit. When untraced there is no separate trace stream, so
+	// stdout and stderr both land in the output buffer as before.
+	outBuf := &capWriter{max: maxScriptOutput}
+	traceBuf := &capWriter{max: maxTraceBytes}
+	if traced {
+		cmd.Stdout, cmd.Stderr = traceBuf, outBuf
+	} else {
+		cmd.Stdout, cmd.Stderr = outBuf, outBuf
+	}
+	runErr := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		out = append(out, []byte(fmt.Sprintf("\nguard: box killed after %s wall-clock limit\n", boxTimeout))...)
+		fmt.Fprintf(outBuf, "\nguard: box killed after %s wall-clock limit\n", boxTimeout)
 		// The killed CLI may not have run --rm; make sure the container is gone.
 		_ = exec.Command(runtime, "rm", "-f", containerName).Run()
 	}
 
-	res := Result{Output: string(out), Traced: traced}
+	res := Result{Output: outBuf.String(), Requested: traced}
+	if outBuf.truncated {
+		res.Truncated = append(res.Truncated, "output")
+	}
+	if traceBuf.truncated {
+		res.Truncated = append(res.Truncated, "trace")
+	}
 	if exitErr, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = exitErr.ExitCode()
 	} else if runErr != nil {
 		return res, fmt.Errorf("container launch failed: %w", runErr)
 	}
 
-	// Verdict from the syscall evidence.
-	if traced {
-		log, err := os.ReadFile(filepath.Join(obsDir, "trace.log"))
-		if err == nil {
-			rep := trace.Parse(log)
-			res.Findings = rep.Observations
-			res.Unsafe = rep.Unsafe
-		} else {
-			// No log at all (container died pre-strace): treat as untraced
-			// rather than pretending we observed a clean run.
-			res.Traced = false
-		}
-	}
+	res.Traced, res.Findings, res.Unsafe, res.ObserverLost = verdict(traceBuf.buf, traceBuf.truncated, traced, ctx.Err() == context.DeadlineExceeded)
 
 	// UNSAFE → the output is discarded: pre-run state comes back via rename.
 	if res.Unsafe {
-		if err := os.RemoveAll(pkgDir); err != nil {
-			return res, fmt.Errorf("discarding unsafe output: %w", err)
-		}
-		if err := os.Rename(backupDir, pkgDir); err != nil {
-			return res, fmt.Errorf("restoring pre-run state: %w", err)
-		}
-		return res, nil
+		res.Discarded = true
+		keep, err := restore(pkgDir, backupDir)
+		keepBackup = keep
+		return res, err
+	}
+	// We asked to observe this run and couldn't, fully. The script is not
+	// convicted — but unobserved output isn't accepted either.
+	if shouldDiscard(strict, traced, res.Traced, res.ObserverLost, traceBuf.truncated) {
+		res.Discarded = true
+		keep, err := restore(pkgDir, backupDir)
+		keepBackup = keep
+		return res, err
 	}
 
 	// File diff: what did the script actually write? Build output in the
@@ -387,6 +555,21 @@ func Run(runtime, image string, traced bool, projectDir, relPath string) (Result
 		}
 	}
 	return res, nil
+}
+
+// tracedScript wraps the install-script command in strace. The trace goes to
+// the container's STDOUT — a pipe the script cannot reach (see obsDockerfile) —
+// and the script's own output is pushed to stderr so the two never mix. %network covers connect/sendto/recvfrom
+// — destinations AND DNS payloads; openat covers file access; execve covers spawns.
+func tracedScript(script string) string {
+	// -q (not -qq) keeps strace's per-process exit lines. That is the ONLY
+	// evidence that the observer outlived the script — see traceComplete.
+	// `exec` makes strace PID 1. Without it Debian's dash (no single-command
+	// exec optimization) sits at PID 1, dumpable, holding the trace pipe as
+	// its fd 1 — and /proc/1/fd/1 forgery works (verified live). As PID 1
+	// strace also gains the kernel's pid-namespace init protection: SIGKILL
+	// from inside the namespace is dropped, so the tracer can't be killed.
+	return `exec strace -f -q -e trace=%network,execve,openat -s 512 -o /dev/stdout sh -c 'exec 1>&2; ` + script + `'`
 }
 
 // scrubbedEnv is the minimal environment an uncontained script inherits: enough
@@ -447,8 +630,22 @@ func snapshot(dir string) (map[string]string, error) {
 }
 
 // Summary renders a short human-readable account of what the box observed.
+//
+// It says so LOUDLY when the observation was incomplete. A script can blind the
+// observer on purpose — flood enough openat() calls and the trace hits its cap —
+// and under `untraced-boxed: run` that run is still accepted. The least we owe
+// the human is to not report it in the same words as a fully watched run.
 func (r Result) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "exit %d, %d new file(s), %d modified", r.ExitCode, len(r.NewFiles), len(r.Modified))
+	if len(r.Truncated) > 0 {
+		fmt.Fprintf(&b, "; ⚠ %s output hit the size cap (trace cap %d MiB)", strings.Join(r.Truncated, "+"), maxTraceBytes>>20)
+	}
+	if r.ObserverLost {
+		b.WriteString("; ⚠ observer terminated before the script finished (trace has no completion marker)")
+	}
+	if r.Requested && !r.Traced {
+		b.WriteString("; ⚠ observation INCOMPLETE — this run was NOT fully watched")
+	}
 	return b.String()
 }

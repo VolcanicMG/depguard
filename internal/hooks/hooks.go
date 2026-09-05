@@ -7,7 +7,9 @@ package hooks
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -15,7 +17,9 @@ import (
 // can UPGRADE an already-installed shim in place instead of leaving a stale copy
 // running. v1 was the pre-marker shim (no version line) — treated as foreign and
 // chained onto, since we can't be sure a marker-less block is exclusively ours.
-const shimVersion = "2"
+// v3 added --hook=, which is what makes the check PHASE-AWARE (pre-push looks at
+// the outgoing commits, not just the working tree).
+const shimVersion = "3"
 
 // shimBegin / shimEnd are CONSTANT (version-independent) sentinels wrapping
 // depguard's managed region so a later init can find and REPLACE it. The version
@@ -35,13 +39,18 @@ const (
 // a sibling hook. The bypass lives in the shim, not the binary, so it can't
 // weaken the CI gate, which calls `guard check` directly.
 //
+// --hook="${0##*/}" passes the hook's own filename (pre-commit / pre-push) so
+// guard knows which snapshot to check: at pre-push git also feeds this hook the
+// ref lines on stdin, which guard inherits and reads. ONE shim body serves both
+// phases — the binary decides what the phase means.
+//
 // A MISSING guard binary stays fail-open (exit 0 — a teammate without guard
 // installed must still be able to commit) but is LOUD on stderr. Silence there
 // was the bug: the repo looked protected while every commit sailed unchecked.
 const shimBody = `if [ -n "$GUARD_SKIP" ]; then
   echo "depguard: check skipped (GUARD_SKIP set)." >&2
 elif command -v guard >/dev/null 2>&1; then
-  guard check --quiet --confirm || {
+  guard check --quiet --confirm --hook="${0##*/}" || {
     echo "depguard: advisory check failed (or warnings not accepted). Run 'guard check' for details." >&2
     echo "depguard: bypass once with GUARD_SKIP=1 (depguard only) or git --no-verify (all hooks)." >&2
     exit 1
@@ -132,6 +141,80 @@ func hasCurrentShim(s string) bool {
 	return strings.Contains(s[b:e], "# depguard-shim-version: "+shimVersion)
 }
 
+// HookDir resolves where git will ACTUALLY look for this repo's hooks — the
+// only place a shim is worth writing, and the only place `guard status` should
+// look for one. Order:
+//
+//	core.hooksPath   git's own override wins (relative → repo-root relative).
+//	                 husky v9 points it at .husky/_ and REGENERATES that dir on
+//	                 every install, so we target its parent .husky instead.
+//	.husky/          present without core.hooksPath (husky v8 and earlier).
+//	.git/hooks       the default.
+//
+// Install and Installed share this: hard-coding .git/hooks in Installed made
+// `guard status` claim a husky repo was protected by a shim git never runs.
+func HookDir(dir string) string {
+	if p := gitConfig(dir, "core.hooksPath"); p != "" {
+		if !filepath.IsAbs(p) {
+			// git resolves a relative core.hooksPath against the REPO ROOT, not
+			// the current directory — so must we, or running guard from a
+			// subdirectory writes (and looks for) the shim in the wrong place.
+			p = filepath.Join(repoRoot(dir), p)
+		}
+		if filepath.Base(p) == "_" && filepath.Base(filepath.Dir(p)) == ".husky" {
+			return filepath.Dir(p)
+		}
+		return p
+	}
+	if fi, err := os.Stat(filepath.Join(dir, ".husky")); err == nil && fi.IsDir() {
+		return filepath.Join(dir, ".husky")
+	}
+	return filepath.Join(dir, ".git", "hooks")
+}
+
+// repoRoot returns the repository's top level, falling back to dir when git
+// can't say (not a repo, git absent).
+func repoRoot(dir string) string {
+	if out := gitOut(dir, "rev-parse", "--show-toplevel"); out != "" {
+		return out
+	}
+	return dir
+}
+
+// gitConfig reads one git config value, "" when unset or git is unavailable.
+func gitConfig(dir, key string) string { return gitOut(dir, "config", "--get", key) }
+
+// gitOut runs a git command in dir and returns its trimmed stdout, "" on error.
+func gitOut(dir string, args ...string) string {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// isExecutable reports whether path carries an execute bit — a hook without one
+// is a file git silently ignores, so it is NOT protection. Windows has no such
+// bit (git for Windows runs hooks through sh regardless), so the test is skipped
+// there rather than reporting every repo unprotected.
+func isExecutable(path string) bool {
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode()&0o111 != 0
+}
+
+// writeHook writes a hook file and FORCES mode 0755. os.WriteFile only applies
+// its perm argument when it creates the file, so rewriting an existing 0644 hook
+// left it non-executable — installed, and never run.
+func writeHook(path string, content []byte) error {
+	if err := os.WriteFile(path, content, 0o755); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o755)
+}
+
 // installHook writes the guard shim for hook phase h. It (a) UPGRADES our own
 // managed block in place when it's stale, (b) CHAINS onto a foreign/pre-marker
 // hook rather than clobbering it, or (c) writes a fresh standalone shim. Keying
@@ -146,23 +229,23 @@ func installHook(hookDir, h string) (string, error) {
 	}
 	// (c) Fresh (or empty) hook: write the standalone shim.
 	if os.IsNotExist(err) || len(existing) == 0 {
-		return path, os.WriteFile(path, []byte(hookScript), 0o755)
+		return path, writeHook(path, []byte(hookScript))
 	}
 	content := string(existing)
 	// (a) We already manage a block here → idempotent if current, else upgrade.
 	if b, e := shimSpan(content); b >= 0 {
-		if hasCurrentShim(content) {
+		if hasCurrentShim(content) && isExecutable(path) {
 			return "", nil // up to date — don't rewrite
 		}
 		updated := content[:b] + managedBlock + content[e:]
-		return path, os.WriteFile(path, []byte(updated), 0o755)
+		return path, writeHook(path, []byte(updated))
 	}
 	// (b) A foreign/pre-marker hook → chain our block on, never clobber it.
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 	content += hookAppend
-	return path, os.WriteFile(path, []byte(content), 0o755)
+	return path, writeHook(path, []byte(content))
 }
 
 // npmrcSettings are the npm-config keys depguard pins at the .npmrc level. This
@@ -222,12 +305,9 @@ func Install(dir string, ci bool) ([]string, error) {
 		written = append(written, ".npmrc (ignore-scripts + save-exact)")
 	}
 
-	// Prefer husky's hook dir when present: husky points core.hooksPath at
-	// .husky, so anything we drop in .git/hooks would never fire there.
-	hookDir := filepath.Join(dir, ".git", "hooks")
-	if _, err := os.Stat(filepath.Join(dir, ".husky")); err == nil {
-		hookDir = filepath.Join(dir, ".husky")
-	}
+	// Write where git will actually look (core.hooksPath / husky / .git/hooks) —
+	// a shim anywhere else is decoration.
+	hookDir := HookDir(dir)
 	if _, err := os.Stat(hookDir); err != nil {
 		return nil, fmt.Errorf("no %s here — run inside a git repo (or git init first)", filepath.Base(hookDir))
 	}
@@ -271,13 +351,17 @@ type InstalledState struct {
 	Npmrc            bool // .npmrc pins ignore-scripts=true
 	CIWorkflow       bool // .github/workflows/depguard.yml present
 	Husky            bool // a .husky dir exists (hooks chain there instead of .git/hooks)
+	// HookDir is the directory git will actually read hooks from — reported by
+	// `guard status` so "no hook found" names the place that was searched.
+	HookDir string
 }
 
 // Installed inspects dir for the artifacts `guard init` drops.
 func Installed(dir string) InstalledState {
 	var s InstalledState
-	pc := filepath.Join(dir, ".git", "hooks", "pre-commit")
-	pp := filepath.Join(dir, ".git", "hooks", "pre-push")
+	s.HookDir = HookDir(dir)
+	pc := filepath.Join(s.HookDir, "pre-commit")
+	pp := filepath.Join(s.HookDir, "pre-push")
 	s.PreCommit = hookCallsGuard(pc)
 	s.PrePush = hookCallsGuard(pp)
 	s.PreCommitCurrent = hookIsCurrent(pc)
@@ -294,15 +378,17 @@ func Installed(dir string) InstalledState {
 	return s
 }
 
-// hookCallsGuard reports whether the hook file at path exists and invokes guard.
+// hookCallsGuard reports whether the hook file at path exists, invokes guard,
+// AND is executable. A non-executable hook is one git skips in silence, so
+// reporting it as installed would be reporting protection that isn't there.
 func hookCallsGuard(path string) bool {
 	b, err := os.ReadFile(path)
-	return err == nil && strings.Contains(string(b), "guard check")
+	return err == nil && strings.Contains(string(b), "guard check") && isExecutable(path)
 }
 
 // hookIsCurrent reports whether the hook file at path carries depguard's CURRENT
 // managed shim marker — the F4 test for "real protection" vs a stale/foreign hook.
 func hookIsCurrent(path string) bool {
 	b, err := os.ReadFile(path)
-	return err == nil && hasCurrentShim(string(b))
+	return err == nil && hasCurrentShim(string(b)) && isExecutable(path)
 }

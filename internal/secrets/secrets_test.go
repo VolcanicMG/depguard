@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -17,8 +18,8 @@ func TestMatchAny(t *testing.T) {
 		pat  string // expected matching pattern (when want)
 	}{
 		{".env", true, ".env"},
-		{"config/.env", true, ".env"},            // basename match
-		{".env.local", true, ".env.*"},           // glob
+		{"config/.env", true, ".env"},             // basename match
+		{".env.local", true, ".env.*"},            // glob
 		{".env.example", true, ".env.*"},          // documents: example is caught → waive it
 		{"secrets/prod.key", true, "secrets/"},    // dir prefix
 		{"secrets/sub/db.key", true, "secrets/"},  // dir prefix, nested
@@ -59,9 +60,9 @@ func TestFindOnlyTrackedOrStaged(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(".env", "TOKEN=abc")           // will be staged → must be flagged
-	write(".env.local", "TOKEN=xyz")     // left untracked → must NOT be flagged
-	write("index.js", "console.log(1)")  // staged, but not a secret
+	write(".env", "TOKEN=abc")          // will be staged → must be flagged
+	write(".env.local", "TOKEN=xyz")    // left untracked → must NOT be flagged
+	write("index.js", "console.log(1)") // staged, but not a secret
 	run("add", ".env", "index.js")
 
 	got, err := Find(dir, []string{".env", ".env.*"})
@@ -93,5 +94,87 @@ func TestFindNonRepoErrors(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Find(dir, []string{".env"}); err == nil {
 		t.Fatal("Find in a non-git dir should return git's error, got nil")
+	}
+}
+
+// The pre-push gate's whole point: a secret committed and then DELETED in a
+// later commit is gone from the index — Find sees nothing — but it still rides
+// the outgoing history to the remote. FindOutgoing is what catches it, and it's
+// why `git rm --cached` is not the fix.
+func TestFindOutgoingSeesDeletedSecretInHistory(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md")
+	run("commit", "-qm", "base")
+	base, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(base))
+
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("TOKEN=abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".env")
+	run("commit", "-qm", "oops")
+	run("rm", "-q", ".env")
+	run("commit", "-qm", "remove the secret")
+
+	// The tree is clean now — that is exactly the false all-clear.
+	if got, err := Find(dir, []string{".env"}); err != nil || len(got) != 0 {
+		t.Fatalf("Find = (%v, %v), want no tree hits after the removal commit", got, err)
+	}
+	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	got, err := FindOutgoing(dir, []string{".env"}, [][]string{{baseSHA + ".." + strings.TrimSpace(string(head))}})
+	if err != nil {
+		t.Fatalf("FindOutgoing: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != ".env" {
+		t.Fatalf("FindOutgoing = %+v, want one .env hit from the outgoing history", got)
+	}
+	if !got[0].History {
+		t.Error("History = false — the report would tell the user to git rm --cached, which cannot help")
+	}
+}
+
+// No patterns or no ranges: the gate is inert, never an error.
+func TestFindOutgoingInert(t *testing.T) {
+	dir := t.TempDir()
+	if got, err := FindOutgoing(dir, nil, [][]string{{"a..b"}}); err != nil || got != nil {
+		t.Errorf("FindOutgoing(no patterns) = (%v, %v), want (nil, nil)", got, err)
+	}
+	if got, err := FindOutgoing(dir, []string{".env"}, nil); err != nil || got != nil {
+		t.Errorf("FindOutgoing(no ranges) = (%v, %v), want (nil, nil)", got, err)
+	}
+}
+
+// A range git cannot read must surface as an ERROR, not as "no secrets". On a
+// shallow clone the remote sha isn't present locally, so EVERY range fails —
+// swallowing that returned a confident all-clear from a scan that never ran.
+func TestFindOutgoingReportsUnreadableRange(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git unavailable: %v\n%s", err, out)
+	}
+	missing := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	got, err := FindOutgoing(dir, []string{".env"}, [][]string{{missing + "..HEAD"}})
+	if err == nil {
+		t.Fatalf("FindOutgoing = (%v, nil), want an error for a range git can't resolve", got)
+	}
+	if len(got) != 0 {
+		t.Errorf("matches = %v, want none", got)
 	}
 }

@@ -1,8 +1,10 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,5 +188,67 @@ func TestAddSecretPathFromEmpty(t *testing.T) {
 	c, _ := Load(dir)
 	if len(c.SecretPaths) != 1 || c.SecretPaths[0] != "*.pem" {
 		t.Fatalf("SecretPaths = %v, want [*.pem]", c.SecretPaths)
+	}
+}
+
+// on-check-error decides whether a check that could NOT run is a warning or a
+// gate. It must parse both values, default to warn, and fail closed on a typo —
+// a mistyped security toggle must never silently pick the looser mode.
+func TestOnCheckErrorParse(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) Config {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, FileName), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(dir)
+		if err != nil {
+			t.Fatalf("Load(%q): %v", body, err)
+		}
+		return c
+	}
+	if Defaults().OnCheckErrorFail {
+		t.Error("default OnCheckErrorFail = true, want warn (fail-open) by default")
+	}
+	if !write("on-check-error: fail\n").OnCheckErrorFail {
+		t.Error("on-check-error: fail did not set OnCheckErrorFail")
+	}
+	if write("on-check-error: warn\n").OnCheckErrorFail {
+		t.Error("on-check-error: warn set OnCheckErrorFail")
+	}
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("on-check-error: yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err == nil {
+		t.Error("a bogus on-check-error value was accepted — must fail closed")
+	}
+	// And the editing path must agree with Load about what's legal.
+	if _, err := canonicalValue("on-check-error", "fail"); err != nil {
+		t.Errorf("canonicalValue rejected a legal value: %v", err)
+	}
+	if _, err := canonicalValue("on-check-error", "nope"); err == nil {
+		t.Error("canonicalValue accepted an illegal on-check-error value")
+	}
+}
+
+// Degrade is the single decision point for every fail-open lookup in the repo:
+// warn returns nil (work continues), fail returns the error (the gate trips).
+func TestDegrade(t *testing.T) {
+	boom := errors.New("osv unreachable")
+	if err := (Config{}).Degrade("advisory check", boom); err != nil {
+		t.Errorf("warn mode gated: %v", err)
+	}
+	// The warning is NOT suppressible: the hooks pass --quiet, and a silent
+	// fail-open is exactly what the degraded-reporting stance exists to prevent.
+	err := Config{OnCheckErrorFail: true}.Degrade("advisory check", boom)
+	if err == nil {
+		t.Fatal("fail mode did not gate a check that could not complete")
+	}
+	if !strings.Contains(err.Error(), "advisory check") || !strings.Contains(err.Error(), "osv unreachable") {
+		t.Errorf("error = %q, want it to name the check and the cause", err)
+	}
+	// No error means nothing to report, in either mode.
+	if err := (Config{OnCheckErrorFail: true}).Degrade("advisory check", nil); err != nil {
+		t.Errorf("Degrade(nil) = %v, want nil", err)
 	}
 }

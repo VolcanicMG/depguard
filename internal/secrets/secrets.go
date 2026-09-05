@@ -5,12 +5,19 @@
 // goes bad). This one guards against the repo's own authors leaking a secret:
 // `guard check` hard-blocks a commit/push — same gate weight as a critical
 // advisory — when a file matching a policy pattern is staged or already tracked
-// by git (DESIGN.md §11). "Staged or tracked" is exactly git's upload surface:
-// the set of files a push would carry to the remote. Untracked/gitignored files
-// are skipped — git won't upload them, so they aren't a leak yet.
+// by git (DESIGN.md §11). Untracked/gitignored files are skipped — git won't
+// upload them, so they aren't a leak yet.
+//
+// The upload surface depends on the PHASE. At pre-commit it is the working
+// tree's tracked + staged set (Find). At pre-push it is the OUTGOING COMMITS
+// (FindOutgoing): a secret committed and then deleted in a later commit is gone
+// from the index but still travels in the history the push transmits — and
+// `git rm --cached` does not take it back out.
 package secrets
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
 	"path"
 	"sort"
@@ -24,6 +31,10 @@ type Match struct {
 	Path string
 	// Pattern is the secret-paths entry that matched.
 	Pattern string
+	// History marks a hit found in an OUTGOING COMMIT rather than the current
+	// tree. Deleting the file now does not un-send it: the fix is a history
+	// rewrite plus credential rotation, and the report must say so.
+	History bool
 }
 
 // Find returns every git-tracked-or-staged file in dir that matches one of the
@@ -50,13 +61,15 @@ func Find(dir string, patterns []string) ([]Match, error) {
 }
 
 // gitFiles is the union of already-tracked and currently-staged files, deduped —
-// every path git would carry to the remote on the next push.
+// the CURRENT tree's upload surface. Note this is not everything a push
+// transmits: a file removed in a later commit is absent here but still present
+// in the outgoing history (see FindOutgoing).
 func gitFiles(dir string) ([]string, error) {
 	set := map[string]bool{}
 	// Already tracked (in the index / committed): catches a secret that slipped
-	// in before the gate existed and still rides every push until it is removed
-	// with `git rm --cached`. This is the workhorse — `ls-files` also lists a
-	// freshly `git add`ed file, so it already covers most "staged" cases.
+	// in before the gate existed and still rides every push until it is removed.
+	// This is the workhorse — `ls-files` also lists a freshly `git add`ed file,
+	// so it already covers most "staged" cases.
 	tracked, err := gitLines(dir, "ls-files", "-z")
 	if err != nil {
 		return nil, err
@@ -77,6 +90,46 @@ func gitFiles(dir string) ([]string, error) {
 		out = append(out, f)
 	}
 	return out, nil
+}
+
+// FindOutgoing returns every file ADDED or MODIFIED by the commits a push would
+// transmit, matched against the patterns. revArgs holds one git-log revision
+// selector per pushed ref — "<remote-sha>..<local-sha>" for an existing remote
+// branch, or {"<local-sha>", "--not", "--remotes"} for a brand-new one.
+//
+// This is the pre-push half of the gate: Find looks at the tree, this looks at
+// the history, and only together do they cover what leaves the machine.
+//
+// It returns the matches it DID find alongside a joined error for every range it
+// could not read. Swallowing those errors made a shallow clone — where the
+// remote sha isn't present locally, so every range fails — report "no secrets"
+// rather than "I could not look", which is the one answer a secret gate must
+// never give. The caller decides what to do with it (cfg.Degrade).
+func FindOutgoing(dir string, patterns []string, revArgs [][]string) ([]Match, error) {
+	if len(patterns) == 0 || len(revArgs) == 0 {
+		return nil, nil
+	}
+	seen := map[string]string{}
+	var errs []error
+	for _, rev := range revArgs {
+		args := append([]string{"log", "--format=", "--name-only", "--diff-filter=ACMR", "-z"}, rev...)
+		files, err := gitLines(dir, args...)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("git log %s: %w", strings.Join(rev, " "), err))
+			continue
+		}
+		for _, f := range files {
+			if p, ok := matchAny(f, patterns); ok {
+				seen[f] = p
+			}
+		}
+	}
+	var out []Match
+	for f, p := range seen {
+		out = append(out, Match{Path: f, Pattern: p, History: true})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, errors.Join(errs...)
 }
 
 // gitLines runs `git -C dir <args>` and splits NUL-delimited output (-z) into
