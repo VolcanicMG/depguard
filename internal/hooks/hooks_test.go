@@ -161,8 +161,8 @@ func TestShimIsPhaseAware(t *testing.T) {
 	if !strings.Contains(shimBody, `--remote="$1"`) {
 		t.Error("shim body does not pass --remote=$1 (the pre-push scan can't scope to the destination)")
 	}
-	if shimVersion != "3" {
-		t.Errorf("shimVersion = %q, want 3 — a body change must bump it or installed shims never upgrade", shimVersion)
+	if shimVersion != "4" {
+		t.Errorf("shimVersion = %q, want 4 — a body change must bump it or installed shims never upgrade", shimVersion)
 	}
 }
 
@@ -401,5 +401,78 @@ func TestShimPassesRemote(t *testing.T) {
 	}
 	if !strings.Contains(shimBody, `--hook="${0##*/}"`) {
 		t.Error("shim body lost --hook=")
+	}
+}
+
+// v3ShimBody is the shim EXACTLY as 1.2.0 shipped it — no --remote. It went out
+// marked "version 3", so adding --remote to the v3 body without bumping would
+// have left every installed shim looking current and never upgrading.
+const v3ShimBody = `if [ -n "$GUARD_SKIP" ]; then
+  echo "depguard: check skipped (GUARD_SKIP set)." >&2
+elif command -v guard >/dev/null 2>&1; then
+  guard check --quiet --confirm --hook="${0##*/}" || {
+    echo "depguard: advisory check failed (or warnings not accepted). Run 'guard check' for details." >&2
+    exit 1
+  }
+else
+  echo "depguard: !! guard binary not found on PATH — depguard check SKIPPED !!" >&2
+fi`
+
+func TestInstallHookUpgradesShippedV3(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pre-push")
+	shipped := "#!/bin/sh\n" + shimBegin + "\n# depguard-shim-version: 3\n" + v3ShimBody + "\n" + shimEnd + "\n"
+	if err := os.WriteFile(path, []byte(shipped), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installHook(dir, "pre-push"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), `--remote="$1"`) {
+		t.Error("a shipped v3 shim was not upgraded — it would keep scanning against every remote")
+	}
+	if strings.Contains(string(got), "# depguard-shim-version: 3") {
+		t.Error("the v3 marker survived the upgrade")
+	}
+	if n := strings.Count(string(got), shimBegin); n != 1 {
+		t.Errorf("shim block count = %d after upgrade, want 1", n)
+	}
+}
+
+// A managed block chained AFTER an unconditional exit is never reached, yet it
+// carries a current marker — so every other signal says "protected". That is the
+// one state worth naming out loud.
+func TestInstalledDetectsUnreachableBlock(t *testing.T) {
+	dir := t.TempDir()
+	hookDir := filepath.Join(dir, ".git", "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "#!/bin/sh\nrun-my-linter\nexit 0\n"
+	path := filepath.Join(hookDir, "pre-commit")
+	if err := os.WriteFile(path, []byte(foreign), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installHook(hookDir, "pre-commit"); err != nil {
+		t.Fatal(err)
+	}
+	st := Installed(dir)
+	if !st.PreCommit || !st.PreCommitCurrent {
+		t.Fatalf("fixture wrong: the block should look present+current, got %+v", st)
+	}
+	if !st.PreCommitUnreachable {
+		t.Error("a block sitting after an unconditional exit was reported as working protection")
+	}
+	// A normal chained hook (no trailing exit) is reachable.
+	ok := filepath.Join(hookDir, "pre-push")
+	if err := os.WriteFile(ok, []byte("#!/bin/sh\nrun-my-linter\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installHook(hookDir, "pre-push"); err != nil {
+		t.Fatal(err)
+	}
+	if Installed(dir).PrePushUnreachable {
+		t.Error("a normally-chained hook was reported unreachable")
 	}
 }

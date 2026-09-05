@@ -298,17 +298,18 @@ func TestInstalledAtNonNpmLockfile(t *testing.T) {
 
 // npm records a bundled dependency as a SECOND entry for the same name@version
 // with no resolved and no integrity — the bytes ship inside the parent's tarball,
-// which is hashed. Reading that as "hashed at one path, hashless at another" made
-// every bundling package's tree self-contradictory, and the conflict verdict is
-// UNWAIVABLE: the repo became un-committable except with GUARD_SKIP, while the
-// advice ("npm install regenerates consistent entries") reproduces it exactly.
-func TestBundledAndLinkEntriesAreNotOccurrences(t *testing.T) {
+// which is hashed. It is still INSTALLED CODE, so it must stay in the inventory
+// (advisories, cooldown, SBOM) while being invisible to the integrity gates.
+// Dropping it outright hid the package from every check whenever no standalone
+// occurrence existed; counting it as an ordinary hashless occurrence made every
+// bundling package look self-contradictory, and that verdict is unwaivable.
+func TestBundledEntriesStayInInventory(t *testing.T) {
 	lock := []byte(`{"lockfileVersion":3,"packages":{
 	  "":{"name":"root"},
 	  "node_modules/bar":{"version":"1.2.3","resolved":"https://registry.npmjs.org/bar.tgz","integrity":"sha512-bar"},
 	  "node_modules/foo/node_modules/bar":{"version":"1.2.3","inBundle":true},
-	  "node_modules/mylib":{"version":"1.0.0","link":true},
-	  "node_modules/foo":{"version":"2.0.0","resolved":"https://registry.npmjs.org/foo.tgz","integrity":"sha512-foo"}
+	  "node_modules/onlybundled":{"version":"9.9.9","inBundle":true},
+	  "node_modules/mylib":{"version":"1.0.0","link":true}
 	}}`)
 	pkgs, _, err := parseNamed("package-lock.json", lock)
 	if err != nil {
@@ -318,18 +319,44 @@ func TestBundledAndLinkEntriesAreNotOccurrences(t *testing.T) {
 	for _, p := range pkgs {
 		byKey[p.Key()] = p
 	}
-	bar, ok := byKey["bar@1.2.3"]
+	// A package that ONLY ever appears bundled must still be in the inventory,
+	// or its advisories and cooldown are never checked at all.
+	only, ok := byKey["onlybundled@9.9.9"]
 	if !ok {
-		t.Fatal("bar@1.2.3 missing entirely")
+		t.Fatal("a purely-bundled package vanished from the inventory — advisories/cooldown/SBOM would never see it")
 	}
+	if !only.Bundled {
+		t.Error("onlybundled: Bundled = false, so the integrity gates would report it unhashed")
+	}
+	// Standalone + bundled occurrences: the standalone one decides, no conflict.
+	bar := byKey["bar@1.2.3"]
 	if bar.Conflict {
-		t.Error("a bundled copy was read as a contradicting occurrence — this gate is unwaivable, so the repo could not be committed at all")
+		t.Error("a bundled copy was read as a contradicting occurrence (unwaivable — the repo could not be committed)")
+	}
+	if bar.Bundled {
+		t.Error("bar has a standalone hashed occurrence, so it is not a bundled-only package")
 	}
 	if bar.Integrity != "sha512-bar" {
-		t.Errorf("Integrity = %q, want the real entry's hash", bar.Integrity)
+		t.Errorf("Integrity = %q, want the standalone entry's hash", bar.Integrity)
 	}
 	if _, ok := byKey["mylib@1.0.0"]; ok {
-		t.Error("a link: entry was kept — it has no registry identity to check")
+		t.Error("a link: entry was kept — it has no registry identity")
+	}
+}
+
+// The order of occurrences must not change the outcome.
+func TestBundledMergeIsOrderIndependent(t *testing.T) {
+	standalone := Entry{Name: "bar", Version: "1.2.3", Path: "node_modules/bar",
+		Resolved: "https://r/bar.tgz", Integrity: "sha512-bar"}
+	bundled := Entry{Name: "bar", Version: "1.2.3", Path: "node_modules/foo/node_modules/bar", Bundled: true}
+	for _, order := range [][]Entry{{standalone, bundled}, {bundled, standalone}} {
+		got := dedupe(order)
+		if len(got) != 1 {
+			t.Fatalf("dedupe = %+v, want one entry", got)
+		}
+		if got[0].Conflict || got[0].Bundled || got[0].Integrity != "sha512-bar" {
+			t.Errorf("order %q first: got %+v, want the standalone fields and no conflict", order[0].Path, got[0])
+		}
 	}
 }
 
@@ -391,5 +418,39 @@ func TestUnionDoesNotInventConflicts(t *testing.T) {
 		if u := Union(order...); !u[0].Conflict {
 			t.Error("a real in-lockfile conflict was lost in the union")
 		}
+	}
+}
+
+// Every read error used to become "no lockfile — nothing to check": a silent
+// all-clear from a check that never ran.
+func TestInstalledAtDistinguishesAbsenceFromFailure(t *testing.T) {
+	// Confirmed absence: an empty dir really has no lockfile.
+	if _, _, err := InstalledAt(t.TempDir(), ""); !os.IsNotExist(err) {
+		t.Errorf("empty dir: err = %v, want ErrNotExist", err)
+	}
+	// A bad ref is a FAILURE, not an absence.
+	dir := gitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte(npmLock("ms")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := InstalledAt(dir, "no-such-ref")
+	if err == nil || os.IsNotExist(err) {
+		t.Errorf("bad ref: err = %v, want a real error", err)
+	}
+	// Not a git repo at all is a failure too, for a ref-based read.
+	if _, _, err := InstalledAt(t.TempDir(), ":"); err == nil || os.IsNotExist(err) {
+		t.Errorf("non-repo index read: err = %v, want a real error", err)
+	}
+	// An unreadable working-tree lockfile is a failure, not an absence.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 000 is not enforced")
+	}
+	unreadable := t.TempDir()
+	p := filepath.Join(unreadable, "package-lock.json")
+	if err := os.WriteFile(p, []byte(npmLock("ms")), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := InstalledAt(unreadable, ""); err == nil || os.IsNotExist(err) {
+		t.Errorf("unreadable lockfile: err = %v, want a permission error", err)
 	}
 }

@@ -265,6 +265,9 @@ func TestProtectionVerdict(t *testing.T) {
 		{"stale/foreign hook", stale, true, true, false, "not depguard's current shim"},
 		{"guard missing", current, false, true, false, "not on PATH"},
 		{"invalid policy", current, true, false, false, "policy invalid"},
+		// Present, current, but chained after a foreign `exit`: git runs the
+		// file and never reaches depguard's block — must NOT read as protected.
+		{"unreachable block", hooks.InstalledState{PreCommit: true, PreCommitCurrent: true, PreCommitUnreachable: true}, true, true, false, "UNREACHABLE"},
 	}
 	for _, c := range cases {
 		ok, msg := protectionVerdict(c.st, c.guardOnPath, c.policyOK)
@@ -427,6 +430,8 @@ func TestOutgoingRevArgs(t *testing.T) {
 		{localSHA: "local1", remoteSHA: "remote1"},
 		{localSHA: "local2", remoteSHA: zero},
 	}, "")
+	// No remote name → exclude NOTHING and scan the whole branch. Excluding every
+	// remote's commits would be the unsafe guess; a full scan is only slower.
 	want := [][]string{{"remote1..local1"}, {"local2", "--not", "--remotes"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("outgoingRevArgs = %v, want %v", got, want)
@@ -869,8 +874,11 @@ func TestOutgoingRevArgsScopedToRemote(t *testing.T) {
 	if got := outgoingRevArgs(refs, "origin"); !reflect.DeepEqual(got, [][]string{{"local1", "--not", "--remotes=origin"}}) {
 		t.Errorf("with a remote: %v, want it scoped to origin", got)
 	}
+	// No remote name (a pre-1.2.1 v3 shim, a URL push): keep the all-remotes
+	// exclusion rather than a full-history scan, which would turn every not-yet
+	// re-initialised repo's next push into a wall of historic findings.
 	if got := outgoingRevArgs(refs, ""); !reflect.DeepEqual(got, [][]string{{"local1", "--not", "--remotes"}}) {
-		t.Errorf("without a remote: %v, want the conservative all-remotes form", got)
+		t.Errorf("without a remote: %v, want the all-remotes fallback", got)
 	}
 	// An existing remote branch is already an exact range; the remote name adds
 	// nothing there.
@@ -960,5 +968,165 @@ func TestGatePkgsReportsUnrecognizedEntries(t *testing.T) {
 	}
 	if _, d, err := gatePkgs(worktreeSnapshot(clean), config.Config{OnCheckErrorFail: true}); err != nil || d != nil {
 		t.Errorf("a fully-parsed lockfile reported degraded: %v (err %v)", d, err)
+	}
+}
+
+// ─── round-7 pins ────────────────────────────────────────────────────────────
+
+// pushRepo builds a repo with two branches off a shared base, each committing
+// its own package-lock.json body. Returns (dir, base, shaA, shaB).
+func pushRepo(t *testing.T, lockA, lockB string) (string, string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Skipf("git %v unavailable: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("add", "package-lock.json")
+	}
+	clean := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/base":{"version":"1.0.0","resolved":"https://registry.npmjs.org/base.tgz","integrity":"sha512-base"}}}`
+	git("init", "-q")
+	write(clean)
+	git("commit", "-qm", "base")
+	base := git("rev-parse", "HEAD")
+
+	git("checkout", "-qb", "a")
+	write(lockA)
+	git("commit", "-qm", "a")
+	shaA := git("rev-parse", "HEAD")
+
+	git("checkout", "-q", base)
+	git("checkout", "-qb", "b")
+	write(lockB)
+	git("commit", "-qm", "b")
+	shaB := git("rev-parse", "HEAD")
+	return dir, base, shaA, shaB
+}
+
+// The integrity gate judges OCCURRENCES, so it must run per ref. Over the union,
+// a clean branch A lends its hash to branch B's unhashed occurrence of the same
+// name@version and the finding disappears from the push entirely.
+func TestIntegrityGateRunsPerRef(t *testing.T) {
+	hashed := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/ms":{"version":"2.0.0","resolved":"https://registry.npmjs.org/ms.tgz","integrity":"sha512-ms"}}}`
+	unhashed := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/ms":{"version":"2.0.0","resolved":"https://registry.npmjs.org/ms.tgz"}}}`
+	dir, _, shaA, shaB := pushRepo(t, hashed, unhashed)
+
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Registry: "https://registry.npmjs.org"}
+	snap := hookSnapshot(dir, "pre-push", []pushRef{{localSHA: shaA}, {localSHA: shaB}})
+
+	// The union hides it: branch A's hash covers branch B's occurrence.
+	union, _, err := snap.pkgs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range union {
+		if p.Key() == "ms@2.0.0" && p.Integrity == "" {
+			t.Fatal("fixture wrong: the union should have borrowed the hash")
+		}
+	}
+	err = checkLockfileIntegrity(snap, cfg, wf, true)
+	if err == nil {
+		t.Fatal("the unhashed occurrence in the second pushed branch was not reported")
+	}
+	if !strings.Contains(err.Error(), "1 unhashed") {
+		t.Errorf("error = %q, want the unhashed finding", err)
+	}
+}
+
+// Same for an off-registry tarball in one branch of a multi-ref push.
+func TestIntegrityGatePerRefOffRegistry(t *testing.T) {
+	clean := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/ms":{"version":"2.0.0","resolved":"https://registry.npmjs.org/ms.tgz","integrity":"sha512-ms"}}}`
+	evil := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/ms":{"version":"2.0.0","resolved":"https://evil.example/ms.tgz","integrity":"sha512-ms"}}}`
+	dir, _, shaA, shaB := pushRepo(t, clean, evil)
+
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := hookSnapshot(dir, "pre-push", []pushRef{{localSHA: shaA}, {localSHA: shaB}})
+	err = checkLockfileIntegrity(snap, config.Config{Registry: "https://registry.npmjs.org"}, wf, true)
+	if err == nil {
+		t.Fatal("an off-registry tarball in the second pushed branch was not reported")
+	}
+	if !strings.Contains(err.Error(), "1 off-registry") {
+		t.Errorf("error = %q, want the off-registry finding", err)
+	}
+}
+
+// perRef keeps each ref's set separate and labels it; the union stays available
+// for the name@version-only checks.
+func TestSnapshotPerRef(t *testing.T) {
+	a := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/fromA":{"version":"1.0.0","integrity":"sha512-a"}}}`
+	b := `{"lockfileVersion":3,"packages":{"":{"name":"r"},"node_modules/fromB":{"version":"1.0.0","integrity":"sha512-b"}}}`
+	dir, _, shaA, shaB := pushRepo(t, a, b)
+	views, err := hookSnapshot(dir, "pre-push", []pushRef{{localSHA: shaA}, {localSHA: shaB}}).perRef()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("perRef returned %d views, want one per ref", len(views))
+	}
+	if views[0].label != shaA[:8] || views[1].label != shaB[:8] {
+		t.Errorf("labels = %q/%q, want the short shas", views[0].label, views[1].label)
+	}
+	// The working tree collapses to a single labelled view.
+	single, err := worktreeSnapshot(dir).perRef()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(single) != 1 || single[0].label != "working tree" {
+		t.Errorf("worktree perRef = %+v, want one 'working tree' view", single)
+	}
+}
+
+// gatherCheck (--json / MCP) used lockfile.Installed, which DISCARDS the skipped
+// count, so a partially-understood lockfile reported a clean result.
+func TestGatherCheckRecordsPartialParse(t *testing.T) {
+	dir := t.TempDir()
+	lock := "lockfileVersion: '6.0'\n\npackages:\n\n" +
+		"  /lodash@4.17.21:\n    resolution: {integrity: sha512-abc}\n" +
+		"  some-future-shape:\n    resolution: {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Registry: "http://127.0.0.1:1"}
+	res, err := gatherCheck(dir, cfg, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, d := range res.Degraded {
+		if strings.Contains(d, "lockfile parse") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Degraded = %v, want the unrecognized-entry count recorded", res.Degraded)
+	}
+	// And under on-check-error: fail that must flip ok.
+	cfg.OnCheckErrorFail = true
+	res, err = gatherCheck(dir, cfg, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OK {
+		t.Error("ok = true over a partial parse under on-check-error: fail")
 	}
 }

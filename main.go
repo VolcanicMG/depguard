@@ -888,6 +888,7 @@ func cmdCheck(args []string) error {
 			}
 		}
 	}
+	warnUnknownRemote(refs, remote)
 	secErr := checkSecrets(dir, cfg, wf, quiet, refs, remote)
 	advErr := checkAdvisories(snap, cfg, quiet, confirm, wf)
 	freshErr := checkFreshness(snap, cfg, quiet, all, confirm, wf, refs, remote)
@@ -1198,7 +1199,10 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			}
 		}
 	}
-	pkgs, err := lockfile.Installed(dir)
+	// InstalledAt, not Installed: the skipped-entry count is part of the answer.
+	// Installed discards it, so a partially-understood lockfile never reached
+	// res.Degraded and --json/MCP reported a clean result over a partial parse.
+	pkgs, skipped, err := lockfile.InstalledAt(dir, "")
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No deps to vet, but a tracked secret still gates.
@@ -1206,6 +1210,10 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			return res, nil
 		}
 		return res, err
+	}
+	if skipped > 0 {
+		res.Degraded = append(res.Degraded,
+			fmt.Sprintf("lockfile parse: %d unrecognized entr(ies) skipped", skipped))
 	}
 	// OSV is meaningless for a loopback/mock registry (those versions aren't in
 	// OSV's public npm namespace) — same skip the proxy applies. For a real
@@ -1337,12 +1345,32 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 // host check — they are declared to live on a private registry. `allow:` is a
 // cooldown escape hatch and exempts NOTHING here. Gates like the advisory layer.
 func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, quiet bool) error {
-	pkgs, degraded, err := gatePkgs(snap, cfg)
+	// PER REF, not over the union: an occurrence-level finding belongs to the
+	// lockfile it appears in. Unioning first let a clean branch in the same push
+	// lend its hash (or its registry host) to a bad occurrence in another.
+	views, err := snap.perRef()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
+	}
+	var degraded error
+	total, skipped := 0, 0
+	for _, v := range views {
+		total += len(v.pkgs)
+		skipped += v.skipped
+	}
+	if skipped > 0 {
+		degraded = cfg.Degrade("lockfile parse",
+			fmt.Errorf("%d unrecognized entr(ies) skipped in the %s", skipped, snap.label))
+	}
+	// Only label findings by ref when there is more than one to tell apart.
+	label := func(v refPkgs, key string) string {
+		if len(views) < 2 {
+			return key
+		}
+		return v.label + ": " + key
 	}
 	regHost := hostOf(cfg.Registry)
 	now := time.Now()
@@ -1363,30 +1391,34 @@ func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, 
 			*into = append(*into, display)
 		}
 	}
-	for _, p := range pkgs {
-		// Not waivable: a self-contradicting lockfile has to be fixed, not
-		// accepted — we can't say which of the two records will win.
-		if p.Conflict {
-			conflict = append(conflict, p.Key())
-		}
-		if !checkableDep(p) {
-			continue
-		}
-		// The host comparison needs an actual tarball URL; pnpm normally records
-		// none, and those entries are still hash-checked below.
-		if hasTarballURL(p) && !cfg.Internal(p.Name) {
-			if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
-				waiveOrKeep(offRegistryWaiverID(p.Key()),
-					fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost), &offReg)
+	for _, v := range views {
+		for _, p := range v.pkgs {
+			// Not waivable: a self-contradicting lockfile has to be fixed, not
+			// accepted — we can't say which of the two records will win.
+			if p.Conflict {
+				conflict = append(conflict, label(v, p.Key()))
 			}
-		}
-		if p.Integrity == "" {
-			waiveOrKeep(unhashedWaiverID(p.Key()), p.Key(), &noHash)
+			// A bundled copy has no tarball of its own: its bytes are covered by
+			// the parent's hash. Nothing here to verify, so nothing to report.
+			if p.Bundled || !checkableDep(p) {
+				continue
+			}
+			// The host comparison needs an actual tarball URL; pnpm normally
+			// records none, and those entries are still hash-checked below.
+			if hasTarballURL(p) && !cfg.Internal(p.Name) {
+				if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
+					waiveOrKeep(offRegistryWaiverID(p.Key()),
+						label(v, fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost)), &offReg)
+				}
+			}
+			if p.Integrity == "" {
+				waiveOrKeep(unhashedWaiverID(p.Key()), label(v, p.Key()), &noHash)
+			}
 		}
 	}
 	if len(offReg) == 0 && len(noHash) == 0 && len(conflict) == 0 {
 		if !quiet && degraded == nil {
-			fmt.Printf("guard: lockfile integrity ok (%d version(s), %s) %s\n", len(pkgs), snap.label, ui.OK())
+			fmt.Printf("guard: lockfile integrity ok (%d version(s), %s) %s\n", total, snap.label, ui.OK())
 		}
 		return degraded
 	}
@@ -1915,6 +1947,56 @@ func hookSnapshot(dir, hook string, refs []pushRef) snapshot {
 //
 // A ref with no lockfile at all is skipped rather than fatal (a branch that
 // predates the lockfile); os.ErrNotExist comes back only when NO ref had one.
+// refPkgs is one ref's own package set — the view the OCCURRENCE-level gates
+// need. Integrity and provenance judge a specific tarball at a specific path, so
+// they must not see the union: a clean branch A lends its hash to branch B's
+// unhashed occurrence and the finding disappears from the push.
+type refPkgs struct {
+	ref     string
+	label   string
+	pkgs    []lockfile.Pkg
+	skipped int
+}
+
+// perRef returns each ref's package set separately, in ref order. For the
+// working tree (or a single ref) that is one entry, so the loop collapses.
+func (s snapshot) perRef() ([]refPkgs, error) {
+	if len(s.refs) == 0 {
+		p, n, err := lockfile.InstalledAt(s.dir, "")
+		if err != nil {
+			return nil, err
+		}
+		return []refPkgs{{label: s.label, pkgs: p, skipped: n}}, nil
+	}
+	var out []refPkgs
+	for _, ref := range s.refs {
+		p, n, err := lockfile.InstalledAt(s.dir, ref)
+		if os.IsNotExist(err) {
+			continue // this ref carries no lockfile; others may
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", ref, err)
+		}
+		out = append(out, refPkgs{ref: ref, label: refLabel(ref, s.label), pkgs: p, skipped: n})
+	}
+	if len(out) == 0 {
+		return nil, os.ErrNotExist
+	}
+	return out, nil
+}
+
+// refLabel names a ref in a finding. Only worth a short sha; the full one is
+// noise on every line.
+func refLabel(ref, fallback string) string {
+	if ref == "" || ref == ":" {
+		return fallback
+	}
+	if len(ref) > 8 {
+		return ref[:8]
+	}
+	return ref
+}
+
 func (s snapshot) pkgs() ([]lockfile.Pkg, int, error) {
 	if len(s.refs) == 0 {
 		return lockfile.InstalledAt(s.dir, "")
@@ -2061,7 +2143,7 @@ func outgoingRevArgs(refs []pushRef, remote string) [][]string {
 	var out [][]string
 	for _, r := range refs {
 		if isZeroSHA(r.remoteSHA) {
-			out = append(out, append([]string{r.localSHA, "--not"}, notRemotes(remote)...))
+			out = append(out, append([]string{r.localSHA}, notArgs(remote)...))
 		} else {
 			out = append(out, []string{r.remoteSHA + ".." + r.localSHA})
 		}
@@ -2074,14 +2156,37 @@ func outgoingRevArgs(refs []pushRef, remote string) [][]string {
 // branch already pushed to a fork would be treated as nothing-new when pushed to
 // the real upstream for the first time — the exact case a review gate must catch.
 //
-// When the named remote has no tracking refs yet, this excludes nothing and
-// rev-list yields the branch's whole history: a full scan, which is the
-// conservative direction to be wrong in.
+// With no remote name — a pre-1.2.1 (v3) shim that passes no --remote, a URL
+// push, or a hook chain that consumed $1 — we fall back to excluding what is on
+// ANY remote. Excluding nothing would be safer in theory but turns the next push
+// of every not-yet-re-initialised repo into a full-history secret scan and a
+// full-tree cooldown sweep, which reads as guard breaking; warnUnknownRemote
+// tells the user how to get the precise scope instead.
+//
+// When the named remote simply has no tracking refs yet, --remotes=<name>
+// matches nothing and the whole branch history is scanned — the conservative
+// outcome for a genuinely new destination.
 func notRemotes(remote string) []string {
 	if remote == "" {
 		return []string{"--remotes"}
 	}
 	return []string{"--remotes=" + remote}
+}
+
+// warnUnknownRemote explains the wider scope once per check run.
+var warnedUnknownRemote bool
+
+func warnUnknownRemote(refs []pushRef, remote string) {
+	if remote != "" || len(refs) == 0 || warnedUnknownRemote {
+		return
+	}
+	warnedUnknownRemote = true
+	fmt.Fprintln(os.Stderr, "guard: push destination unknown (old hook shim?) — outgoing scope is 'not on any remote'; re-run 'guard init' to scope it to the destination.")
+}
+
+// notArgs builds the "--not <exclusions>" tail.
+func notArgs(remote string) []string {
+	return append([]string{"--not"}, notRemotes(remote)...)
 }
 
 // pushBaseRef picks the freshness comparison base for one pushed ref: the state
@@ -2095,7 +2200,7 @@ func pushBaseRef(dir string, r pushRef, remote string) (base string, full bool) 
 	if !isZeroSHA(r.remoteSHA) {
 		return r.remoteSHA, false
 	}
-	out, err := gitOutput(dir, append([]string{"rev-list", r.localSHA, "--not"}, notRemotes(remote)...)...)
+	out, err := gitOutput(dir, append([]string{"rev-list", r.localSHA}, notArgs(remote)...)...)
 	if err != nil {
 		return "", true
 	}
@@ -2134,7 +2239,7 @@ func pushNewVersions(dir string, refs []pushRef, remote string) (pkgs []lockfile
 		add := cur
 		switch {
 		case full:
-			scope = "full tree (pushing a root commit, npm lockfile only)"
+			scope = "full tree (no reachable base for the pushed commits, npm lockfile only)"
 		case base == "":
 			continue // this ref is already on a remote
 		default:
@@ -2244,16 +2349,28 @@ func checkLicenses(snap snapshot, cfg config.Config, wf *waivers.File, quiet boo
 // complete is reported as DEGRADED (visible, never gating) — distinct from a
 // clean "none published" so a transient/hostile failure isn't read as absence.
 func checkProvenance(snap snapshot, cfg config.Config, quiet bool) error {
-	pkgs, _, err := snap.pkgs()
+	// Per ref like the integrity gate: an attestation is bound to a specific
+	// tarball HASH, so a union that borrowed a hash from another ref would verify
+	// the wrong bytes.
+	views, err := snap.perRef()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	apkgs := make([]attestation.Pkg, 0, len(pkgs))
-	for _, p := range pkgs {
-		apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
+	seen := map[string]bool{}
+	var apkgs []attestation.Pkg
+	for _, v := range views {
+		for _, p := range v.pkgs {
+			// Same identity the attestation binds to; fetch each once.
+			k := p.Key() + "|" + p.Integrity
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
+		}
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	verified, invalid, degraded := 0, 0, 0
@@ -2968,8 +3085,8 @@ func cmdStatus(args []string) error {
 	// Triggers
 	fmt.Println("\n" + ui.Bold("triggers"))
 	st := hooks.Installed(dir)
-	row("pre-commit hook", hookRow(st.PreCommit, st.PreCommitCurrent))
-	row("pre-push hook", hookRow(st.PrePush, st.PrePushCurrent))
+	row("pre-commit hook", hookRow(st.PreCommit, st.PreCommitCurrent, st.PreCommitUnreachable))
+	row("pre-push hook", hookRow(st.PrePush, st.PrePushCurrent, st.PrePushUnreachable))
 	rel, relErr := filepath.Rel(dir, st.HookDir)
 	if relErr != nil {
 		rel = st.HookDir
@@ -3017,10 +3134,12 @@ func cmdStatus(args []string) error {
 
 // hookRow renders a hook trigger row, distinguishing a current managed shim from
 // a stale/foreign one that mentions guard but lacks the current marker.
-func hookRow(present, current bool) string {
+func hookRow(present, current, unreachable bool) string {
 	switch {
 	case !present:
 		return ui.Dim("— not installed (guard init)")
+	case unreachable:
+		return ui.Warn() + " installed but UNREACHABLE (hook exits before depguard's block)"
 	case !current:
 		return ui.Warn() + " present, stale shim — run 'guard init' to refresh"
 	default:
@@ -3038,6 +3157,8 @@ func protectionVerdict(st hooks.InstalledState, guardOnPath, policyOK bool) (boo
 		return false, "not fully set up — policy invalid; fix .guardrc"
 	case !(st.PreCommit || st.PrePush):
 		return false, "not fully set up — run 'guard init'"
+	case st.PreCommitUnreachable || st.PrePushUnreachable:
+		return false, "degraded — depguard's block is installed but UNREACHABLE: the hook it was chained onto exits first; move the depguard block above that exit"
 	case !(st.PreCommitCurrent || st.PrePushCurrent):
 		return false, "degraded — a hook exists but is not depguard's current shim; run 'guard init' to refresh"
 	case !guardOnPath:
