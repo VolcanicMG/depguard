@@ -142,12 +142,28 @@ func readLockfile(dir, ref, name string) (raw []byte, found bool, err error) {
 		}
 		return b, true, nil
 	}
-	// A trailing ':' is already the separator ("" ref + ':' is git's spelling of
-	// the index), so don't double it.
-	spec := strings.TrimSuffix(ref, ":") + ":" + name
-	if perr := exec.Command("git", "-C", dir, "cat-file", "-e", spec).Run(); perr != nil {
-		return nil, false, nil // path not in this ref — try the next lockfile name
+	// Absence must come from a SUCCESSFUL listing of the index/tree, never from
+	// a failed probe: `cat-file -e` exits non-zero for "no such path" and for
+	// "cannot read the index/tree/object" alike, and only the first means
+	// "nothing to check". ls-files / ls-tree exit 0 with empty output for a
+	// missing path and fail loudly (128) when the index/tree can't be read.
+	// No --error-unmatch and no message parsing: git's error strings are
+	// localized. ":(top)" anchors the pathspec at the repo root so the probe
+	// and the root-relative `git show <ref>:<name>` name the same file.
+	var list *exec.Cmd
+	if ref == ":" {
+		list = exec.Command("git", "-C", dir, "ls-files", "--", ":(top)"+name)
+	} else {
+		list = exec.Command("git", "-C", dir, "ls-tree", "--name-only", ref, "--", ":(top)"+name)
 	}
+	listed, lerr := list.Output()
+	if lerr != nil {
+		return nil, false, fmt.Errorf("git listing %s in %s: %w", name, ref, lerr)
+	}
+	if strings.TrimSpace(string(listed)) == "" {
+		return nil, false, nil // listing succeeded; the path is simply not in it
+	}
+	spec := strings.TrimSuffix(ref, ":") + ":" + name
 	out, oerr := exec.Command("git", "-C", dir, "show", spec).Output()
 	if oerr != nil {
 		return nil, false, fmt.Errorf("git show %s: %w", spec, oerr)

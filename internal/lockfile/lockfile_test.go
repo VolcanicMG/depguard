@@ -453,4 +453,24 @@ func TestInstalledAtDistinguishesAbsenceFromFailure(t *testing.T) {
 	if _, _, err := InstalledAt(unreadable, ""); err == nil || os.IsNotExist(err) {
 		t.Errorf("unreadable lockfile: err = %v, want a permission error", err)
 	}
+	// The repo resolves but the INDEX cannot be read: that used to look like
+	// "path not in this ref" (cat-file -e fails either way) and became an
+	// all-clear. Absence must come from a successful listing.
+	idx := gitRepo(t)
+	if err := os.WriteFile(filepath.Join(idx, "package-lock.json"), []byte(npmLock("ms")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", idx, "add", "package-lock.json").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	if err := os.Chmod(filepath.Join(idx, ".git", "index"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := InstalledAt(idx, ":"); err == nil || os.IsNotExist(err) {
+		t.Errorf("unreadable index: err = %v, want a real error, not absence", err)
+	}
+	// And a readable index that simply lacks the file IS absence.
+	if _, _, err := InstalledAt(gitRepo(t), ":"); !os.IsNotExist(err) {
+		t.Errorf("empty index: err = %v, want ErrNotExist", err)
+	}
 }
