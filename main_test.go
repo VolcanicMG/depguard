@@ -865,6 +865,27 @@ func TestSnapshotPkgsFailsClosedOnParseError(t *testing.T) {
 	}
 }
 
+// An unknown destination is an accepted, EXPLICIT tradeoff: warn-and-continue by
+// default, but under on-check-error: fail an imprecise outgoing scope gates like
+// any other check that could not complete.
+func TestUnknownRemotePolicy(t *testing.T) {
+	refs := []pushRef{{localSHA: "0000000000000000000000000000000000000001"}}
+	warn := config.Config{}
+	if err := unknownRemote(warn, refs, ""); err != nil {
+		t.Errorf("warn policy: err = %v, want nil (warning only)", err)
+	}
+	fail := config.Config{OnCheckErrorFail: true}
+	if err := unknownRemote(fail, refs, ""); err == nil || !strings.Contains(err.Error(), "guard init") {
+		t.Errorf("fail policy: err = %v, want a gating error naming the fix", err)
+	}
+	if err := unknownRemote(fail, refs, "origin"); err != nil {
+		t.Errorf("known remote: err = %v, want nil", err)
+	}
+	if err := unknownRemote(fail, nil, ""); err != nil {
+		t.Errorf("no refs (not a pre-push): err = %v, want nil", err)
+	}
+}
+
 // "Outgoing" is relative to the DESTINATION. --remotes excludes commits present
 // on ANY remote, so a branch already pushed to a fork looked like nothing-new
 // when first pushed to the real upstream — the exact case the gate exists for.

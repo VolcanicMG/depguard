@@ -136,7 +136,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │                    --remote=$1 names the DESTINATION, so "outgoing" means
    │                    --not --remotes=<remote>, not --remotes (any remote);
    │                    an UNKNOWN remote (old shim, URL push) falls back to
-   │                    --remotes with a re-run-guard-init note
+   │                    --remotes via cfg.Degrade: warn by default, gate under fail
    ├─ hookSnapshot ──── the lockfile state THIS phase acts on: ":" (index) at
    │                    pre-commit, the pushed shas at pre-push, else the working
    │                    tree. Every lockfile gate reads it via snapshot.pkgs() →

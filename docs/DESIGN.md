@@ -1,4 +1,4 @@
-# depguard — Design
+# depguard — Design Absence is established only by a SUCCESSFUL listing of the index or tree (`ls-files` / `ls-tree`); a failed probe is an error, because `cat-file -e` fails identically for "no such path" and "cannot read the index".
 
 A local-first guard against supply-chain attacks in package dependencies (npm first).
 Automatic, per-repo, no background process.
@@ -106,10 +106,14 @@ When the named remote has no tracking refs yet, `--remotes=<name>` matches
 nothing and the whole branch is scanned — the conservative direction. When the
 remote name is UNKNOWN (a pre-1.2.1 shim that passes no `--remote`, a push by
 URL, or a hook chain that consumed `$1`) guard falls back to `--not --remotes`
-(any remote) and says so, pointing at `guard init`: "already on some other
-remote" is weaker evidence than the destination's own refs, but a full-history
-scan would turn every not-yet-re-initialised repo's next push into a wall of
-historic findings — the false-positive fatigue §11b warns against.
+(any remote). That is an explicit, accepted tradeoff — history already on some
+OTHER remote can still be new to this destination — so it is routed through the
+`on-check-error` policy like any check that could not complete precisely: under
+`warn` (default) the check runs with the wider scope and prints the fix (re-run
+`guard init`); under `fail` the push is refused with that same message. A
+full-history scan was rejected as the fallback because it would turn every
+not-yet-re-initialised repo's next push into a wall of historic findings — the
+false-positive fatigue §11b warns against.
 
 Both commit-hook and PR-check triggers are enabled (chosen): the hook catches your
 own installs and later-flagged deps; the PR check stops a teammate's bad dep before

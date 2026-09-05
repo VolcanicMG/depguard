@@ -46,7 +46,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.2.1"
+const version = "1.2.2"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -888,7 +888,7 @@ func cmdCheck(args []string) error {
 			}
 		}
 	}
-	warnUnknownRemote(refs, remote)
+	remErr := unknownRemote(cfg, refs, remote)
 	secErr := checkSecrets(dir, cfg, wf, quiet, refs, remote)
 	advErr := checkAdvisories(snap, cfg, quiet, confirm, wf)
 	freshErr := checkFreshness(snap, cfg, quiet, all, confirm, wf, refs, remote)
@@ -912,6 +912,7 @@ func cmdCheck(args []string) error {
 	if !quiet {
 		printCheckSummary(dir, map[string]error{
 			"secrets":     secErr,
+			"destination": remErr,
 			"advisories":  advErr,
 			"cooldown":    freshErr,
 			"integrity":   intErr,
@@ -924,6 +925,9 @@ func cmdCheck(args []string) error {
 	// lead — an uploaded credential is the highest-stakes, least-recoverable miss.
 	if secErr != nil {
 		return secErr
+	}
+	if remErr != nil {
+		return remErr // the secret scan above ran with an imprecise scope
 	}
 	if advErr != nil {
 		return advErr
@@ -2173,15 +2177,17 @@ func notRemotes(remote string) []string {
 	return []string{"--remotes=" + remote}
 }
 
-// warnUnknownRemote explains the wider scope once per check run.
-var warnedUnknownRemote bool
-
-func warnUnknownRemote(refs []pushRef, remote string) {
-	if remote != "" || len(refs) == 0 || warnedUnknownRemote {
-		return
+// unknownRemote is the accepted tradeoff made explicit: with no destination
+// name the outgoing scope is "not on any remote", which can miss history that
+// is new to THIS destination. Under the default policy that is a warning with
+// the fix in it; under on-check-error: fail an incomplete scope is a gate, like
+// every other check that could not complete precisely.
+func unknownRemote(cfg config.Config, refs []pushRef, remote string) error {
+	if remote != "" || len(refs) == 0 {
+		return nil
 	}
-	warnedUnknownRemote = true
-	fmt.Fprintln(os.Stderr, "guard: push destination unknown (old hook shim?) — outgoing scope is 'not on any remote'; re-run 'guard init' to scope it to the destination.")
+	return cfg.Degrade("push-destination scoping",
+		errors.New("destination unknown (pre-1.2.1 hook shim, or a push by URL) — outgoing scope fell back to 'not on any remote'; re-run 'guard init' so the hook passes --remote"))
 }
 
 // notArgs builds the "--not <exclusions>" tail.

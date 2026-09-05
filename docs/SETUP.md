@@ -51,7 +51,7 @@ sha256sum --ignore-missing -c SHA256SUMS    # macOS: shasum -a 256 --ignore-miss
 
 chmod +x "$ASSET"
 sudo mv "$ASSET" /usr/local/bin/guard       # or anywhere on your PATH
-guard version                               # -> guard 1.2.1
+guard version                               # -> guard 1.2.2
 ```
 
 #### Verify the release came from this repo's CI (recommended)
@@ -83,7 +83,7 @@ Invoke-WebRequest "$base/$asset" -OutFile guard.exe
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
 Move-Item -Force guard.exe "$env:USERPROFILE\bin\guard.exe"   # a dir already on your PATH
-guard version                               # -> guard 1.2.1
+guard version                               # -> guard 1.2.2
 ```
 
 > **Windows:** SmartScreen may warn on the unsigned binary — *More info → Run anyway*.
@@ -97,7 +97,7 @@ Needs Go 1.26.4; produces the same single, zero-dependency binary.
 cd /path/to/depguard
 go build -o guard .            # zero dependencies
 sudo mv guard /usr/local/bin/
-guard version                  # -> guard 1.2.1
+guard version                  # -> guard 1.2.2
 ```
 
 (On this machine Go lives at `~/.local/go/bin/go`, not on PATH — use that path to build.)
