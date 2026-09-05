@@ -18,8 +18,11 @@ import (
 // running. v1 was the pre-marker shim (no version line) — treated as foreign and
 // chained onto, since we can't be sure a marker-less block is exclusively ours.
 // v3 added --hook=, which is what makes the check PHASE-AWARE (pre-push looks at
-// the outgoing commits, not just the working tree).
-const shimVersion = "3"
+// the outgoing commits, not just the working tree). v4 added --remote=$1, which
+// scopes "outgoing" to the destination — the v3 body SHIPPED in 1.2.0, so
+// changing it without a bump would have left every installed v3 shim marked
+// current and never upgraded.
+const shimVersion = "4"
 
 // shimBegin / shimEnd are CONSTANT (version-independent) sentinels wrapping
 // depguard's managed region so a later init can find and REPLACE it. The version
@@ -389,9 +392,14 @@ type InstalledState struct {
 	PrePush          bool // .git/hooks/pre-push calls guard
 	PreCommitCurrent bool // ...and carries depguard's CURRENT managed shim marker
 	PrePushCurrent   bool // ...and carries depguard's CURRENT managed shim marker
-	Npmrc            bool // .npmrc pins ignore-scripts=true
-	CIWorkflow       bool // .github/workflows/depguard.yml present
-	Husky            bool // a .husky dir exists
+	// PreCommitUnreachable / PrePushUnreachable: the managed block is present and
+	// current, but sits after an unconditional `exit` in the hook it was chained
+	// onto — so it never runs. Everything else would report "protected".
+	PreCommitUnreachable bool
+	PrePushUnreachable   bool
+	Npmrc                bool // .npmrc pins ignore-scripts=true
+	CIWorkflow           bool // .github/workflows/depguard.yml present
+	Husky                bool // a .husky dir exists
 	// HuskyInactive: that .husky dir is NOT what git uses (core.hooksPath unset),
 	// so anything installed there would never run.
 	HuskyInactive bool
@@ -410,6 +418,10 @@ func Installed(dir string) InstalledState {
 	s.PrePush = hookCallsGuard(pp)
 	s.PreCommitCurrent = hookIsCurrent(pc)
 	s.PrePushCurrent = hookIsCurrent(pp)
+	// Only meaningful for a hook git would actually run; a non-executable file
+	// is "not installed", and saying "unreachable" would misdiagnose the cause.
+	s.PreCommitUnreachable = s.PreCommit && hookUnreachable(pc)
+	s.PrePushUnreachable = s.PrePush && hookUnreachable(pp)
 	if b, err := os.ReadFile(filepath.Join(dir, ".npmrc")); err == nil {
 		s.Npmrc = strings.Contains(string(b), "ignore-scripts=true")
 	}
@@ -436,4 +448,20 @@ func hookCallsGuard(path string) bool {
 func hookIsCurrent(path string) bool {
 	b, err := os.ReadFile(path)
 	return err == nil && hasCurrentShim(string(b)) && isExecutable(path)
+}
+
+// hookUnreachable reports a managed block that git will never reach because the
+// hook it was chained onto ends in an unconditional `exit` BEFORE it. The file
+// carries a current marker, so every other signal says "protected" — which is
+// exactly the state worth naming out loud.
+func hookUnreachable(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	i := strings.Index(string(b), shimBegin)
+	if i < 0 {
+		return false
+	}
+	return endsUnconditionalExit(string(b)[:i])
 }

@@ -134,7 +134,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    ├─ parsePushRefs ─── pre-push only: git's "<local ref> <local sha> <remote ref>
    │                    <remote sha>" lines on stdin (inherited through the shim);
    │                    --remote=$1 names the DESTINATION, so "outgoing" means
-   │                    --not --remotes=<remote>, not --remotes (any remote)
+   │                    --not --remotes=<remote>, not --remotes (any remote);
+   │                    an UNKNOWN remote (old shim, URL push) falls back to
+   │                    --remotes with a re-run-guard-init note
    ├─ hookSnapshot ──── the lockfile state THIS phase acts on: ":" (index) at
    │                    pre-commit, the pushed shas at pre-push, else the working
    │                    tree. Every lockfile gate reads it via snapshot.pkgs() →
@@ -157,9 +159,14 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │                     --all      → full tree
    │                     → freshness.Check: publish dates from registry,
    │                       violations fail the commit/PR; allowlist skipped
-   └─ checkLockfileIntegrity ── off-registry host (internal-scopes exempt), missing
-                         hash, and Pkg.Conflict (same name@version, two records,
-                         different tarball/integrity — not waivable)
+   └─ checkLockfileIntegrity ── PER REF (snapshot.perRef, not the union — the
+                         union lets a clean branch lend its hash to a bad
+                         occurrence in another): off-registry host
+                         (internal-scopes exempt), missing hash, and Pkg.Conflict
+                         (same name@version, two records, different
+                         tarball/integrity — not waivable). Pkg.Bundled entries
+                         are inventory-only and skipped here. checkProvenance
+                         loops the same way (an attestation binds to a HASH).
 
 Every fail-open lookup routes through `config.Degrade(quiet, what, err)` —
 `advisory check`, `freshness check`, `maintainer check`, `provenance check`,

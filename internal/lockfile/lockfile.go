@@ -23,6 +23,8 @@ type Entry struct {
 	// Resolved/Integrity mirror the lockfile fields (see Pkg).
 	Resolved  string
 	Integrity string
+	// Bundled mirrors Pkg.Bundled — this occurrence ships inside a parent tarball.
+	Bundled bool
 }
 
 // Pkg is one installed name@version pair, location-independent. A dependency
@@ -52,6 +54,12 @@ type Pkg struct {
 	// without this flag the disagreement — the signature of a hand-edited or
 	// partially poisoned lockfile — would vanish silently.
 	Conflict bool
+	// Bundled: every occurrence of this name@version ships INSIDE a parent's
+	// tarball, so npm records no URL and no hash for it — the parent's integrity
+	// hash already covers the bytes. It is still installed code, so advisories,
+	// the cooldown and the SBOM must see it; only the integrity gates skip it,
+	// because it has nothing of its own to verify.
+	Bundled bool
 }
 
 // Key is the dedupe/identity key for a package version ("name@version").
@@ -95,9 +103,21 @@ var lockfileNames = []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
 // the caller can report an incompletely-understood lockfile instead of quietly
 // checking a subset of it.
 func InstalledAt(dir, ref string) (pkgs []Pkg, skipped int, err error) {
+	// Validate the ref ONCE. After this, a per-name lookup that fails means the
+	// path is absent from an otherwise-fine ref — git reports that as exit 128
+	// ("not a valid object name"), indistinguishable by exit code from a broken
+	// repo, so the two have to be separated here instead.
+	if ref != "" {
+		if rerr := refUsable(dir, ref); rerr != nil {
+			return nil, 0, rerr
+		}
+	}
 	for _, name := range lockfileNames {
-		raw, rerr := readLockfile(dir, ref, name)
+		raw, found, rerr := readLockfile(dir, ref, name)
 		if rerr != nil {
+			return nil, 0, rerr // a real failure — never mistake it for "no deps"
+		}
+		if !found {
 			continue
 		}
 		return parseNamed(name, raw)
@@ -106,13 +126,50 @@ func InstalledAt(dir, ref string) (pkgs []Pkg, skipped int, err error) {
 }
 
 // readLockfile reads one lockfile from the working tree (ref "") or from git.
-func readLockfile(dir, ref, name string) ([]byte, error) {
+// It separates CONFIRMED ABSENCE (found=false, err=nil — try the next name) from
+// FAILURE (err non-nil). Treating every read error as absence meant an unreadable
+// file, a broken git or a bad ref all ended as "no lockfile here — nothing to
+// check": a silent all-clear from a check that never ran. The ref itself is
+// validated by the caller (refUsable), so here a git miss means "no such path".
+func readLockfile(dir, ref, name string) (raw []byte, found bool, err error) {
 	if ref == "" {
-		return os.ReadFile(filepath.Join(dir, name))
+		b, rerr := os.ReadFile(filepath.Join(dir, name))
+		if os.IsNotExist(rerr) {
+			return nil, false, nil
+		}
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		return b, true, nil
 	}
 	// A trailing ':' is already the separator ("" ref + ':' is git's spelling of
 	// the index), so don't double it.
-	return exec.Command("git", "-C", dir, "show", strings.TrimSuffix(ref, ":")+":"+name).Output()
+	spec := strings.TrimSuffix(ref, ":") + ":" + name
+	if perr := exec.Command("git", "-C", dir, "cat-file", "-e", spec).Run(); perr != nil {
+		return nil, false, nil // path not in this ref — try the next lockfile name
+	}
+	out, oerr := exec.Command("git", "-C", dir, "show", spec).Output()
+	if oerr != nil {
+		return nil, false, fmt.Errorf("git show %s: %w", spec, oerr)
+	}
+	return out, true, nil
+}
+
+// refUsable reports whether ref is something git can actually read from here, so
+// a missing FILE can be told apart from a missing repo or a bogus ref. Both look
+// like exit 128 from cat-file, and only one of them means "nothing to check".
+func refUsable(dir, ref string) error {
+	if ref == ":" {
+		// The index exists whenever the repo does.
+		if err := exec.Command("git", "-C", dir, "rev-parse", "--git-dir").Run(); err != nil {
+			return fmt.Errorf("git rev-parse --git-dir: %w", err)
+		}
+		return nil
+	}
+	if err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run(); err != nil {
+		return fmt.Errorf("git cannot resolve ref %q: %w", ref, err)
+	}
+	return nil
 }
 
 // parseNamed dispatches on the lockfile's FILENAME — the only thing that
@@ -186,7 +243,7 @@ func dedupe(entries []Entry) []Pkg {
 	for _, e := range sorted {
 		// FromRegistry stays false: an npm lockfile records the tarball URL for
 		// real registry deps, so Resolved alone classifies these.
-		p := Pkg{Name: e.Name, Version: e.Version, Resolved: e.Resolved, Integrity: e.Integrity}
+		p := Pkg{Name: e.Name, Version: e.Version, Resolved: e.Resolved, Integrity: e.Integrity, Bundled: e.Bundled}
 		if i, ok := at[p.Key()]; ok {
 			merge(&out[i], p)
 			continue
@@ -220,6 +277,19 @@ func merge(dst *Pkg, src Pkg) { mergeInto(dst, src, true) }
 func mergeAcross(dst *Pkg, src Pkg) { mergeInto(dst, src, false) }
 
 func mergeInto(dst *Pkg, src Pkg, sameFile bool) {
+	// A bundled occurrence has no fields of its own to compare: it is neither
+	// unhashed nor in disagreement, its bytes just live in the parent's tarball.
+	// When the other occurrence is standalone, the standalone one decides.
+	dst.Conflict = dst.Conflict || src.Conflict // never lose a flag, whichever side is bundled
+	if src.Bundled {
+		return
+	}
+	if dst.Bundled {
+		dst.Resolved, dst.Integrity, dst.Bundled = src.Resolved, src.Integrity, false
+		dst.FromRegistry = dst.FromRegistry || src.FromRegistry
+		dst.Conflict = dst.Conflict || src.Conflict
+		return
+	}
 	if dst.Resolved == "" {
 		dst.Resolved = src.Resolved
 	} else if sameFile && src.Resolved != "" && src.Resolved != dst.Resolved {
@@ -301,19 +371,25 @@ func parseBytes(raw []byte) ([]Entry, error) {
 		if path == "" || p.Version == "" {
 			continue // "" is the root project itself
 		}
-		// A bundled copy and a link are not independently-fetched packages:
-		// neither carries a resolved URL or a hash, by design. Treating them as
-		// occurrences of the name would make every bundling package's tree look
-		// self-contradictory (hashed at one path, hashless at the bundled one) —
-		// and that verdict is unwaivable, so the repo could not be committed at
-		// all, while the advice ("npm install regenerates consistent entries")
-		// reproduces the very same lockfile.
-		// inBundle is attacker-writable, so trust the SHAPE, not the flag: a
-		// genuine bundled copy records neither a URL nor a hash. An entry that
-		// claims inBundle but carries a fetchable resolved/integrity is checked.
-		if p.Link || (p.InBundle && p.Resolved == "" && p.Integrity == "") {
+		// A link is a symlink to a workspace or a local path: no registry
+		// identity, nothing to inventory. Dropped.
+		if p.Link {
 			continue
 		}
+		// A bundled copy records neither a URL nor a hash by design — its bytes
+		// ship inside the PARENT's hashed tarball. It is still installed code, so
+		// it stays in the INVENTORY (advisories, cooldown, SBOM) and is marked
+		// instead; only the integrity gates skip Bundled entries. Dropping it
+		// outright hid the package from every check whenever no standalone
+		// occurrence existed, and treating it as an ordinary hashless occurrence
+		// made every bundling package's tree look self-contradictory — a verdict
+		// that is unwaivable and whose advice ("npm install regenerates
+		// consistent entries") reproduces the very same lockfile.
+		//
+		// inBundle is attacker-writable, so trust the SHAPE, not the flag: an
+		// entry that claims inBundle but carries a fetchable resolved/integrity
+		// is an ordinary entry and is checked like one.
+		bundled := p.InBundle && p.Resolved == "" && p.Integrity == ""
 		// The package name is everything after the LAST "node_modules/",
 		// which handles nested deps like "node_modules/a/node_modules/b".
 		idx := strings.LastIndex(path, "node_modules/")
@@ -326,6 +402,7 @@ func parseBytes(raw []byte) ([]Entry, error) {
 			Path:      path,
 			Resolved:  p.Resolved,
 			Integrity: p.Integrity,
+			Bundled:   bundled,
 		})
 	}
 	return out, nil

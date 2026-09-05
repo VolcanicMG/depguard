@@ -92,11 +92,24 @@ invisible to a HEAD diff — yet it is exactly what the push transmits. The
 snapshot reader dispatches on the lockfile's FILENAME, because bytes from
 `git show` carry no other format hint, so pnpm and yarn snapshots work too.
 
+Occurrence-level gates (integrity, provenance) run **per ref**, not over the
+union. They judge a specific tarball at a specific path, so unioning first let a
+clean branch in the same push lend its hash — or its registry host — to a bad
+occurrence in another, and the finding vanished. Findings are prefixed with the
+short sha when a push carries more than one ref. Name@version-only checks
+(advisories, cooldown) keep using the union.
+
 "Outgoing" is likewise scoped to the **destination**: `--not --remotes=<remote>`,
 not `--remotes`. Excluding commits present on *any* remote meant a branch already
 pushed to a fork looked like nothing-new when first pushed to the real upstream.
-When the named remote has no tracking refs yet nothing is excluded and the whole
-branch is scanned — the conservative direction.
+When the named remote has no tracking refs yet, `--remotes=<name>` matches
+nothing and the whole branch is scanned — the conservative direction. When the
+remote name is UNKNOWN (a pre-1.2.1 shim that passes no `--remote`, a push by
+URL, or a hook chain that consumed `$1`) guard falls back to `--not --remotes`
+(any remote) and says so, pointing at `guard init`: "already on some other
+remote" is weaker evidence than the destination's own refs, but a full-history
+scan would turn every not-yet-re-initialised repo's next push into a wall of
+historic findings — the false-positive fatigue §11b warns against.
 
 Both commit-hook and PR-check triggers are enabled (chosen): the hook catches your
 own installs and later-flagged deps; the PR check stops a teammate's bad dep before
@@ -628,18 +641,27 @@ agents.
                                     made the missing hash disappear. (Resolved is
                                     different: pnpm records no tarball URL at all,
                                     so empty-vs-set is no contradiction there.)
-                                    BUNDLED (inBundle) and LINK entries are not
-                                    occurrences at all and are dropped by the
-                                    parser: npm records a bundled copy with no
-                                    resolved/integrity because the bytes ship
-                                    inside the PARENT's hashed tarball, and a link
-                                    has no registry identity. Counting them would
-                                    make every bundling package look
+                                    BUNDLED entries stay in the INVENTORY but are
+                                    not integrity OCCURRENCES: npm records a
+                                    bundled copy with no resolved/integrity
+                                    because the bytes ship inside the PARENT's
+                                    hashed tarball. They are still installed code,
+                                    so advisories, the cooldown and the SBOM see
+                                    them (dropping them hid a package from every
+                                    check whenever it only ever appeared bundled);
+                                    the integrity gates skip them, because
+                                    counting them as hashless occurrences made
+                                    every bundling package look
                                     self-contradictory — and since the conflict
                                     verdict is unwaivable, and the advice ("npm
                                     install regenerates consistent entries")
                                     reproduces the same file, the repo would
-                                    become un-committable. inBundle is a field
+                                    become un-committable. `inBundle` is
+                                    attacker-writable, so the SHAPE decides: an
+                                    entry claiming inBundle that still records a
+                                    URL and a hash is checked like any other. LINK
+                                    entries are dropped entirely — no registry
+                                    identity to inventory or verify. inBundle is a field
                                     anyone can write, so the parser trusts the
                                     SHAPE, not the flag: only an entry with
                                     neither resolved nor integrity is dropped;
@@ -899,7 +921,8 @@ Guarantees / boundaries:
 - The upload surface depends on the phase. At **pre-commit** it is the working
   tree's tracked + staged set. At **pre-push** guard additionally reads the
   OUTGOING COMMITS (`git log --diff-filter=ACMR` over `<remote>..<local>`, or
-  `<local> --not --remotes` for a new branch) — because a secret committed and
+  `<local> --not --remotes=<remote>` for a new branch, or `--not --remotes` when
+  the destination is unknown) — because a secret committed and
   then deleted in a later commit is gone from the index yet still travels in the
   history the push carries. Those hits are labelled `[committed in outgoing
   history]`, and the advice for them is a history rewrite plus rotation: `git rm
