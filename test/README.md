@@ -96,6 +96,36 @@ Budget: each test costs an npm spawn (~0.5s); docker/traced tests ~3s. The
 whole suite stays around ~10s — keep it that way; this runs in pre-commit
 habits.
 
+## Manual: the trace-forgery replay (needs Docker)
+
+The box's evidence guarantee — the tracee cannot reach the trace pipe — is a
+kernel property of the exec-only strace binary, so the unit suite can only pin
+the recipe (`TestObsImageMakesTracerNonDumpable`). Prove the property itself
+against the shipped image after any change to `obsDockerfile`, `tracedScript`,
+or the `docker run` flags. Run as a non-root uid, with the same flags `box.Run`
+uses:
+
+```sh
+IMG=depguard-box:2   # box.ObsImageName()
+docker run --rm --read-only --network none --tmpfs /tmp:size=64m \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --user 1000:1000 \
+  $IMG sh -c "exec strace -f -q -e trace=%network,execve,openat -s 512 -o /dev/stdout sh -c '
+    exec 1>&2
+    ls -l /proc/\$\$/fd                                   # expect: 0 /dev/null, 1 and 2 the SAME pipe, nothing else
+    printf \"%d    +++ exited with 0 +++\n\" \$\$ > /proc/1/fd/1 && echo FORGE-OK || echo FORGE-BLOCKED
+    cat /proc/1/fd/1 || true                              # expect: Permission denied
+    kill -9 1; echo still-alive; exit 5'" > trace.txt 2> out.txt
+echo "exit=$?"; tail -1 trace.txt; cat out.txt
+```
+
+Expected: `cat /proc/1/comm` says `strace`; `FORGE-BLOCKED`; both `/proc/1/fd/1`
+accesses denied; `kill -9 1` is silently dropped (a pid-namespace init ignores
+signals from inside), so `still-alive` prints, exit is 5 and the trace's last
+line is `<root pid> +++ exited with 5 +++`. Drop the `exec` before `strace` to
+see the hole this guards: PID 1 becomes `sh`, `FORGE-OK`, and the kill lands
+(exit 137). Killed-tracer / flooded-trace classification itself is pinned by
+the unit fixtures in `internal/box/box_test.go`.
+
 ## Related: the live demo
 
 `demo/run.mjs` (see [../demo/README.md](../demo/README.md)) reuses these same

@@ -142,6 +142,22 @@ out-of-date managed shim in place** (and is a no-op when it's already current), 
 shim can actually be refreshed. A foreign hook that merely mentions `guard` (no
 marker) is chained onto, never clobbered. What lands:
 
+**Where the hooks go.** `guard init` writes to the directory git will actually
+read: `core.hooksPath` if set (husky v9 points it at `.husky/_`, which husky
+regenerates, so guard targets the `.husky` parent instead), else `.husky/` if it
+exists, else `.git/hooks`. `guard status` resolves the same directory and prints
+it — and it reports a hook as installed only when it is also **executable**, since
+git skips a non-executable hook in silence.
+
+**Chained pre-push hooks and stdin.** git feeds the pre-push hook its ref lines
+(`<local ref> <local sha> <remote ref> <remote sha>`) on **stdin**, and that
+stream can only be read once. depguard's shim uses them to check the *outgoing
+commits*. If depguard is chained onto an existing pre-push hook that consumes
+stdin first, guard sees no refs and quietly falls back to the working-tree check
+(the pre-commit behavior) — still useful, but it won't catch a secret or a
+too-young version that is already committed. If you chain, put the depguard block
+**first**, or `tee` the refs to both consumers.
+
 ```
  your-project/
  ├── .guardrc            ◄ policy (cooldown, scopes, fallback) — COMMIT IT
@@ -211,7 +227,8 @@ internal-scopes: ["@yourco/*"]     # MUST come from a private registry — block
 no-container-fallback: warn-approve # no Docker? warn + ask (CI fails closed unless pre-approved) | or: fail
 flag: [new-deps, new-maintainer, provenance]  # extra opt-in signals guard check surfaces (see below)
 advisory-threshold: high           # lowest advisory severity that BLOCKS; below it warns | critical|high|moderate|low
-untraced-boxed: run                # box can't build the strace image? run caged-but-unwatched | or: fail
+untraced-boxed: run                # box can't observe the run? run caged-but-unwatched | or: fail (discard its output)
+on-check-error: warn               # a check that couldn't COMPLETE (OSV/registry down): warn | or: fail (gate on it)
 secret-paths: [".env", ".env.*", "secrets/", "*.pem"]  # files that must NEVER be committed/pushed (off by default)
 license-deny: ["GPL-3.0", "AGPL-3.0"]   # SPDX ids to BLOCK on installed deps (off by default; deny applied first)
 # license-allow: ["MIT", "Apache-2.0", "ISC", "BSD-3-Clause"]  # allowlist mode: ONLY these pass (stricter — pick one mode)
@@ -254,7 +271,12 @@ Tips:
   is staged or already tracked by git, `guard check` HARD-BLOCKS the commit/push —
   same weight as a critical advisory — so the secret can't be uploaded. Untracked /
   gitignored files are ignored (git wouldn't push them); a file already committed
-  keeps blocking until you `git rm --cached` it (and rotate the secret). A
+  keeps blocking until you `git rm --cached` it (and rotate the secret).
+  At **pre-push** the gate also reads the OUTGOING COMMITS, so a secret you
+  committed and then deleted is still caught — those hits are marked
+  `[committed in outgoing history]`, and `git rm --cached` does NOT fix them:
+  the bytes are already in a commit you're about to send. Rewrite the history
+  (`git rebase -i`, `git filter-repo`) **and rotate the credential**. A
   deliberate match (`.env.example`) is waived with `guard ignore secret:<path>`.
   The list is fully yours to extend — nothing is baked in. `guard secret-add
   "*.pem" "secrets/"` APPENDS patterns without restating the list (the convenience
@@ -297,12 +319,26 @@ Tips:
   `guard approve better-sqlite3@11.0.0` (add `--uncontained` to allow a bare run
   where there's no sandbox, or `--deny` to refuse). Commit `.guard-approvals`.
 - **`untraced-boxed: fail`** for shops that won't accept output they couldn't
-  observe (the strace image failed to build, e.g. offline).
+  observe. It covers both cases: the strace image failed to build (the script is
+  skipped before it runs), and the run happened but the trace came back missing or
+  truncated (the script's output is discarded and the package dir rolled back).
+  Neither is a conviction — the approval stands; guard just doesn't keep output it
+  couldn't watch.
+- **`on-check-error: fail`** if you'd rather stop than proceed on an unproven
+  tree. By default an OSV outage or a failed registry lookup warns and lets you
+  work (a blip elsewhere shouldn't wedge your commits); under `fail` it gates, and
+  `guard check --json` reports `ok: false` whenever `degraded` is non-empty.
+- **`no-container-fallback: fail` is enforced at every run**, not only when an
+  approval is recorded: an existing `approved-uncontained` entry is skipped under
+  that policy, and `guard approve --uncontained` refuses to record a new one.
 - **An uncontained run is still env-scrubbed** — even when you approve a bare run
   (no sandbox), the script inherits only `PATH`/`HOME`/`LANG`/`TMPDIR`, never the
   API tokens in your shell. It's damage limitation, not containment.
 - **Skip the first-run wait with `guard prewarm`** — builds the sandbox (strace)
-  image ahead of time so the first approved native build isn't slow. Or pass
+  image ahead of time so the first approved native build isn't slow. The image is
+  tagged by version, so an upgrade that changes the sandbox recipe rebuilds it
+  once on the next approved script (or run `guard prewarm` to get it over with);
+  the old image is left behind and `guard clean --image` reclaims it. Or pass
   `--prebuild-box` to `guard init`. Needs docker + network; pure-JS installs
   never touch it.
 - **Tidy up with `guard clean`** — sweeps stray containers + any backup/trace

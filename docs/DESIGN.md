@@ -57,11 +57,19 @@ target. Binary lives on the machine; only config lives in the repo.
 No daemon, no cron, no polling. Protection fires on *your* actions.
 
 ```
- you install a dep ─────► filter versions + handle scripts (see §5, §6)
- you commit/push ──────► git hook re-checks lockfile vs advisory feeds
+ you install a dep ─────► filter versions + gate the lockfile + handle scripts
+ you commit ───────────► pre-commit: working tree vs git HEAD
+ you push ─────────────► pre-push:   the OUTGOING COMMITS vs what the remote has
  you open a PR (CI) ───► same check, blocks merge if a dep is now flagged
  you run `guard check` ► on-demand audit, anytime
 ```
+
+The two hook phases are **not** the same check. The shim passes `--hook=<phase>`,
+and at pre-push git also hands the hook its ref lines on stdin, so guard can
+compare against the remote instead of the working tree. That distinction is the
+whole point: after a commit the tree and HEAD agree, so a too-young version or a
+secret that got committed anyway (`GUARD_SKIP`, a teammate without guard) is
+invisible to a HEAD diff — but it is exactly what the push transmits.
 
 Both commit-hook and PR-check triggers are enabled (chosen): the hook catches your
 own installs and later-flagged deps; the PR check stops a teammate's bad dep before
@@ -200,6 +208,20 @@ declares its scripts; depguard detects the few that want to run code and asks on
  + a shipped BASELINE of obvious-good build packages → rarely even asked
 ```
 
+**An approval is about code, not about a name.** Each recorded decision stores the
+lockfile's integrity hash for that `name@version`, and a decision only applies
+while the hash still matches. Re-point the lockfile at a different tarball, or
+republish the version, and the entry stops counting as known: guard re-prompts
+(and in a non-interactive context lists it as skipped) rather than letting new
+bytes inherit a yes given to old ones. Entries written before this binding existed
+carry no hash and keep applying — but only until the next run: the first time
+guard executes such an entry it records the tarball's current hash into it
+(bind-on-first-use), so upgrading guard actually buys the binding for packages
+that were already approved, instead of leaving them permanently unbound. Such an
+entry is annotated `auto-bound on first run after upgrade (integrity inferred,
+not reviewed)`, because `.guard-approvals` is reviewed in PRs and an inferred
+hash carries none of the assurance of one recorded while a human read the code.
+
 ---
 
 ## 8. The box (dynamic) — run approved scripts watched + caged
@@ -239,6 +261,78 @@ Only packages with an **approved** install script ever enter the box. It is both
 Mechanism on Linux (the container is Linux): passive syscall, exec, and network
 tracing. **As shipped this is `strace -f` running inside the container** (see §11b);
 a richer eBPF / Falco-style probe stays future work.
+
+**The evidence path is UNREACHABLE from the tracee, and completion is PROVEN.**
+strace writes the trace to the container's STDOUT and the traced script's own
+output is redirected to stderr, so guard reads the trace over a pipe. An earlier
+design wrote it to a bind-mounted file, which the script — running as the same
+uid — could truncate or rewrite, and an unreadable trace downgraded the run to
+"untraced". Both host-side buffers (script output, trace) are bounded, so a
+script that prints forever cannot exhaust guard's memory.
+
+Being a pipe is not by itself enough. The script holds no fd to it (`exec 1>&2`
+replaces fd 1; strace's `-o` fd is CLOEXEC) — but `/proc/<tracer>/fd/1` would
+reopen it, and a tracee knows its own pid, so it could FORGE its own completion
+marker there and then kill the tracer. What closes that is the image:
+
+```
+ obsDockerfile:  RUN chmod 0711 /usr/bin/strace     ← root-owned, execute-only
+   │
+   └─ kernel marks the running strace NON-DUMPABLE
+        └─ /proc/<strace>/ becomes root:root dr-x------
+             └─ tracee (ordinary uid): write EACCES, read EACCES
+```
+
+So the trace can be neither truncated NOR appended to. **The whole guarantee
+rests on that exec-only binary** — without it the marker below is forgeable and
+the observation proves nothing.
+
+Append-only is necessary but not sufficient, because the tracee can kill its
+tracer: `kill -9 $PPID` from an install script. strace dies, its pipe closes, and
+what guard reads is an entirely ordinary trace — non-empty, under the cap, nothing
+incriminating in it. The script is DETACHED by that kill, not stopped, so
+everything it does next is unseen. Absence of evidence is therefore not evidence
+of absence, and the trace must carry positive proof of a clean ending:
+
+```
+ strace -f -q   (NOT -qq — that suppresses exactly the line we need)
+   │
+   └─ last line of a complete run:  "<root pid> +++ exited with N +++"
+                                    "<root pid> +++ killed by SIGx +++"
+```
+
+The pid must be the ROOT tracee's — the pid on the first trace line. A child's
+marker will not do: a script can arrange for a child to exit before it kills the
+tracer.
+
+No marker → `Traced=false`, reported as "observer terminated by the script", and
+the output is **DISCARDED under every policy** — including `untraced-boxed: run`,
+where an ordinarily-unobserved run is kept. Killing your own tracer has no
+build-time excuse — and neither does flooding the trace past guard's 64 MiB cap
+(no real build emits that many network/exec/open syscalls), so a capped trace is
+discarded the same way. It is still not an auto-conviction (the approval stands, the
+package is not denied): a build we killed ourselves at the wall-clock limit looks
+similar from the outside, which is exactly why a TIMED-OUT run is excluded from
+"observer lost" — `Traced` is still false there, but the blame is ours.
+
+strace is `exec`'d so it is PID 1. Without that, Debian's `dash` (which has no
+single-command exec optimization) sits at PID 1, dumpable, holding the trace pipe
+as its fd 1 — `/proc/1/fd/1` forgery works, verified live. As PID 1 strace also
+inherits the kernel's rule that a pid-namespace init ignores signals from inside
+the namespace (SIGKILL included): the tracer cannot be killed by the tracee at
+all. The completion marker is therefore defense in depth, not the only line.
+
+`kill` is deliberately NOT added to the seccomp denylist — npm legitimately
+signals its own children, and blocking it would break ordinary builds to close a
+hole the unreachable pipe already closes.
+
+**Unobserved ≠ observed clean.** A trace that is missing (strace never ran) or
+truncated (we stopped reading) means we did not see everything, and `Traced` is
+false. Under `untraced-boxed: fail` the output of such a run is DISCARDED — the
+package dir is rolled back exactly as for an unsafe verdict. That is not a
+conviction and the approval is not revoked; the script may well have been fine.
+The rule is only that we don't keep what we couldn't watch. Evidence captured
+before a truncation still convicts.
 
 **Behavior → verdict:**
 
@@ -304,6 +398,14 @@ It warns loudly, then lets you explicitly approve running it **uncontained**:
 The recorded approval travels with the repo, so a package you've vetted once can
 build in CI without re-prompting — but an *unvetted* script can never silently run
 uncontained in a non-interactive context.
+
+**`no-container-fallback: fail` is enforced at every RUN, not just at approval.**
+A recorded `approved-uncontained` entry is checked against the CURRENT policy each
+time it would run: under `fail` the script is skipped (the install continues) and
+`guard approve --uncontained` refuses to record a new one. Otherwise an approval
+made on a Docker-less machine, or committed by a teammate, would keep running bare
+in a repo that had since tightened the policy — the policy would describe the past
+instead of governing the present.
 
 ---
 
@@ -474,13 +576,38 @@ agents.
                                     without a URL; a pnpm `tarball:` in the
                                     resolution block feeds the host check. npm
                                     file:/link:/git deps stay exempt — they
-                                    legitimately carry neither host nor hash.
+                                    legitimately carry neither host nor hash —
+                                    and internal-scopes names are exempt from the
+                                    HOST check only (they are declared to live on
+                                    a private registry). `allow:` exempts nothing
+                                    here: it is a cooldown/typosquat escape
+                                    hatch in the proxy and buys no authority in
+                                    the check path.
+                                    It also flags a CONFLICT: one name@version
+                                    recorded at two lockfile paths with different
+                                    tarballs or hashes. Dedupe has to keep one, so
+                                    the disagreement would otherwise vanish
+                                    silently — and there is no single truth to
+                                    waive, so a conflict is not waivable. Fix the
+                                    lockfile.
    → capability diff vs prev        scans the previous version's tarball and
                                     shows what THIS version added (new socket,
                                     new eval...) at approval. flag: new-network/new-fs.
 
  BROADER COVERAGE:
-   → pnpm-lock.yaml + yarn.lock      hand-rolled zero-dep parsers; check spans all
+   → pnpm-lock.yaml + yarn.lock      hand-rolled zero-dep parsers covering pnpm
+                                    v5 (/name/version) and v6+ (name@version)
+                                    keys, and yarn classic (`version "x"`) and
+                                    berry (`version: x`). A parser that reads a
+                                    file but recognizes NOTHING in it returns an
+                                    ERROR — "we didn't understand this" must
+                                    never be reported as "no dependencies", which
+                                    is exactly how a CRLF lockfile once went
+                                    completely unchecked. Berry's `checksum` is
+                                    yarn's cache key, not an SRI hash, so berry
+                                    entries stay OUT of the integrity gates
+                                    rather than being claimed as verified;
+                                    check spans all
                                     three managers. As of v0.8.0 `guard install`
                                     PROXIES all three too (§11e); boxed script
                                     approval stays npm-only.
@@ -528,6 +655,19 @@ agents.
      --json / MCP record it in CheckResult.degraded, so a green result cannot
      hide that the advisory layer did not run. Body is size-capped.
 ```
+
+**Fail open vs fail closed — and who chooses.** The filter path (name gates,
+confusion gate, policy parsing, proxy rewrites) fails CLOSED: those decisions are
+local and cheap, so there is no excuse for guessing. The lookup path (OSV,
+registry publish dates, publisher history, provenance, and the git call behind the
+secret gate) fails OPEN by default: an outage on someone else's server must not
+wedge every commit in every repo. That default is a availability trade, not a
+claim of safety — which is why nothing is ever silent about it, and why the choice
+is the repo's to make. `on-check-error: fail` in `.guardrc` flips the lookup path
+closed: every check that could not COMPLETE then gates, with a message saying so,
+and `guard check --json` reports `ok: false` whenever `degraded` is non-empty. One
+helper (`config.Degrade`) implements it, so every fail-open site obeys the same
+policy rather than each drifting on its own.
 
 ### 12a. Advisory severity tiering (v0.9.0)
 
@@ -691,10 +831,16 @@ pattern. It leads the exit-code precedence: an uploaded credential is the
 highest-stakes, least-recoverable miss.
 
 Guarantees / boundaries:
-- "Staged or tracked" is git's actual upload surface. An untracked / gitignored
-  file is ignored — git won't push it, so it isn't a leak yet. Corollary: a
-  secret committed months ago still blocks every push until it is `git rm
-  --cached`d (and rotated).
+- The upload surface depends on the phase. At **pre-commit** it is the working
+  tree's tracked + staged set. At **pre-push** guard additionally reads the
+  OUTGOING COMMITS (`git log --diff-filter=ACMR` over `<remote>..<local>`, or
+  `<local> --not --remotes` for a new branch) — because a secret committed and
+  then deleted in a later commit is gone from the index yet still travels in the
+  history the push carries. Those hits are labelled `[committed in outgoing
+  history]`, and the advice for them is a history rewrite plus rotation: `git rm
+  --cached` removes the file going forward and takes nothing back.
+- An untracked / gitignored file is ignored — git won't push it, so it isn't a
+  leak yet.
 - Matching is repo-relative-path OR basename via `path.Match`, plus a
   trailing-'/' directory prefix. No registry, no network — pure local git state.
 - Fail-open + loud on a git error (not a repo, git absent): there is no upload

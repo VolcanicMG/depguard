@@ -199,21 +199,22 @@ type inTotoStatement struct {
 }
 
 // Check fetches and verifies provenance for each package whose Integrity is
-// known (the tarball hash we bind to). allowed packages are skipped (your own
-// scopes). Network/parse failures fail OPEN per package (StatusDegraded, never
+// known (the tarball hash we bind to). internal packages are skipped: a package
+// declared to come from a PRIVATE registry has no public attestation to fetch,
+// so asking is pure noise. Network/parse failures fail OPEN per package (StatusDegraded, never
 // gating) so a registry blip never blocks a commit — but the caller can tell a
 // failed fetch (Degraded) from a clean "nothing published" (None) and from a
 // real tamper signal (StatusInvalid). progress, if non-nil,
 // is called once per package (incl. skips) with (done, total) for liveness on
 // a large tree — one registry fetch per package makes this the slow check.
-func Check(client *http.Client, registry string, pkgs []Pkg, allowed func(string) bool, progress func(done, total int)) []Result {
+func Check(client *http.Client, registry string, pkgs []Pkg, internal func(string) bool, progress func(done, total int)) []Result {
 	reg := strings.TrimSuffix(registry, "/")
 	var out []Result
 	for i, p := range pkgs {
 		if progress != nil {
 			progress(i+1, len(pkgs))
 		}
-		if allowed != nil && allowed(p.Name) {
+		if internal != nil && internal(p.Name) {
 			continue
 		}
 		if p.Integrity == "" {

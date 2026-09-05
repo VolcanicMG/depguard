@@ -176,6 +176,11 @@ and the typosquat name gate ONLY** ("I want this exact name, and I accept it may
 fresh"). It does **not** disable OSV advisory blocking, registry-signature
 verification, or the dependency-confusion (`internal-scopes`) gate: an allowlisted
 package with a known-malicious or tampered version still has that version dropped.
+And it bypasses **nothing in `guard check`** — an allowed package is still
+advisory-checked, still needs an integrity hash, and must still resolve to the
+configured registry. Only `internal-scopes` names are exempt from the
+off-registry host check and the provenance fetch, because a private registry and
+no public attestation are expected for them.
 The cooldown makes too-fresh versions invisible, so npm picks a
 safe one itself. Signature verification catches registry/account tampering the
 integrity hash can't — but only blocks *present-but-invalid* signatures (unsigned
@@ -194,9 +199,18 @@ When you approve a script, it runs in a **digest-pinned container**: no network,
 secrets, no-new-privileges, pids-limited, and **seccomp**-filtered (io_uring, the
 kernel keyring, and bpf/perf are blocked). On top of that, **strace watches every
 syscall**. A `connect()` to a real host or a read of `/root/.ssh` auto-convicts: the
-output is discarded and the approval revoked. The container is named and force-removed
-on timeout; `guard prewarm` builds the image ahead of the first run, `guard clean
---image` reclaims it.
+output is discarded and the approval revoked. The trace travels out on the
+container's **stdout** — a pipe the traced script cannot reach at all (it inherits
+no handle to it, and `/proc/<tracer>/fd` is root-only because the image's strace is
+execute-only, which makes the kernel mark the tracer non-dumpable), so a script can
+neither erase nor forge its own evidence. On top of that guard requires the tracer's
+own **exit marker** before it will call a run watched: a script that kills strace and
+carries on leaves a trace that otherwise looks perfectly clean. If the trace comes
+back missing, truncated, or unterminated the run counts as **unobserved** — and if
+the observer was *killed* or the trace *flooded past its cap*, the output is discarded under **every** policy, not just
+`untraced-boxed: fail` (not a conviction — we just don't keep what we couldn't
+watch). The container is named and force-removed on timeout; `guard prewarm` builds
+the image ahead of the first run, `guard clean --image` reclaims it.
 
 ### On commit / push / PR — *`guard check`, run by the git hooks & CI gate*
 
@@ -205,8 +219,8 @@ Catches deps that go bad *after* you installed them — and your own secrets on 
 | Layer | Stops |
 |---|---|
 | `guard check` (advisories + cooldown) | newly-reported advisories + cooldown violations across **every version** in the tree, on every commit/PR (detail below) |
-| Lockfile integrity check | entries whose tarball resolves off-registry or carry no integrity hash (poisoned lockfile) — npm, pnpm and yarn; npm `file:`/`link:`/git deps are exempt by design |
-| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, keys) staged or already tracked by git — hard-blocks commit/push so they never reach the remote (`secret-paths` in .guardrc); waive a deliberate match with `guard ignore secret:<path>` |
+| Lockfile integrity check | entries whose tarball resolves off-registry, carry no integrity hash, or record the **same `name@version` twice with conflicting tarball/integrity values** (poisoned or hand-edited lockfile) — npm, pnpm and yarn classic; npm `file:`/`link:`/git deps and yarn-berry entries are exempt by design (nothing verifiable is recorded), `internal-scopes` names are exempt from the host check only, and a conflict is not waivable |
+| Secret-file gate (opt-in) | **your own** credential files (`.env`, `secrets/`, keys) staged or already tracked by git — hard-blocks commit/push so they never reach the remote (`secret-paths` in .guardrc); at **pre-push** it also scans the **outgoing commit history**, so a secret committed and later deleted is still caught (that one needs a history rewrite + rotation, not `git rm --cached`); waive a deliberate match with `guard ignore secret:<path>` |
 | License-policy gate (opt-in) | installed packages under a denied (or, in allowlist mode, non-allowed) license — `license-deny` / `license-allow` in .guardrc |
 
 **How `guard check` grades and recovers.** Advisories are tiered: high+/`MAL-*`/unscored
@@ -224,9 +238,18 @@ re-verify). CI always keeps the strict block.
 | Build-provenance attestation | a published Sigstore/SLSA attestation that fails to verify (DSSE signature, Fulcio cert chain, tarball-digest binding, or a signer identity that doesn't belong to the GitHub source repo it claims) — i.e. a tampered or impersonated provenance claim. Non-GitHub sources report *not bound*, not tampered (`flag: [provenance]`) |
 | Maintainer-change | publisher changes / long-dormancy republishes on installed versions — the account-takeover fingerprint |
 
-`guard check` scopes the cooldown re-check to lockfile versions **added since git
-HEAD** — each version is vetted once, at the commit that introduces it. `--all`
-forces a full-tree sweep.
+`guard check` scopes the cooldown re-check to the versions the current action
+**adds** — each version is vetted once, at the change that introduces it. What
+"adds" means depends on the phase, which the hook shim passes as `--hook=`:
+at **pre-commit** it is the working tree vs git HEAD; at **pre-push** it is the
+pushed commits vs what the remote already has (so a too-young version that got
+committed anyway — `GUARD_SKIP`, or a teammate without guard — is still caught on
+the way out). `--all` forces a full-tree sweep. The pre-push snapshots are read
+from `package-lock.json`, so that phase is npm-only.
+
+`guard install` runs these same lockfile gates (advisories → integrity →
+cooldown) **before** it replays any lifecycle script: node_modules is on disk, but
+nothing has executed, so a tree that fails a gate never gets to run a postinstall.
 
 The OSV advisory and registry-cooldown lookups are **fail-open**: a network blip
 or an OSV outage must not block every commit, so the check never *gates* on them.
@@ -235,7 +258,10 @@ skipped: …`), and `guard check --json` (and the MCP `check_dependencies` tool)
 list what couldn't run in a **`degraded`** array. A `degraded` result with
 `ok: true` means *no findings were seen, but some layers didn't run* — treat it as
 "incomplete," not "proven clean." CI that wants to be strict can fail on a
-non-empty `degraded`.
+non-empty `degraded`. Set `on-check-error: fail` in `.guardrc` to make guard do
+that for you: every lookup that could not complete then gates instead of warning.
+The warning prints even under `--quiet` (which the hooks pass) — collapsed to one
+line per check, so a tree-wide outage is one message, not one per package.
 
 ## Command reference
 
@@ -257,7 +283,10 @@ guard install <pkg>                  # protected install through the cooldown pr
 guard ci                             # lockfile-exact install (npm ci), same protections
 
 # ── Audit ──────────────────────────────────────────────────
-guard check [--all] [--json] [--confirm] [--quiet]   # advisories + cooldown + integrity + secrets (hooks run this)
+guard check [--all] [--json] [--confirm] [--quiet] [--hook=pre-commit|pre-push]
+                                     # advisories + cooldown + integrity + secrets (hooks run this)
+                                     #   --hook= tells guard which git phase called it; at pre-push it
+                                     #   reads git's ref lines on stdin and checks the OUTGOING commits
 guard scan <dir> [--json]            # static-scan one package dir (scripts, caps, injection)
 guard why <pkg> [--all]              # which direct dep(s) pull a package in (npm lockfile)
 guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to stdout
@@ -314,7 +343,7 @@ attempt prompt injection. The MCP surface is **vetting-only**; state-changing ac
 | File | Holds |
 |---|---|
 | `.guardrc` | policy: cooldown, allowed scopes, fallback mode, advisory severity threshold, secret-file paths — **review changes in PRs** (it controls the filter) |
-| `.guard-approvals` | ask-once script decisions — **review changes in PRs** (they're security decisions) |
+| `.guard-approvals` | ask-once script decisions, each bound to the tarball's integrity hash so a re-pointed or republished `name@version` re-prompts instead of inheriting the old yes — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
 | `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
 
@@ -342,6 +371,15 @@ others leave.
   (manager auto-detected from the lockfile). The **boxed lifecycle-script
   approval** flow stays npm-only — under pnpm/yarn scripts simply stay disabled
   (`--ignore-scripts`) and the lockfile re-check still runs.
+- **How much of each lockfile is checked.** npm (`package-lock.json`) gets
+  everything. pnpm (`pnpm-lock.yaml`, v5/pnpm-7 and v6+/pnpm-8 key shapes) gets
+  advisories, cooldown *and* the integrity gates — its entries are marked as
+  registry deps so a missing hash still gates. yarn **classic** gets all of it
+  too. yarn **berry** (v2+) gets advisories and cooldown but **not** the
+  integrity gates: berry records a `checksum` (its own `10c0/<hex>` cache key,
+  not an SRI hash) and no tarball URL, so there is nothing guard can verify —
+  it says nothing rather than claiming a check it didn't do. A lockfile guard
+  cannot parse is an **error**, never a silent "no dependencies".
 - Signature verification **blocks only present-but-invalid** signatures; unsigned
   versions pass, because most of the ecosystem still is. Maintainer-change, the
   per-version capability diff, and build-provenance are **opt-in** (`flag:`) — they

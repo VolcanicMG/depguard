@@ -31,7 +31,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── attestation/attestation.go npm build-provenance: Sigstore/SLSA DSSE + Fulcio chain + digest bind (flag:)
  │   ├── maintainer/maintainer.go publisher-change / account-takeover detection
  │   ├── freshness/freshness.go  cooldown re-check on lockfile versions + LatestSafe (pin target)
- │   ├── secrets/secrets.go      secret-file gate: git staged/tracked vs secret-paths globs
+ │   ├── secrets/secrets.go      secret-file gate: Find = git staged/tracked;
+ │                               FindOutgoing = files added/modified in the commits
+ │                               a push transmits (pre-push), vs secret-paths globs
  │   ├── license/license.go      license-deny/allow gate on installed deps' SPDX ids
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
  │   │                           Severities = per-vuln detail for tiering; Blocks;
@@ -39,10 +41,18 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
- │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth)
- │   ├── lockfile/altlock.go     pnpm-lock.yaml + yarn.lock parsers (check path); pnpm
+ │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth);
+ │                               dedupe MERGES duplicate records of one
+ │                               name@version (union, not first-wins — first-wins
+ │                               let an info-empty duplicate erase the real URL and
+ │                               hash and skip the integrity gates) and flags a
+ │                               Conflict when two non-empty values disagree
+ │   ├── lockfile/altlock.go     pnpm-lock.yaml (v5 + v6 keys) and yarn.lock
+ │                               (classic + berry) parsers for the check path; pnpm
  │                               entries are marked Pkg.FromRegistry so the integrity
- │                               gates apply without a tarball URL
+ │                               gates apply without a tarball URL. Both parsers
+ │                               ERROR when they read content but recognize none of
+ │                               it — an unparsed lockfile must not look empty
  │   ├── lockfile/graph.go       package-lock graph rebuild for `guard why` (parent→child edges)
  │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
@@ -81,41 +91,76 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    ├─ exec npm install/ci ──── --registry=proxy --ignore-scripts (flags win over .npmrc)
    ├─ report proxy.BlockedVersions()
    │
+   ├─ installGates ────────── advisories → integrity → cooldown, BEFORE any script
+   │                           runs (node_modules is on disk, nothing has executed);
+   │                           firstErr keeps cmdCheck's exit-code precedence
+   │
    ├─ handleScripts            for each lockfile entry (lockfile.InstalledPaths):
    │     ├─ scanner.ReadScripts ── cheap gate: ~90% exit here (no scripts)
    │     ├─ scanner.ScanDir ────── full capability sweep, script-bearing only
-   │     ├─ approvals.Get / promptApproval (tty.IsTerminal gates the ask)
+   │     ├─ approvals.Get → Entry.AppliesTo(lockfile integrity): a changed
+   │     │                   tarball invalidates the remembered decision → re-prompt
+   │     ├─ promptApproval (tty.IsTerminal gates the ask)
    │     ├─ box.EnsureObsImage ─── lazy: builds strace image on first script
    │     └─ runApproved
    │           ├─ box.Run ──────────── docker: net=none, ro tree, own dir rw,
    │           │     │                 cap-drop ALL, no-new-privileges,
    │           │     │                 pids-limit, digest-pinned image,
    │           │     │                 strace -f over network/openat/execve
-   │           │     ├─ trace.Parse ── log → observations + Unsafe verdict
-   │           │     └─ Unsafe? ────── pkg dir RESTORED from pre-run backup,
-   │           │                       approval auto-flipped to Denied (committed)
-   │           ├─ box.RunUncontained ─ ONLY if explicitly approved; env scrubbed
+   │           │     ├─ box.verdict ── trace (from stdout, capWriter-bounded) →
+   │           │     │                  observations + Unsafe; missing, truncated,
+   │           │     │                  or lacking the root exit marker
+   │           │     │                  (traceComplete) ⇒ Traced=false (unobserved)
+   │           │     ├─ Unsafe? ────── box.restore: pkg dir RESTORED from pre-run
+   │           │     │                 backup, approval auto-flipped to Denied
+   │           │     └─ strict? ────── untraced-boxed:fail + unobserved ⇒ restore,
+   │           │                       res.Discarded (no denial — just not kept)
+   │           ├─ box.RunUncontained ─ ONLY if explicitly approved AND
+   │           │                       no-container-fallback != fail (checked per RUN)
    │           └─ skip + explain ───── approved-boxed but no runtime here
    │
-   ├─ runRootScripts ───────── the repo's OWN lifecycle scripts (trusted, incl. prepare)
-   └─ checkAdvisories ──────── advisory.Check (OSV batch) on the final lockfile,
-                              then enrichSeverities + partitionBySeverity (tiering)
+   └─ runRootScripts ───────── the repo's OWN lifecycle scripts (trusted, incl. prepare)
 ```
 
 ## Flow: `guard check` (what hooks + CI run)
 
 ```
- main.cmdCheck (--confirm enables the interactive warn-tier accept flow)
+ main.cmdCheck (--confirm enables the interactive warn-tier accept flow;
+                --hook=pre-commit|pre-push names the git phase)
+   ├─ parsePushRefs ─── pre-push only: git's "<local ref> <local sha> <remote ref>
+   │                    <remote sha>" lines on stdin (inherited through the shim)
+   ├─ checkSecrets ──── secrets.Find (tree) + at pre-push secrets.FindOutgoing over
+   │                    outgoingRevArgs(refs): a secret committed then DELETED is
+   │                    gone from the index but still rides the outgoing history
    ├─ checkAdvisories ── lockfile.Installed → advisory.Check (OSV)
    │                     fail-open on network errors (loud warning)
    │                     → enrichSeverities (advisory.Severities, per-vuln detail)
    │                     → partitionBySeverity: blockers gate, warns don't
    │                     → confirmThroughWarnings (--confirm, /dev/tty): on "yes"
    │                       records acceptances via waivers.Set → .guard-ignores
-   └─ checkFreshness ─── scope = lockfile versions ADDED since git HEAD
-                         (headLockfile via `git show`; --all = full tree)
-                         → freshness.Check: publish dates from registry,
-                           violations fail the commit/PR; allowlist skipped
+   ├─ checkFreshness ─── scope = the versions THIS action adds:
+   │                     pre-commit → worktree vs HEAD (headLockfile)
+   │                     pre-push   → pushed sha vs pushBaseRef (remote sha, or the
+   │                                  oldest outgoing commit's parent for a new
+   │                                  branch) — refLockfile via `git show <ref>:`
+   │                     --all      → full tree
+   │                     → freshness.Check: publish dates from registry,
+   │                       violations fail the commit/PR; allowlist skipped
+   └─ checkLockfileIntegrity ── off-registry host (internal-scopes exempt), missing
+                         hash, and Pkg.Conflict (same name@version, two records,
+                         different tarball/integrity — not waivable)
+
+Every fail-open lookup routes through `config.Degrade(quiet, what, err)` —
+`advisory check`, `freshness check`, `maintainer check`, `provenance check`,
+`license check` (node_modules missing), `secret-paths check` and
+`outgoing-history secret scan` — so `on-check-error: fail` turns "couldn't run"
+into a gate everywhere at once. The warning line is printed even under `--quiet`
+(which the hooks pass): a silent fail-open is the thing the degraded-reporting
+stance exists to prevent. Per-package spam is collapsed by `main.collapse` to one
+line naming the count and an example, so volume never becomes the reason to mute it. `gatherCheck`
+mirrors it: anything that lands in `CheckResult.degraded` (including a DEGRADED
+provenance result) flips `ok` to false under that policy, so `--json`/MCP can't
+report green while the prose path gates.
 ```
 
 Every gating finding is first run through `.guard-ignores` (`internal/waivers`): an
@@ -173,7 +218,7 @@ the shared history.
 | Editable `.guardrc` key (allow/config) | `config/config.go` `canonicalValue` + `writeKeyLine`; surfaced by `cmdAllow`/`cmdConfig` |
 | Terminal color | `internal/ui/ui.go` (gate = NO_COLOR + both streams TTY) |
 | Approval semantics | `approvals/approvals.go` (decisions) + `main.go` `promptApproval`/`runApproved` |
-| Hook/CI behavior | `hooks/hooks.go` (the shims) — they only ever call `guard check` |
+| Hook/CI behavior | `hooks/hooks.go` (the shims) — they only ever call `guard check --hook=<phase>`; bump `shimVersion` on any body change or installed shims never upgrade. `HookDir` resolves `core.hooksPath` / husky / `.git/hooks` and is shared by `Install` and `Installed` |
 | Another ecosystem (PyPI) | new siblings of `registry`/`lockfile`/`scanner`; `main.go` orchestration is npm-shaped today |
 
 ## Invariants — do not break
@@ -185,7 +230,7 @@ the shared history.
 5. **Prompts default to NO** (EOF, garbage input → deny).
 6. **Approvals/policy are committed files** — changes are PR-reviewable security decisions.
 7. **The trace convicts only on no-build-excuse behavior** (network reach-out, real-secret access). Spawns and writes are context, never convictions — false positives train humans to disable the tool. New `trace` matchers must hold this line.
-8. **The strace log is written to a host-side temp dir** (`/obs`), never inside the package's writable mount — the traced script must not be able to doctor its own evidence.
+8. **The strace log leaves the container on its STDOUT**, never through a shared file, and the pipe is **unreachable from the tracee** — it inherits no fd to it (`exec 1>&2`; strace's `-o` fd is CLOEXEC), and `/proc/<tracer>/fd` is root-only because `obsDockerfile` chmods strace to 0711, which makes the kernel mark the running tracer non-dumpable. So the trace can be neither truncated nor appended to by the tracee (guard's own 64 MiB cap is the only truncation, and it counts as unobserved). That is what makes the completion check meaningful: without the exec-only binary a tracee could write its own `+++ exited with 0 +++` (it knows its `$$`) and then `kill -9` the tracer. **Completion is proven, not assumed** — `strace -f -q` (never `-qq`) emits `<root pid> +++ exited with N +++`, and `box.traceComplete` requires that marker for the ROOT tracee (the pid on the first line; a child's marker is not enough). Missing, truncated, or unterminated ⇒ **unobserved**, never "observed clean"; `box.shouldDiscard` then drops the output under `untraced-boxed: fail`, or under ANY policy when the observer was killed or the trace was flooded past its cap (neither has a build-time excuse). `tracedScript` `exec`s strace so it is PID 1 — otherwise dash sits there, dumpable, with the trace pipe as fd 1 (`/proc/1/fd/1` forgery, verified live); PID 1 also cannot be SIGKILLed from inside the namespace, so the tracer is unkillable by the tracee. Changing `obsDockerfile` requires bumping `obsImage`'s tag or existing installs keep the old image.
 
 ## Generated reference
 

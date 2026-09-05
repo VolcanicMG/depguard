@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -413,7 +415,21 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 		return fmt.Errorf("%s %s failed: %w", inv.name, npmCmd, npmErr)
 	}
 
-	// 4. Script-bearing packages: detect → approve → box (§7, §8). This reads
+	// 4. Lockfile gates BEFORE any script replay (§3 layer 5). node_modules is
+	// already on disk, but nothing has EXECUTED yet — so a tree that fails the
+	// advisory, integrity or cooldown gate never gets to run a postinstall.
+	// Running these after the scripts (the old order) meant the gate reported on
+	// code that had already had its say. Scope is git-diff like the hook, so only
+	// versions THIS install introduced are cooldown-vetted.
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+	if err := installGates(dir, cfg, wf); err != nil {
+		return err
+	}
+
+	// 5. Script-bearing packages: detect → approve → box (§7, §8). This reads
 	// package-lock.json to enumerate packages, so it's npm-only; under pnpm/yarn
 	// scripts simply stayed disabled (--ignore-scripts above) and the lockfile
 	// re-check below still runs over all three managers.
@@ -436,26 +452,35 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 			mgr)
 	}
 
-	// 5. Re-check the FINAL lockfile (§3 layer 5): advisories AND cooldown.
-	// Both run so each prints its own findings; the advisory gate takes the
-	// exit code first (matching cmdCheck's precedence). Freshness is re-applied
-	// here so install-time enforcement matches `guard check`: a too-fresh
-	// version that entered via a pinned lockfile (guard ci, or npm honoring an
-	// existing pin) skips the proxy's packument filter and would otherwise only
-	// be caught later at commit/push. Scope is git-diff (all=false) like the
-	// hook, so only versions THIS install introduced are vetted.
-	wf, err := waivers.Load(dir)
-	if err != nil {
-		return err
+	return nil
+}
+
+// installGates runs the lockfile gates `guard install` applies to the freshly
+// resolved tree, in cmdCheck's order so both commands agree on which finding
+// owns the exit code. All three run (each prints its own findings); the first
+// one to have tripped decides the error.
+//
+// Freshness is re-applied here so install-time enforcement matches
+// `guard check`: a too-fresh version that entered via a pinned lockfile
+// (guard ci, or npm honoring an existing pin) skips the proxy's packument
+// filter and would otherwise only be caught later at commit/push. There is no
+// interactive confirm — install isn't the commit/push gate.
+func installGates(dir string, cfg config.Config, wf *waivers.File) error {
+	advErr := checkAdvisories(dir, cfg, false, false, wf)
+	intErr := checkLockfileIntegrity(dir, cfg, wf, false)
+	freshErr := checkFreshness(dir, cfg, false, false, false, wf, nil)
+	return firstErr(advErr, intErr, freshErr)
+}
+
+// firstErr returns the first non-nil error, preserving gate precedence when
+// every gate has already run and printed.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
 	}
-	// Same severity tiering as 'guard check' (moderate/low warn, high+/MAL/unknown
-	// block), but no interactive confirm here — install isn't the commit/push gate.
-	advErr := checkAdvisories(dir, false, false, cfg.AdvisoryThreshold, wf)
-	freshErr := checkFreshness(dir, false, false, false, wf)
-	if advErr != nil {
-		return advErr
-	}
-	return freshErr
+	return nil
 }
 
 // reasonCategory collapses a proxy block reason to a stable category so the
@@ -546,6 +571,11 @@ func handleScripts(dir string, cfg config.Config, appr *approvals.File) error {
 
 		key := e.Name + "@" + e.Version
 		entry, known := appr.Get(key)
+		if known && !entry.AppliesTo(e.Integrity) {
+			// The decision was about bytes that are no longer what will run.
+			fmt.Fprintf(os.Stderr, "guard: approval for %s was for a different tarball (integrity changed) — re-review\n", key)
+			known = false
+		}
 		if known && entry.Decision == approvals.Denied {
 			fmt.Fprintf(os.Stderr, "guard: %s — scripts denied previously, skipping\n", key)
 			continue
@@ -566,13 +596,21 @@ func handleScripts(dir string, cfg config.Config, appr *approvals.File) error {
 				newCaps = priorCapabilityDiff(cfg, e.Name, e.Version, rep)
 			}
 			decision := promptApproval(key, rep, runtime, cfg, newCaps)
-			appr.Set(key, decision, "")
+			appr.Set(key, decision, "", e.Integrity)
 			if err := appr.Save(dir); err != nil {
 				return err
 			}
 			entry = approvals.Entry{Decision: decision}
 			if decision == approvals.Denied {
 				continue
+			}
+		}
+
+		// Bind a legacy (unbound) approval to the tarball it is about to run, so
+		// from here on a changed tarball re-prompts instead of inheriting the yes.
+		if appr.Bind(key, e.Integrity) {
+			if err := appr.Save(dir); err != nil {
+				return err
 			}
 		}
 
@@ -659,7 +697,7 @@ func runApproved(key, projectDir, relPath string, d approvals.Decision, runtime,
 			mode = "boxed, UNTRACED"
 		}
 		fmt.Fprintf(os.Stderr, "guard: %s — running %s (%s)...\n", key, mode, runtime)
-		res, err := box.Run(runtime, boxImage, boxTraced, projectDir, relPath)
+		res, err := box.Run(runtime, boxImage, boxTraced, cfg.UntracedFail, projectDir, relPath)
 		if err != nil {
 			return fmt.Errorf("%s box run: %w", key, err)
 		}
@@ -673,11 +711,30 @@ func runApproved(key, projectDir, relPath string, d approvals.Decision, runtime,
 			fmt.Fprintln(os.Stderr, "guard: its output was DISCARDED (package dir restored) and the approval revoked.")
 			// The denial is recorded in the committed approvals file, so the
 			// evidence travels to every teammate and CI run.
-			appr.Set(key, approvals.Denied, "auto-denied: unsafe behavior observed in box")
+			// Keep the tarball binding: the denial is about THESE bytes.
+			prev, _ := appr.Get(key)
+			appr.Set(key, approvals.Denied, "auto-denied: unsafe behavior observed in box", prev.Integrity)
 			if err := appr.Save(projectDir); err != nil {
 				return err
 			}
 			return fmt.Errorf("%s attempted malicious actions during install", key)
+		}
+		if res.Discarded {
+			// Not a conviction — a blind spot. The script may well have been
+			// fine; we just can't say so, so we don't keep what we couldn't watch.
+			if res.ObserverLost {
+				// This one has no build-time excuse, so it is discarded under
+				// EVERY policy, not just untraced-boxed: fail.
+				fmt.Fprintf(os.Stderr, "guard: %s — observer was terminated by the script — output DISCARDED (%s).\n",
+					key, res.Summary())
+			} else if slices.Contains(res.Truncated, "trace") {
+				fmt.Fprintf(os.Stderr, "guard: %s — the script flooded the trace past its cap — output DISCARDED (%s).\n",
+					key, res.Summary())
+			} else {
+				fmt.Fprintf(os.Stderr, "guard: %s — output DISCARDED: observation incomplete (%s) and untraced-boxed is 'fail'.\n",
+					key, res.Summary())
+			}
+			return nil
 		}
 		fmt.Fprintf(os.Stderr, "guard: %s — %s\n", key, res.Summary())
 		if res.ExitCode != 0 {
@@ -690,6 +747,13 @@ func runApproved(key, projectDir, relPath string, d approvals.Decision, runtime,
 		return nil
 
 	case d == approvals.ApprovedUncontained:
+		// Policy is checked at RUN time, not just when the approval was recorded:
+		// an entry approved on a machine that had no Docker must not keep running
+		// bare after the repo tightened no-container-fallback to 'fail'.
+		if !uncontainedAllowed(cfg) {
+			fmt.Fprintf(os.Stderr, "guard: %s is approved-uncontained but no-container-fallback policy is 'fail' — skipping the uncontained run.\n", key)
+			return nil
+		}
 		// Explicit human approval recorded — the only path that runs bare.
 		fmt.Fprintf(os.Stderr, "guard: %s — running UNCONTAINED (explicitly approved)...\n", key)
 		res, err := box.RunUncontained(pkgDir)
@@ -708,6 +772,13 @@ func runApproved(key, projectDir, relPath string, d approvals.Decision, runtime,
 		fmt.Fprintf(os.Stderr, "guard: install docker/podman, or re-approve with: guard approve %s --uncontained\n", key)
 		return nil
 	}
+}
+
+// uncontainedAllowed reports whether policy permits running a script with NO
+// sandbox at all. Consulted at every uncontained run and before recording an
+// uncontained approval, so the two can't disagree.
+func uncontainedAllowed(cfg config.Config) bool {
+	return cfg.NoContainerFallback != config.FallbackFail
 }
 
 // runRootScripts replays the root project's own lifecycle scripts — trusted
@@ -751,22 +822,7 @@ func runRootScripts(dir string) error {
 // npm, a teammate without it) still can't push a too-young version past a
 // commit or PR.
 func cmdCheck(args []string) error {
-	quiet, all, jsonOut, confirm := false, false, false, false
-	for _, a := range args {
-		switch a {
-		case "--quiet":
-			quiet = true
-		case "--all":
-			all = true // force full-tree freshness check, not just the git diff
-		case "--json":
-			jsonOut = true
-		case "--confirm":
-			// Interactive gate for warn-tier advisories: prompt on a terminal
-			// before proceeding, recording acceptances. The git hooks pass this;
-			// CI (no terminal) sees warnings print without prompting.
-			confirm = true
-		}
-	}
+	quiet, all, jsonOut, confirm, hook := parseCheckArgs(args)
 	dir, err := os.Getwd()
 	if err != nil {
 		return err
@@ -797,9 +853,23 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	secErr := checkSecrets(dir, cfg, wf, quiet)
-	advErr := checkAdvisories(dir, quiet, confirm, cfg.AdvisoryThreshold, wf)
-	freshErr := checkFreshness(dir, quiet, all, confirm, wf)
+	// At pre-push git feeds the hook "<local ref> <local sha> <remote ref>
+	// <remote sha>" lines on stdin, which the shim passes straight through.
+	// They name what is actually being TRANSMITTED — the only correct snapshot
+	// for the secret and freshness gates at this phase. No lines (someone ran
+	// the command by hand) falls back to the working-tree view.
+	// Only read stdin when it is actually a pipe. Run by hand on a terminal,
+	// --hook=pre-push would otherwise block forever waiting for ref lines.
+	var refs []pushRef
+	if hook == "pre-push" && !stdinIsTTY() {
+		refs = parsePushRefs(os.Stdin)
+	}
+	if hook == "pre-commit" && !quiet {
+		warnStagedLockfileDiffers(dir)
+	}
+	secErr := checkSecrets(dir, cfg, wf, quiet, refs)
+	advErr := checkAdvisories(dir, cfg, quiet, confirm, wf)
+	freshErr := checkFreshness(dir, cfg, quiet, all, confirm, wf, refs)
 	intErr := checkLockfileIntegrity(dir, cfg, wf, quiet)
 	licErr := checkLicenses(dir, cfg, wf, quiet)
 	var provErr error
@@ -811,19 +881,21 @@ func cmdCheck(args []string) error {
 	if cfg.Flagged("new-deps") {
 		reportNewDeps(dir, quiet)
 	}
+	var maintErr error
 	if cfg.Flagged("new-maintainer") {
-		checkMaintainers(dir, cfg, quiet)
+		maintErr = checkMaintainers(dir, cfg, quiet)
 	}
 	// One-line rollup so the overall verdict is scannable regardless of how many
 	// checkers printed above (and lands as a single line in CI logs).
 	if !quiet {
 		printCheckSummary(dir, map[string]error{
-			"secrets":    secErr,
-			"advisories": advErr,
-			"cooldown":   freshErr,
-			"integrity":  intErr,
-			"licenses":   licErr,
-			"provenance": provErr,
+			"secrets":     secErr,
+			"advisories":  advErr,
+			"cooldown":    freshErr,
+			"integrity":   intErr,
+			"licenses":    licErr,
+			"provenance":  provErr,
+			"maintainers": maintErr,
 		})
 	}
 	// First gate to trip wins the exit code; all of them already printed. Secrets
@@ -843,7 +915,40 @@ func cmdCheck(args []string) error {
 	if provErr != nil {
 		return provErr
 	}
-	return freshErr
+	if freshErr != nil {
+		return freshErr
+	}
+	return maintErr
+}
+
+// parseCheckArgs pulls the flags out of `guard check`'s argv. Split out so the
+// --hook= phase wiring is testable without running the whole command.
+//
+// An unrecognized --hook= value yields "" rather than an error: a future shim
+// naming a phase this binary doesn't know must degrade to the plain check, not
+// break every commit in the repo.
+func parseCheckArgs(args []string) (quiet, all, jsonOut, confirm bool, hook string) {
+	for _, a := range args {
+		switch {
+		case a == "--quiet":
+			quiet = true
+		case a == "--all":
+			all = true // force full-tree freshness check, not just the git diff
+		case a == "--json":
+			jsonOut = true
+		case a == "--confirm":
+			// Interactive gate for warn-tier advisories: prompt on a terminal
+			// before proceeding, recording acceptances. The git hooks pass this;
+			// CI (no terminal) sees warnings print without prompting.
+			confirm = true
+		case strings.HasPrefix(a, "--hook="):
+			switch v := strings.TrimPrefix(a, "--hook="); v {
+			case "pre-commit", "pre-push":
+				hook = v
+			}
+		}
+	}
+	return
 }
 
 // printCheckSummary prints the single-line verdict for guard check: the
@@ -883,9 +988,13 @@ type CheckResult struct {
 	Cooldown         []freshness.Violation `json:"cooldownViolations"`
 	OffRegistry      []string              `json:"offRegistry"`
 	Unhashed         []string              `json:"unhashed"`
-	NewDeps          []string              `json:"newDeps"`
-	Maintainers      []maintainer.Change   `json:"maintainerChanges"`
-	License          []license.Violation   `json:"licenseViolations,omitempty"`
+	// Conflicting are name@version pairs the lockfile records at two paths with
+	// DIFFERENT tarballs or hashes. The lockfile contradicts itself, so no
+	// single answer about what will be installed is trustworthy — not waivable.
+	Conflicting []string            `json:"conflicting,omitempty"`
+	NewDeps     []string            `json:"newDeps"`
+	Maintainers []maintainer.Change `json:"maintainerChanges"`
+	License     []license.Violation `json:"licenseViolations,omitempty"`
 	// Secrets are files matching a secret-paths pattern that are staged or already
 	// tracked by git — a HARD block (like a critical advisory). These flip OK.
 	Secrets    []secrets.Match      `json:"secrets,omitempty"`
@@ -1070,10 +1179,16 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	}
 	regHost := hostOf(cfg.Registry)
 	for _, p := range pkgs {
-		if cfg.Allowed(p.Name) || !checkableDep(p) {
+		if p.Conflict {
+			res.Conflicting = append(res.Conflicting, p.Key())
+		}
+		if !checkableDep(p) {
 			continue
 		}
-		if hasTarballURL(p) {
+		// Only internal-scope names are exempt from the host check: they are
+		// DECLARED to come from a private registry. `allow:` is a cooldown
+		// escape hatch and buys nothing here.
+		if hasTarballURL(p) && !cfg.Internal(p.Name) {
 			if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
 				if id := offRegistryWaiverID(p.Key()); waivedActive(wf, id, now) {
 					res.Waived = append(res.Waived, id)
@@ -1133,10 +1248,12 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			res.License = activeLicense(lres.Violations, wf, now, &res.Waived)
 		}
 	}
-	// Build-provenance gate (flag-gated, opt-in). Only INVALID attestations gate;
-	// verified/absent/degraded are informational (degraded = a fetch/parse that
-	// couldn't complete, surfaced in res.Provenance but never gating). One
-	// registry fetch per package, so it's off by default.
+	// Build-provenance gate (flag-gated, opt-in). Only INVALID attestations gate.
+	// A DEGRADED result is a check that could not complete, so it joins
+	// res.Degraded like every other failed lookup — and therefore obeys
+	// on-check-error via the OK computation below, instead of the JSON/MCP path
+	// reporting ok:true while the text path gates. One registry fetch per
+	// package, so it's off by default.
 	invalidProv := 0
 	if cfg.Flagged("provenance") {
 		apkgs := make([]attestation.Pkg, 0, len(pkgs))
@@ -1144,16 +1261,29 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
 		}
 		client := &http.Client{Timeout: 30 * time.Second}
-		res.Provenance = attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed, nil)
+		res.Provenance = attestation.Check(client, cfg.Registry, apkgs, cfg.Internal, nil)
+		degradedProv := 0
 		for _, r := range res.Provenance {
-			if r.Status == attestation.StatusInvalid {
+			switch r.Status {
+			case attestation.StatusInvalid:
 				invalidProv++
+			case attestation.StatusDegraded:
+				degradedProv++
 			}
+		}
+		if degradedProv > 0 {
+			res.Degraded = append(res.Degraded, fmt.Sprintf("provenance check incomplete: %d package(s) could not be verified", degradedProv))
 		}
 	}
 	// res.Advisories is blockers-only (warnings live in AdvisoryWarnings and do
 	// not gate), so OK keys off it directly.
-	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 && len(res.Unhashed) == 0 && len(res.License) == 0 && len(res.Secrets) == 0 && invalidProv == 0
+	res.OK = len(res.Advisories) == 0 && len(res.Cooldown) == 0 && len(res.OffRegistry) == 0 &&
+		len(res.Unhashed) == 0 && len(res.Conflicting) == 0 && len(res.License) == 0 &&
+		len(res.Secrets) == 0 && invalidProv == 0
+	// Under on-check-error: fail a check that could not COMPLETE is not a pass.
+	if cfg.OnCheckErrorFail && len(res.Degraded) > 0 {
+		res.OK = false
+	}
 	return res, nil
 }
 
@@ -1161,8 +1291,10 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 // configured registry (a poisoned lockfile silently redirecting a fetch to an
 // attacker host) or that carry no integrity hash (npm can't verify the
 // download). Both are tamper signatures a hand-edited or malicious lockfile
-// leaves behind. Allowlisted packages bypass — a deliberately alternate source
-// is the human's call. Gates the check like the advisory layer.
+// leaves behind, as is the same name@version recorded twice with DIFFERENT
+// tarballs or hashes (Conflict). Only internal-scope names are exempt from the
+// host check — they are declared to live on a private registry. `allow:` is a
+// cooldown escape hatch and exempts NOTHING here. Gates like the advisory layer.
 func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
@@ -1173,7 +1305,7 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 	}
 	regHost := hostOf(cfg.Registry)
 	now := time.Now()
-	var offReg, noHash []string
+	var offReg, noHash, conflict []string
 	// waiveOrKeep routes one integrity finding: an active waiver suppresses it
 	// (shown muted), an expired waiver re-gates it loudly, otherwise it gates.
 	waiveOrKeep := func(id, display string, into *[]string) {
@@ -1191,15 +1323,17 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 		}
 	}
 	for _, p := range pkgs {
-		if cfg.Allowed(p.Name) {
-			continue
+		// Not waivable: a self-contradicting lockfile has to be fixed, not
+		// accepted — we can't say which of the two records will win.
+		if p.Conflict {
+			conflict = append(conflict, p.Key())
 		}
 		if !checkableDep(p) {
 			continue
 		}
 		// The host comparison needs an actual tarball URL; pnpm normally records
 		// none, and those entries are still hash-checked below.
-		if hasTarballURL(p) {
+		if hasTarballURL(p) && !cfg.Internal(p.Name) {
 			if h := hostOf(p.Resolved); h != regHost && !isLoopbackHost(h) {
 				waiveOrKeep(offRegistryWaiverID(p.Key()),
 					fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost), &offReg)
@@ -1209,7 +1343,7 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 			waiveOrKeep(unhashedWaiverID(p.Key()), p.Key(), &noHash)
 		}
 	}
-	if len(offReg) == 0 && len(noHash) == 0 {
+	if len(offReg) == 0 && len(noHash) == 0 && len(conflict) == 0 {
 		if !quiet {
 			fmt.Printf("guard: lockfile integrity ok (%d version(s)) %s\n", len(pkgs), ui.OK())
 		}
@@ -1227,8 +1361,17 @@ func checkLockfileIntegrity(dir string, cfg config.Config, wf *waivers.File, qui
 			fmt.Fprintln(os.Stderr, "  ", s)
 		}
 	}
-	fmt.Fprintln(os.Stderr, "guard: a tarball off-registry or without a hash can't be verified — allowlist in .guardrc, or — if reviewed — guard ignore off-registry:<name>@<version> / unhashed:<name>@<version>")
-	return fmt.Errorf("lockfile integrity check failed (%d off-registry, %d unhashed)", len(offReg), len(noHash))
+	if len(conflict) > 0 {
+		fmt.Fprintf(os.Stderr, "guard: %d version(s) appear with conflicting tarball/integrity values:\n", len(conflict))
+		for _, s := range conflict {
+			fmt.Fprintln(os.Stderr, "  ", s)
+		}
+		fmt.Fprintln(os.Stderr, "guard: fix the lockfile — `npm install` regenerates consistent entries; review the diff before committing. Not waivable.")
+	}
+	if len(offReg) > 0 || len(noHash) > 0 {
+		fmt.Fprintln(os.Stderr, "guard: a tarball off-registry or without a hash can't be verified — mark private scopes with internal-scopes in .guardrc, or — if reviewed — guard ignore off-registry:<name>@<version> / unhashed:<name>@<version>")
+	}
+	return fmt.Errorf("lockfile integrity check failed (%d off-registry, %d unhashed, %d conflicting)", len(offReg), len(noHash), len(conflict))
 }
 
 // maxPackumentBytes caps bytes read from a registry packument (see
@@ -1324,22 +1467,21 @@ func priorVersion(current string, all []string) string {
 // checkMaintainers surfaces publisher changes on installed versions — the
 // account-takeover signal (DESIGN §6). Opt-in via `flag: new-maintainer`
 // because it fetches a packument per package; informational, never gates.
-func checkMaintainers(dir string, cfg config.Config, quiet bool) {
+// It returns an error only under on-check-error: fail, when a publisher lookup
+// could not complete — the CHANGES themselves are a signal to verify, never a
+// gate (a legitimate maintainer handover looks identical to a takeover).
+func checkMaintainers(dir string, cfg config.Config, quiet bool) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
-		return
+		return nil
 	}
 	changes, warnings := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, progressPrinter("maintainers", quiet))
-	for _, w := range warnings {
-		if !quiet {
-			fmt.Fprintln(os.Stderr, "guard: maintainer check skipped for", w)
-		}
-	}
+	degraded := cfg.Degrade("maintainer check", collapse(warnings))
 	if len(changes) == 0 {
 		if !quiet {
 			fmt.Println("guard: no maintainer/publisher changes on installed versions " + ui.OK())
 		}
-		return
+		return degraded
 	}
 	fmt.Fprintf(os.Stderr, "guard: %d installed version(s) changed publisher or republished after dormancy (verify — account-takeover signal):\n", len(changes))
 	for _, c := range changes {
@@ -1354,6 +1496,7 @@ func checkMaintainers(dir string, cfg config.Config, quiet bool) {
 			fmt.Fprintf(os.Stderr, "  %s@%s — published after %dd dormancy\n", c.Name, c.Version, c.GapDays)
 		}
 	}
+	return degraded
 }
 
 // reportNewDeps surfaces the packages a lockfile change ADDS to the tree
@@ -1393,14 +1536,18 @@ func reportNewDeps(dir string, quiet bool) {
 }
 
 // checkFreshness re-applies the cooldown to versions already in the lockfile.
-// Scope: only versions ADDED relative to git HEAD (each version gets checked
-// once, at the commit that introduces it) — full tree with --all or when
-// there's no git history to diff against.
-func checkFreshness(dir string, quiet, all, confirm bool, wf *waivers.File) error {
-	cfg, err := config.Load(dir)
-	if err != nil {
-		return err
-	}
+// Which versions count as "new" depends on the PHASE:
+//
+//	--all       the full tree.
+//	pre-push    what the pushed commits ADD over the remote side (refs non-empty).
+//	otherwise   what the working tree ADDS over git HEAD.
+//
+// The pre-push case is the one that matters for enforcement: after a commit the
+// working tree and HEAD agree, so a too-young version that got committed anyway
+// (GUARD_SKIP, or a teammate without guard) is invisible to a HEAD diff yet is
+// exactly what the push transmits. Comparing against the remote catches it.
+// npm-only — the ref snapshots come from package-lock.json.
+func checkFreshness(dir string, cfg config.Config, quiet, all, confirm bool, wf *waivers.File, refs []pushRef) error {
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1410,28 +1557,31 @@ func checkFreshness(dir string, quiet, all, confirm bool, wf *waivers.File) erro
 	}
 
 	scope := "lockfile additions"
-	if !all {
+	scoped := false
+	if all {
+		scope, scoped = "full tree (--all)", true
+	} else if len(refs) > 0 {
+		// One push can carry several refs (`git push --all`, or two branches at
+		// once). Each has its own snapshot and its own base, so vet the UNION of
+		// what they add — checking only the first would let a second branch
+		// smuggle a too-young version through.
+		//
+		// ok is false when no pushed commit had a package-lock.json at all (a
+		// pnpm/yarn repo): fall through to the working-tree view rather than
+		// checking nothing.
+		if np, s, ok := pushNewVersions(dir, refs); ok {
+			pkgs, scope, scoped = np, s, true
+		}
+	}
+	if !scoped {
+		if len(refs) > 0 {
+			scope = "working tree vs HEAD (no npm lockfile in the pushed commits)"
+		}
 		if prev, ok := headLockfile(dir); ok {
-			// Keep only versions not already present at HEAD. Keyed on
-			// name@version (not name) so a NEW version of an existing package
-			// is still vetted — each distinct version is checked once, at the
-			// commit that introduces it.
-			vetted := map[string]bool{}
-			for _, p := range prev {
-				vetted[p.Key()] = true
-			}
-			kept := pkgs[:0]
-			for _, p := range pkgs {
-				if !vetted[p.Key()] {
-					kept = append(kept, p)
-				}
-			}
-			pkgs = kept
+			pkgs = newVersions(pkgs, prev)
 		} else {
 			scope = "full tree (no committed lockfile to diff against)"
 		}
-	} else {
-		scope = "full tree (--all)"
 	}
 	if len(pkgs) == 0 {
 		if !quiet {
@@ -1441,11 +1591,12 @@ func checkFreshness(dir string, quiet, all, confirm bool, wf *waivers.File) erro
 	}
 
 	violations, warnings := freshness.Check(cfg.Registry, pkgs, cfg.Cooldown, cfg.Allowed)
-	for _, w := range warnings {
-		// Fail-open on per-package fetch errors, but loudly: a registry blip
-		// must not block every commit in every repo.
-		fmt.Fprintln(os.Stderr, "guard: freshness check skipped for", w)
-	}
+	// Per-package fetch errors are fail-open by default (a registry blip must
+	// not block every commit in every repo) — but always loud, and gating under
+	// on-check-error: fail. Collapsed to ONE line: a tree-wide registry outage
+	// produces one warning per package, and hundreds of them is how a warning
+	// stops being read.
+	degraded := cfg.Degrade("freshness check", collapse(warnings))
 	// Drop violations a human has reviewed and waived (still shown, muted); an
 	// expired waiver re-gates and is reported.
 	now := time.Now()
@@ -1469,7 +1620,7 @@ func checkFreshness(dir string, quiet, all, confirm bool, wf *waivers.File) erro
 		if !quiet {
 			fmt.Printf("guard: %d version(s) cooldown-checked (%s), all clear %s\n", len(pkgs), scope, ui.OK())
 		}
-		return nil
+		return degraded
 	}
 	fmt.Fprintf(os.Stderr, "guard: %d version(s) inside the %s cooldown:\n", len(active), cfg.Cooldown)
 	for _, v := range active {
@@ -1678,16 +1829,211 @@ func setDepVersion(content, name, version string) (string, bool) {
 
 // headLockfile reads package-lock.json as committed at git HEAD.
 // ok=false when there's no git repo, no HEAD, or no committed lockfile.
-func headLockfile(dir string) ([]lockfile.Pkg, bool) {
-	out, err := exec.Command("git", "-C", dir, "show", "HEAD:package-lock.json").Output()
+func headLockfile(dir string) ([]lockfile.Pkg, bool) { return refLockfile(dir, "HEAD") }
+
+// refLockfile parses package-lock.json as it exists at a git ref — "HEAD", a
+// sha, or "<sha>^" — without checking anything out. npm-only: InstalledBytes
+// reads npm's lockfile shape, so pnpm/yarn repos fall back to the full tree.
+func refLockfile(dir, ref string) ([]lockfile.Pkg, bool) {
+	out, err := gitOutput(dir, "show", ref+":package-lock.json")
 	if err != nil {
 		return nil, false
 	}
-	prev, err := lockfile.InstalledBytes(out)
+	prev, err := lockfile.InstalledBytes([]byte(out))
 	if err != nil {
 		return nil, false
 	}
 	return prev, true
+}
+
+// collapse turns a list of per-package failure messages into ONE error naming
+// the count and the first cause, or nil when there were none. Fail-open layers
+// report per package; printing all of them buries the signal.
+func collapse(warnings []string) error {
+	switch len(warnings) {
+	case 0:
+		return nil
+	case 1:
+		return errors.New(warnings[0])
+	default:
+		return fmt.Errorf("%d package(s), e.g. %s", len(warnings), warnings[0])
+	}
+}
+
+// newVersions returns the entries of curr whose name@version is absent from
+// base — each distinct version is checked once, at the change that adds it.
+func newVersions(curr, base []lockfile.Pkg) []lockfile.Pkg {
+	vetted := map[string]bool{}
+	for _, p := range base {
+		vetted[p.Key()] = true
+	}
+	var out []lockfile.Pkg
+	for _, p := range curr {
+		if !vetted[p.Key()] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// gitOutput runs a git command in dir and returns its stdout. A func var so the
+// ref-selection logic below is testable without building repositories.
+var gitOutput = func(dir string, args ...string) (string, error) {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	return string(out), err
+}
+
+// pushRef is one "<local ref> <local sha> <remote ref> <remote sha>" line git
+// writes to a pre-push hook's stdin.
+type pushRef struct{ localRef, localSHA, remoteRef, remoteSHA string }
+
+// isZeroSHA reports git's all-zero sha, which means "this side has nothing":
+// on the local side a ref being DELETED, on the remote side a branch that does
+// not exist there yet.
+// A bare "0" is not a git object id — the length has to be right too, or a
+// junk field would be read as "this side has nothing".
+func isZeroSHA(s string) bool {
+	return len(s) >= 40 && len(s) <= 64 && strings.Trim(s, "0") == ""
+}
+
+// isSHA validates an object id from the hook's stdin: 40 hex (sha1) to 64 hex
+// (sha256), nothing else. These values are concatenated into git ARGUMENTS, so
+// an unvalidated one is an argument-injection surface — "--output=…" is a
+// perfectly good string until git reads it as a flag.
+func isSHA(s string) bool {
+	if len(s) < 40 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// parsePushRefs reads the ref lines git feeds the pre-push hook (guard inherits
+// that stdin through the shim). Deletions carry nothing to check and are dropped;
+// malformed lines are skipped rather than fatal.
+func parsePushRefs(r io.Reader) []pushRef {
+	var out []pushRef
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		// Drop deletions (nothing to check) and anything whose object ids don't
+		// look like object ids — they end up as git arguments.
+		if len(f) < 4 || isZeroSHA(f[1]) || !isSHA(f[1]) || !(isSHA(f[3]) || isZeroSHA(f[3])) {
+			continue
+		}
+		out = append(out, pushRef{localRef: f[0], localSHA: f[1], remoteRef: f[2], remoteSHA: f[3]})
+	}
+	return out
+}
+
+// outgoingRevArgs turns pushed refs into git-log revision selectors covering
+// exactly the commits the push transmits: a "<remote>..<local>" range for a
+// branch the remote already has, and "<local> --not --remotes" for a new one
+// (everything reachable from it that no remote branch already holds).
+func outgoingRevArgs(refs []pushRef) [][]string {
+	var out [][]string
+	for _, r := range refs {
+		if isZeroSHA(r.remoteSHA) {
+			out = append(out, []string{r.localSHA, "--not", "--remotes"})
+		} else {
+			out = append(out, []string{r.remoteSHA + ".." + r.localSHA})
+		}
+	}
+	return out
+}
+
+// pushBaseRef picks the freshness comparison base for one pushed ref: the state
+// the REMOTE already has, so "new" means "new to the remote", not "new to my
+// working tree". For a branch the remote knows, that's its sha. For a new branch
+// it's the parent of the oldest outgoing commit.
+//
+// Returns ("", false) when nothing is outgoing, and ("", true) when there is no
+// base at all (a root commit) — then the whole tree counts as new.
+func pushBaseRef(dir string, r pushRef) (base string, full bool) {
+	if !isZeroSHA(r.remoteSHA) {
+		return r.remoteSHA, false
+	}
+	out, err := gitOutput(dir, "rev-list", r.localSHA, "--not", "--remotes")
+	if err != nil {
+		return "", true
+	}
+	commits := strings.Fields(out)
+	if len(commits) == 0 {
+		return "", false // already on a remote — nothing to check
+	}
+	oldest := commits[len(commits)-1]
+	if _, err := gitOutput(dir, "rev-parse", "--verify", "--quiet", oldest+"^"); err != nil {
+		return "", true // root commit, no parent
+	}
+	return oldest + "^", false
+}
+
+// pushNewVersions returns the lockfile versions a push ADDS, unioned across
+// every pushed ref, plus a human scope label. For each ref the "current"
+// snapshot is the commit being pushed (not the working tree) and the base is
+// whatever the remote already has (pushBaseRef). A ref with no base at all — a
+// root commit — makes the whole of that snapshot new.
+//
+// ok is false when NO pushed commit carried a package-lock.json — a pnpm/yarn
+// repo, where these snapshots don't exist. The caller then falls back to the
+// working-tree scope instead of silently checking an empty set.
+func pushNewVersions(dir string, refs []pushRef) (pkgs []lockfile.Pkg, scope string, ok bool) {
+	seen := map[string]bool{}
+	var out []lockfile.Pkg
+	scope = "nothing outgoing"
+	sawSnapshot := false
+	for _, r := range refs {
+		cur, ok := refLockfile(dir, r.localSHA)
+		if !ok {
+			continue // no npm lockfile at that commit — nothing to compare
+		}
+		sawSnapshot = true
+		base, full := pushBaseRef(dir, r)
+		add := cur
+		switch {
+		case full:
+			scope = "full tree (pushing a root commit, npm lockfile only)"
+		case base == "":
+			continue // this ref is already on a remote
+		default:
+			if prev, ok := refLockfile(dir, base); ok {
+				add = newVersions(cur, prev)
+				if scope == "nothing outgoing" {
+					scope = "versions this push adds (npm lockfile only)"
+				}
+			} else {
+				scope = "full tree (no lockfile on the remote side)"
+			}
+		}
+		for _, p := range add {
+			if !seen[p.Key()] {
+				seen[p.Key()] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out, scope, sawSnapshot
+}
+
+// warnStagedLockfileDiffers notes when the STAGED package-lock.json differs from
+// the working-tree copy the checks actually read. Informational only: the
+// working tree is the right thing to check at pre-commit, but the human should
+// know the snapshot being committed isn't byte-identical to it.
+func warnStagedLockfileDiffers(dir string) {
+	staged, err := gitOutput(dir, "show", ":package-lock.json")
+	if err != nil {
+		return
+	}
+	wt, err := os.ReadFile(filepath.Join(dir, "package-lock.json"))
+	if err != nil || string(wt) == staged {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "guard: note — checks ran on the working-tree package-lock.json; the STAGED copy differs.")
 }
 
 // activeLicense drops license violations an active waiver suppresses, recording
@@ -1721,8 +2067,12 @@ func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) 
 		return err
 	}
 	res := license.Check(dir, entries, cfg.LicenseDeny, cfg.LicenseAllow)
-	if res.Degraded && !quiet {
-		fmt.Fprintf(os.Stderr, "guard: %s license check incomplete — node_modules missing for some packages (run an install first)\n", ui.Warn())
+	var degraded error
+	if res.Degraded {
+		// An absent node_modules means we could not read some declared licenses
+		// — same "the check didn't run" shape as an OSV outage, same policy.
+		degraded = cfg.Degrade("license check",
+			errors.New("node_modules missing for some packages (run an install first)"))
 	}
 	now := time.Now()
 	var active []license.Violation
@@ -1742,10 +2092,10 @@ func checkLicenses(dir string, cfg config.Config, wf *waivers.File, quiet bool) 
 		}
 	}
 	if len(active) == 0 {
-		if !quiet && len(res.Violations) == 0 {
+		if !quiet && len(res.Violations) == 0 && degraded == nil {
 			fmt.Printf("guard: license policy OK %s\n", ui.OK())
 		}
-		return nil
+		return degraded
 	}
 	fmt.Fprintf(os.Stderr, "guard: %d license violation(s):\n", len(active))
 	for _, v := range active {
@@ -1779,7 +2129,7 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	verified, invalid, degraded := 0, 0, 0
-	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Allowed, progressPrinter("provenance", quiet)) {
+	for _, r := range attestation.Check(client, cfg.Registry, apkgs, cfg.Internal, progressPrinter("provenance", quiet)) {
 		switch r.Status {
 		case attestation.StatusVerified:
 			verified++
@@ -1801,18 +2151,19 @@ func checkProvenance(dir string, cfg config.Config, quiet bool) error {
 	if !quiet && verified > 0 {
 		fmt.Printf("guard: %d package(s) with verified build provenance %s\n", verified, ui.OK())
 	}
-	if !quiet && degraded > 0 {
-		fmt.Fprintf(os.Stderr, "guard: %d package(s) with a degraded provenance check (not gated) %s\n", degraded, ui.Warn())
-	}
 	if invalid > 0 {
 		return fmt.Errorf("%d package(s) with INVALID provenance attestation", invalid)
+	}
+	if degraded > 0 {
+		return cfg.Degrade("provenance check", fmt.Errorf("%d package(s) could not be verified", degraded))
 	}
 	return nil
 }
 
 // checkAdvisories queries OSV for every installed version and fails when any
 // advisory hits — the "installed last month, reported yesterday" recovery layer.
-func checkAdvisories(dir string, quiet, confirm bool, threshold advisory.Severity, wf *waivers.File) error {
+func checkAdvisories(dir string, cfg config.Config, quiet, confirm bool, wf *waivers.File) error {
+	threshold := cfg.AdvisoryThreshold
 	pkgs, err := lockfile.Installed(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1825,10 +2176,10 @@ func checkAdvisories(dir string, quiet, confirm bool, threshold advisory.Severit
 	}
 	vulns, err := advisory.Check(pkgs)
 	if err != nil {
-		// Advisory feed unreachable: report, don't block work on a network
-		// blip. The cooldown + script layers still stand.
-		fmt.Fprintln(os.Stderr, "guard: advisory check skipped:", err)
-		return nil
+		// Advisory feed unreachable: report, don't block work on a network blip
+		// (the cooldown + script layers still stand) — unless on-check-error is
+		// 'fail', where an unproven tree stops the commit instead.
+		return cfg.Degrade("advisory check", err)
 	}
 	// Partition into still-gating hits and the ones a human has reviewed and
 	// waived in .guard-ignores. Waived hits are shown (muted) but never gate;
@@ -1945,16 +2296,37 @@ func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File)
 // secret can't be uploaded. A git error (not a repo, git missing) is fail-open
 // and logged: there's no upload surface to assert about. A deliberate match is
 // waived per-path with 'guard ignore secret:<path>'.
-func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool) error {
+func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool, refs []pushRef) error {
 	if len(cfg.SecretPaths) == 0 {
 		return nil
 	}
 	matches, err := secrets.Find(dir, cfg.SecretPaths)
 	if err != nil {
-		// Fail-open + loud, consistent with the advisory/freshness network paths:
-		// a missing git binary or non-repo must not wedge every check.
-		fmt.Fprintln(os.Stderr, "guard: secret-paths check skipped:", err)
-		return nil
+		// Fail-open + loud by default, consistent with the advisory/freshness
+		// network paths: a missing git binary or non-repo must not wedge every
+		// check. Gates under on-check-error: fail.
+		return cfg.Degrade("secret-paths check", err)
+	}
+	// At pre-push the tree is not the upload surface: a secret committed and
+	// then deleted is absent from ls-files but still rides the outgoing history.
+	// Merge those hits in, keeping the history flag so the remediation advice
+	// can say "rewrite + rotate", not "git rm --cached".
+	var histErr error
+	if len(refs) > 0 {
+		hist, herr := secrets.FindOutgoing(dir, cfg.SecretPaths, outgoingRevArgs(refs))
+		// A range we could not read is "I did not look", not "nothing there" —
+		// a shallow clone fails every range. Report it (and gate under
+		// on-check-error: fail) while still using whatever we did find.
+		histErr = cfg.Degrade("outgoing-history secret scan", herr)
+		have := map[string]bool{}
+		for _, m := range matches {
+			have[m.Path] = true
+		}
+		for _, m := range hist {
+			if !have[m.Path] {
+				matches = append(matches, m)
+			}
+		}
 	}
 	now := time.Now()
 	var active []secrets.Match
@@ -1974,16 +2346,25 @@ func checkSecrets(dir string, cfg config.Config, wf *waivers.File, quiet bool) e
 		}
 	}
 	if len(active) == 0 {
-		if !quiet {
+		if !quiet && histErr == nil {
 			fmt.Printf("guard: no secret files staged or tracked %s\n", ui.OK())
 		}
-		return nil
+		return histErr
 	}
 	fmt.Fprintf(os.Stderr, "guard: %s %d secret file(s) would be committed/pushed:\n", ui.Bad(), len(active))
+	inHistory := false
 	for _, m := range active {
-		fmt.Fprintf(os.Stderr, "  %s  (matched secret-paths %q)\n", m.Path, m.Pattern)
+		where := ""
+		if m.History {
+			where, inHistory = "  [committed in outgoing history]", true
+		}
+		fmt.Fprintf(os.Stderr, "  %s  (matched secret-paths %q)%s\n", m.Path, m.Pattern, where)
 	}
 	fmt.Fprintln(os.Stderr, "guard: untrack it first — git rm --cached <file> (and add it to .gitignore).")
+	if inHistory {
+		fmt.Fprintln(os.Stderr, "guard: a file marked [committed in outgoing history] is ALREADY in a commit you are pushing —")
+		fmt.Fprintln(os.Stderr, "guard: deleting it now does not take it back. Rewrite the history (git rebase -i / filter-repo) AND rotate the credential.")
+	}
 	fmt.Fprintf(os.Stderr, "guard: a deliberate file? → guard ignore secret:%s --reason \"...\"\n", active[0].Path)
 	return fmt.Errorf("%d secret file(s) staged or tracked", len(active))
 }
@@ -2198,17 +2579,42 @@ func cmdApprove(args []string) error {
 	if err != nil {
 		return err
 	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		return err
+	}
+	if decision == approvals.ApprovedUncontained && !uncontainedAllowed(cfg) {
+		return fmt.Errorf("no-container-fallback is 'fail' in %s — refusing to record an uncontained approval (it would never run anyway)", config.FileName)
+	}
 	appr, err := approvals.Load(dir)
 	if err != nil {
 		return err
 	}
-	appr.Set(key, decision, "recorded via guard approve")
+	// Bind the decision to the tarball currently in the lockfile, so it lapses
+	// if the bytes behind this name@version ever change.
+	appr.Set(key, decision, "recorded via guard approve", lockedIntegrity(dir, key))
 	if err := appr.Save(dir); err != nil {
 		return err
 	}
 	fmt.Printf("guard: %s → %s (saved to %s — commit it so the decision travels)\n",
 		key, decision, approvals.FileName)
 	return nil
+}
+
+// lockedIntegrity returns the integrity hash the lockfile records for a
+// "name@version" key, or "" when the package isn't in this project's lockfile
+// (approving ahead of an install stays possible — the entry just isn't bound).
+func lockedIntegrity(dir, key string) string {
+	entries, err := lockfile.InstalledPaths(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.Name+"@"+e.Version == key {
+			return e.Integrity
+		}
+	}
+	return ""
 }
 
 // ─── guard ignore ────────────────────────────────────────────────────────────
@@ -2414,6 +2820,7 @@ func cmdStatus(args []string) error {
 	row("cooldown", fmtCooldown(cfg.Cooldown))
 	row("ignore-scripts", fmt.Sprintf("%v", cfg.IgnoreScripts))
 	row("allow", listOrNone(cfg.Allow))
+	row("on-check-error", boolState(cfg.OnCheckErrorFail, "fail", "warn"))
 	row("internal-scopes", listOrNone(cfg.InternalScopes))
 	row("fallback", string(cfg.NoContainerFallback))
 	row("flags", listOrNone(cfg.Flag))
@@ -2433,6 +2840,11 @@ func cmdStatus(args []string) error {
 	st := hooks.Installed(dir)
 	row("pre-commit hook", hookRow(st.PreCommit, st.PreCommitCurrent))
 	row("pre-push hook", hookRow(st.PrePush, st.PrePushCurrent))
+	rel, relErr := filepath.Rel(dir, st.HookDir)
+	if relErr != nil {
+		rel = st.HookDir
+	}
+	row("hook dir", ui.Dim(rel))
 	row("CI PR gate", boolState(st.CIWorkflow, "installed", "not installed (guard init --ci)"))
 	if st.Husky {
 		row("husky", ui.OK()+" detected (depguard chained onto it)")

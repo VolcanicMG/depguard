@@ -46,6 +46,11 @@ type Pkg struct {
 	// dep, which legitimately carries neither a host nor a hash — so the
 	// integrity checks would have to skip both, and pnpm would go unchecked.
 	FromRegistry bool
+	// Conflict marks a name@version recorded at two lockfile paths with
+	// DIFFERENT tarball URLs or integrity hashes. Dedupe keeps one of them, so
+	// without this flag the disagreement — the signature of a hand-edited or
+	// partially poisoned lockfile — would vanish silently.
+	Conflict bool
 }
 
 // Key is the dedupe/identity key for a package version ("name@version").
@@ -80,10 +85,18 @@ func Installed(dir string) ([]Pkg, error) {
 		return dedupe(entries), nil
 	}
 	if raw, err := os.ReadFile(filepath.Join(dir, "pnpm-lock.yaml")); err == nil {
-		return dedupePkgs(parsePnpm(raw)), nil
+		pkgs, perr := parsePnpm(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		return dedupePkgs(pkgs), nil
 	}
 	if raw, err := os.ReadFile(filepath.Join(dir, "yarn.lock")); err == nil {
-		return dedupePkgs(parseYarn(raw)), nil
+		pkgs, perr := parseYarn(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		return dedupePkgs(pkgs), nil
 	}
 	return nil, os.ErrNotExist // no recognized lockfile — callers treat as "nothing to check"
 }
@@ -102,33 +115,69 @@ func InstalledBytes(raw []byte) ([]Pkg, error) {
 // distinct version of a name (only exact-pair duplicates from nested paths
 // are merged). Output order is deterministic (sorted by key) so callers that
 // print or diff it behave reproducibly.
+// A duplicate that DISAGREES about the tarball or hash sets Conflict on the
+// survivor — the lockfile is inconsistent and the caller must gate on it.
 func dedupe(entries []Entry) []Pkg {
-	seen := map[string]bool{}
+	// Sort by lockfile path first: the map the entries came from has no order,
+	// so without this the surviving record of a duplicate pair would vary run
+	// to run — and with it the reported Resolved/Integrity.
+	sorted := append([]Entry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	at := map[string]int{}
 	var out []Pkg
-	for _, e := range entries {
+	for _, e := range sorted {
 		// FromRegistry stays false: an npm lockfile records the tarball URL for
 		// real registry deps, so Resolved alone classifies these.
 		p := Pkg{Name: e.Name, Version: e.Version, Resolved: e.Resolved, Integrity: e.Integrity}
-		if seen[p.Key()] {
+		if i, ok := at[p.Key()]; ok {
+			merge(&out[i], p)
 			continue
 		}
-		seen[p.Key()] = true
+		at[p.Key()] = len(out)
 		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key() < out[j].Key() })
 	return out
 }
 
+// merge folds a duplicate record of the same name@version into the survivor.
+// It is a UNION, not a first-wins pick: an omitted field is filled in from the
+// duplicate, and only two non-empty differing values are a Conflict.
+//
+// Collapsing by "first wins" was a gate bypass. A crafted lockfile could add an
+// information-EMPTY duplicate (`{"version":"6.0.0"}`) at a path that sorts
+// first; the real record — the one with the evil tarball URL and the hash — was
+// discarded, the survivor had neither, checkableDep went false, and BOTH
+// integrity checks skipped the package while printing "integrity ok".
+func merge(dst *Pkg, src Pkg) {
+	if dst.Resolved == "" {
+		dst.Resolved = src.Resolved
+	} else if src.Resolved != "" && src.Resolved != dst.Resolved {
+		dst.Conflict = true
+	}
+	if dst.Integrity == "" {
+		dst.Integrity = src.Integrity
+	} else if src.Integrity != "" && src.Integrity != dst.Integrity {
+		dst.Conflict = true
+	}
+	// Either record proving this is a registry dep is enough to keep it in scope.
+	dst.FromRegistry = dst.FromRegistry || src.FromRegistry
+}
+
 // dedupePkgs is dedupe for parsers (pnpm/yarn) that already produce []Pkg.
 // Drops entries missing a version (malformed lines) and distinct-by-key sorts.
 func dedupePkgs(in []Pkg) []Pkg {
-	seen := map[string]bool{}
+	at := map[string]int{}
 	var out []Pkg
 	for _, p := range in {
-		if p.Name == "" || p.Version == "" || seen[p.Key()] {
+		if p.Name == "" || p.Version == "" {
 			continue
 		}
-		seen[p.Key()] = true
+		if i, ok := at[p.Key()]; ok {
+			merge(&out[i], p)
+			continue
+		}
+		at[p.Key()] = len(out)
 		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key() < out[j].Key() })

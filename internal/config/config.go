@@ -34,8 +34,11 @@ type Config struct {
 	// Cooldown is the minimum age a published version must reach before the
 	// proxy will let the package manager see it. Layer 1 of the defense.
 	Cooldown time.Duration
-	// Allow lists package-name patterns that bypass the cooldown entirely
-	// (your own scopes — "@yourco/*"). '*' is only honored as a suffix.
+	// Allow lists package-name patterns that bypass the COOLDOWN and the
+	// typosquat name gate in the proxy ("@yourco/*"). It bypasses nothing in
+	// `guard check`: an allowed package is still advisory-checked, still needs an
+	// integrity hash, and still must resolve to the configured registry.
+	// '*' is only honored as a suffix.
 	Allow []string
 	// IgnoreScripts: when true (the default), lifecycle scripts are never
 	// auto-run; script-bearing packages go through the approval flow instead.
@@ -56,7 +59,10 @@ type Config struct {
 	UntracedFail bool
 	// InternalScopes are name patterns that must come from a PRIVATE registry;
 	// the proxy blocks them from resolving against the public one (dependency
-	// confusion). Same single-trailing-'*' glob as Allow.
+	// confusion). They are also the ONLY packages exempt from the off-registry
+	// tarball-host check and the provenance fetch — a private-registry host and
+	// a missing public attestation are expected there, not signals. Same
+	// single-trailing-'*' glob as Allow.
 	InternalScopes []string
 	// LicenseDeny lists SPDX license identifiers that are NOT permitted; any
 	// installed package carrying one is a gating finding in `guard check`.
@@ -81,6 +87,33 @@ type Config struct {
 	// gate. Waive a deliberate match (e.g. ".env.example") with
 	// 'guard ignore secret:<path>'.
 	SecretPaths []string
+	// OnCheckErrorFail: when true (`on-check-error: fail`), a check that could
+	// not COMPLETE — OSV unreachable, a registry lookup that failed, a degraded
+	// provenance fetch — gates instead of warning. Default false: those layers
+	// fail open so a network blip can't wedge every commit in every repo. Shops
+	// that would rather stop than proceed on an unproven tree set this.
+	OnCheckErrorFail bool
+}
+
+// Degrade reports a fail-open lookup failure (what could not be checked, and
+// why) and decides whether it gates. Under the default `on-check-error: warn` it
+// prints and returns nil; under `fail` it returns an error, because a check that
+// never ran is not a check that passed. Single helper so every fail-open site in
+// `guard check` obeys the same policy.
+//
+// The warning is printed even under --quiet, which the git hooks pass. "Green
+// but incomplete" must never look like "green": the whole promise of the
+// fail-open stance is that it is never SILENT. Callers keep it to one line per
+// check rather than one per package.
+func (c Config) Degrade(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "guard: %s skipped: %v\n", what, err)
+	if c.OnCheckErrorFail {
+		return fmt.Errorf("%s could not complete (%v) and on-check-error is 'fail'", what, err)
+	}
+	return nil
 }
 
 // FileName is the policy file dropped by `guard init`, committed with the repo.
@@ -163,6 +196,15 @@ func Load(dir string) (Config, error) {
 				return c, fmt.Errorf("%s:%d: advisory-threshold must be critical, high, moderate or low, got %q", FileName, ln+1, val)
 			}
 			c.AdvisoryThreshold = sev
+		case "on-check-error":
+			switch val {
+			case "warn":
+				c.OnCheckErrorFail = false
+			case "fail":
+				c.OnCheckErrorFail = true
+			default:
+				return c, fmt.Errorf("%s:%d: on-check-error must be warn or fail, got %q", FileName, ln+1, val)
+			}
 		case "untraced-boxed":
 			switch val {
 			case "run":
@@ -280,7 +322,10 @@ ignore-scripts: true
 
 # ── no-container-fallback ─────────────────────────────────────────────────────
 # What to do when an approved build script must run but no container runtime
-# (Docker/Podman) is available to sandbox it.
+# (Docker/Podman) is available to sandbox it. Enforced at EVERY run, not only
+# when the approval is first recorded: under 'fail' an existing
+# approved-uncontained entry is skipped too, and 'guard approve --uncontained'
+# refuses to record one.
 #   values:  warn-approve  (warn + ask; CI fails closed unless pre-approved)
 #            fail          (always skip the script)
 #   default: warn-approve
@@ -294,8 +339,13 @@ no-container-fallback: warn-approve
 # registry: https://registry.npmjs.org
 
 # ── allow ─────────────────────────────────────────────────────────────────────
-# Package-name patterns that bypass the cooldown entirely — your own scopes (you
+# Package-name patterns you intentionally want fresh — your own scopes (you
 # publish them; waiting is pointless). Supports a single trailing '*' glob.
+# Bypasses EXACTLY two things, both in the install proxy: the cooldown, and the
+# typosquat/homoglyph name gate. It does NOT bypass the OSV advisory filter, the
+# registry-signature check, the dependency-confusion gate, or anything in
+# 'guard check' — an allowed package is still advisory-checked, still needs an
+# integrity hash, and must still resolve to the configured registry.
 #   values:  list of names/patterns, e.g. ["@yourco/*", "internal-pkg"]
 #   default: []  (nothing bypasses the cooldown)
 # allow: ["@yourco/*"]
@@ -303,6 +353,9 @@ no-container-fallback: warn-approve
 # ── internal-scopes ───────────────────────────────────────────────────────────
 # Scopes that must come from a PRIVATE registry — the proxy blocks them from
 # resolving against the public one (dependency-confusion guard). Same '*' glob.
+# These are also the only names exempt from 'guard check''"'"'s off-registry tarball
+# host check and its provenance fetch: a private host and no public attestation
+# are expected for them, not signals.
 #   values:  list of names/patterns, e.g. ["@yourco/*"]
 #   default: []  (no names treated as private)
 # internal-scopes: ["@yourco/*"]
@@ -327,6 +380,15 @@ no-container-fallback: warn-approve
 #   values:  run | fail
 #   default: run
 # untraced-boxed: run
+
+# ── on-check-error ────────────────────────────────────────────────────────────
+# What to do when a check cannot COMPLETE — OSV unreachable, a registry lookup
+# that failed, a degraded provenance fetch. Default is fail-OPEN: those layers
+# warn and let you work, so a network blip can'"'"'t wedge every commit in every
+# repo. Set '"'"'fail'"'"' when an unproven tree should stop the commit/push instead.
+#   values:  warn | fail
+#   default: warn
+# on-check-error: warn
 
 # ── advisory-threshold ────────────────────────────────────────────────────────
 # Lowest OSV advisory severity that BLOCKS a commit/push. Anything below it is
@@ -516,6 +578,11 @@ func canonicalValue(key, value string) (string, error) {
 			return value, nil
 		}
 		return "", fmt.Errorf("untraced-boxed must be run or fail, got %q", value)
+	case "on-check-error":
+		if value == "warn" || value == "fail" {
+			return value, nil
+		}
+		return "", fmt.Errorf("on-check-error must be warn or fail, got %q", value)
 	case "advisory-threshold":
 		sev, ok := advisory.ParseSeverity(value)
 		if !ok {
@@ -540,7 +607,7 @@ func canonicalValue(key, value string) (string, error) {
 		}
 		return "[" + strings.Join(items, ", ") + "]", nil
 	default:
-		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold, secret-paths)", key)
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, on-check-error, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold, secret-paths)", key)
 	}
 }
 
