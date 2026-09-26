@@ -797,13 +797,38 @@ threshold / waive the specific hit.
 
 **Interactive accept-and-record (`guard check --confirm`).** The git hooks pass
 `--confirm`. When the *only* findings are warn-tier and a controlling terminal
-exists, `guard check` asks before letting the commit/push through; on "yes" it
-records each accepted hit as a waiver in `.guard-ignores` (the audit trail of
-what was waved through and when, and what suppresses the same hit next time).
-No terminal (CI, a piped hook) ⇒ no prompt: warnings print, the action proceeds,
-blockers still fail the gate. The prompt reads `/dev/tty`, not stdin, because a
-git hook's stdin is ref data, not the keyboard. Blockers are **never** confirmable
-this way — accept a specific blocker deliberately with `guard ignore`.
+(or an askpass helper — see below) exists, `guard check` asks before letting the
+commit/push through; on "yes" it records each accepted hit as a waiver in
+`.guard-ignores` (the audit trail of what was waved through and when, and what
+suppresses the same hit next time). Neither askpass nor a terminal (CI, a piped
+hook) ⇒ no prompt: warnings print, the action proceeds, blockers still fail the
+gate. Blockers are **never** confirmable this way — accept a specific blocker
+deliberately with `guard ignore`.
+
+The prompt mirrors git's own precedence: if `GIT_ASKPASS` (or `SSH_ASKPASS`) is
+set, it runs that program with the question — git's own askpass convention is
+a single argument — and reads the first line of its stdout as the answer,
+bounded by a timeout (5 minutes) so a dead askpass can never wedge the gate —
+a timeout, non-zero exit, or empty answer all come back as "not accepted",
+same as declining at a prompt. Only when no askpass is configured does it fall
+back to reading `/dev/tty` directly (not stdin — a git hook's stdin is ref
+data, not the keyboard). This exists because VS Code sets `GIT_ASKPASS` for
+every git process it spawns (hooks inherit the environment): without the
+askpass path, a `git push` run from Source Control still opens `/dev/tty` when
+VS Code was itself launched from a terminal, and the prompt goes to a terminal
+nobody is watching — the push hangs forever instead of showing a VS Code input
+box.
+
+When `VSCODE_GIT_ASKPASS_MAIN` is set (VS Code's own marker), the question is
+reshaped into three argv words instead of one, because VS Code's extension-side
+`handleAskpass` reads two fixed positions built for git's own literal
+"Username/Password for '\<url\>':" prompts and **throws** on anything shorter —
+a plain single-argument question gets no box at all. The reshaped form keeps
+the whole question as one word (regular spaces swapped for a NO-BREAK SPACE,
+which survives word-splitting) followed by two literal words, `for depguard`,
+supplying the position VS Code reads as a pseudo-host. Net effect: the input
+box's placeholder is the question and its label reads "Git: depguard" — a
+real, readable prompt, not a thrown exception.
 
 ## 13. Reviewed-finding waivers (v0.6.0 — .guard-ignores)
 

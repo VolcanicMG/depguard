@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,7 +47,7 @@ import (
 	"depguard/internal/waivers"
 )
 
-const version = "1.2.2"
+const version = "1.2.3"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -1737,16 +1738,12 @@ func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, 
 //	                    latest version past the cooldown, reinstall, re-verify
 //	[N] abort
 //
-// interactive is false when there's no terminal (CI, a piped hook) — the caller
-// then falls through to the hard block. Reads /dev/tty, not stdin: a git hook's
-// stdin carries ref data, not the keyboard (mirrors confirmThroughWarnings).
+// interactive is false when there's no terminal and no askpass helper (CI, a
+// piped hook) — the caller then falls through to the hard block. Prompts
+// through GIT_ASKPASS/SSH_ASKPASS when set (see promptChoice), otherwise reads
+// /dev/tty, not stdin: a git hook's stdin carries ref data, not the keyboard
+// (mirrors confirmThroughWarnings).
 func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation, wf *waivers.File) (resolved, interactive bool, err error) {
-	ttyf, e := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if e != nil {
-		return false, false, nil // no terminal — caller hard-blocks
-	}
-	defer ttyf.Close()
-
 	// One registry fetch per package to name the concrete pin target up front, so
 	// the human chooses with the real version in hand rather than a guess.
 	safe := map[string]string{}
@@ -1755,16 +1752,27 @@ func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation
 			safe[v.Name] = s
 		}
 	}
-	fmt.Fprintln(ttyf, "guard: cooldown options —")
+	var detail []string
+	detail = append(detail, "guard: cooldown options —")
 	for _, v := range active {
 		if s := safe[v.Name]; s != "" {
-			fmt.Fprintf(ttyf, "  %s@%s  → latest past cooldown: %s\n", v.Name, v.Version, s)
+			detail = append(detail, fmt.Sprintf("  %s@%s  → latest past cooldown: %s", v.Name, v.Version, s))
 		} else {
-			fmt.Fprintf(ttyf, "  %s@%s  (no version past the cooldown yet)\n", v.Name, v.Version)
+			detail = append(detail, fmt.Sprintf("  %s@%s  (no version past the cooldown yet)", v.Name, v.Version))
 		}
 	}
-	fmt.Fprint(ttyf, "Choose: [a] accept all (waive)  [p] pin & reinstall  [N] abort: ")
-	line, _ := bufio.NewReader(ttyf).ReadString('\n')
+	// An askpass box shows only the question string, so the per-package detail
+	// above isn't visible there — the choices get spelled out in the question
+	// itself instead. Kept short and free of "password" (see
+	// vscodeAskpassPrompt): VS Code's own askpass shows this verbatim as the
+	// input box's placeholder.
+	question := "Choose: [a] accept all (waive)  [p] pin & reinstall  [N] abort: "
+	askpassQuestion := "Cooldown: [a] accept all  [p] pin & reinstall  [N] abort"
+
+	out, line, interactiveTTY := promptChoice(detail, question, askpassQuestion)
+	if !interactiveTTY {
+		return false, false, nil // no terminal, no askpass — caller hard-blocks
+	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "a", "accept":
 		reason := "accepted " + time.Now().UTC().Format("2006-01-02") + " via guard check --confirm"
@@ -1776,16 +1784,16 @@ func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation
 		if e := wf.Save(dir); e != nil {
 			return false, true, e
 		}
-		fmt.Fprintf(ttyf, "guard: recorded %d cooldown acceptance(s) in %s\n", len(active), waivers.FileName)
+		fmt.Fprintf(out, "guard: recorded %d cooldown acceptance(s) in %s\n", len(active), waivers.FileName)
 		return true, true, nil
 	case "p", "pin":
-		if e := pinAndReinstall(dir, cfg, active, safe, ttyf); e != nil {
-			fmt.Fprintln(ttyf, "guard: pin failed:", e)
+		if e := pinAndReinstall(dir, cfg, active, safe, out); e != nil {
+			fmt.Fprintln(out, "guard: pin failed:", e)
 			return false, true, nil // failed pin = not resolved; caller aborts
 		}
 		return true, true, nil
 	default:
-		fmt.Fprintln(ttyf, "guard: not accepted — aborting.")
+		fmt.Fprintln(out, "guard: not accepted — aborting.")
 		return false, true, nil
 	}
 }
@@ -2506,24 +2514,24 @@ func checkAdvisories(snap snapshot, cfg config.Config, quiet, confirm bool, wf *
 	return nil
 }
 
-// confirmThroughWarnings asks, on the controlling terminal, whether to proceed
-// past warn-tier advisory hits. On "yes" it records each as a waiver in
-// .guard-ignores — both the audit trail of what was accepted (and when) and the
-// thing that suppresses the same hit on later runs. interactive is false when
-// there is no terminal to ask at (CI, a piped hook); the caller then proceeds
-// without recording. Reads /dev/tty directly, not stdin, because a git hook's
-// stdin carries ref data, not the keyboard.
+// confirmThroughWarnings asks whether to proceed past warn-tier advisory
+// hits. On "yes" it records each as a waiver in .guard-ignores — both the
+// audit trail of what was accepted (and when) and the thing that suppresses
+// the same hit on later runs. interactive is false when there's no terminal
+// and no askpass helper to ask at (CI, a piped hook); the caller then
+// proceeds without recording. Prompts through GIT_ASKPASS/SSH_ASKPASS when
+// set (see promptChoice), otherwise reads /dev/tty directly, not stdin,
+// because a git hook's stdin carries ref data, not the keyboard.
 func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File) (accepted, interactive bool, err error) {
-	// Note: open /dev/tty (the controlling terminal) rather than reading os.Stdin
-	// like promptYN does — a git hook's stdin is ref data or /dev/null, not the
-	// keyboard. A failed open means "no terminal" (CI), the non-interactive path.
-	ttyf, e := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if e != nil {
-		return false, false, nil // no terminal — caller proceeds, no record
+	question := fmt.Sprintf("\nguard: accept the %d warning advisory(ies) above and proceed? [y/N] ", len(warns))
+	// Kept short and free of "password" (see vscodeAskpassPrompt): VS Code's
+	// own askpass shows this verbatim as the input box's placeholder.
+	askpassQuestion := fmt.Sprintf("Accept %d warning advisory(ies) and continue? [y/N]", len(warns))
+
+	out, line, interactive := promptChoice(nil, question, askpassQuestion)
+	if !interactive {
+		return false, false, nil // no terminal, no askpass — caller proceeds, no record
 	}
-	defer ttyf.Close()
-	fmt.Fprintf(ttyf, "\nguard: accept the %d warning advisory(ies) above and proceed? [y/N] ", len(warns))
-	line, _ := bufio.NewReader(ttyf).ReadString('\n')
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
 		reason := "accepted " + time.Now().UTC().Format("2006-01-02") + " via guard check --confirm"
@@ -2535,12 +2543,123 @@ func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File)
 		if e := wf.Save(dir); e != nil {
 			return false, true, e
 		}
-		fmt.Fprintf(ttyf, "guard: recorded %d acceptance(s) in %s\n", len(warns), waivers.FileName)
+		fmt.Fprintf(out, "guard: recorded %d acceptance(s) in %s\n", len(warns), waivers.FileName)
 		return true, true, nil
 	default:
-		fmt.Fprintln(ttyf, "guard: not accepted — aborting.")
+		fmt.Fprintln(out, "guard: not accepted — aborting.")
 		return false, true, nil
 	}
+}
+
+// askpassTimeout bounds how long we wait for an askpass helper to answer, so
+// a dead or hung askpass (e.g. a crashed extension host) can never wedge a
+// commit/push the way an unattended /dev/tty prompt did (the bug this fixes).
+var askpassTimeout = 5 * time.Minute
+
+// askpassProgram returns the configured askpass helper, mirroring git's own
+// precedence — GIT_ASKPASS, falling back to SSH_ASKPASS — or "" if neither is
+// set, in which case the caller falls back to /dev/tty.
+func askpassProgram() string {
+	if p := os.Getenv("GIT_ASKPASS"); p != "" {
+		return p
+	}
+	return os.Getenv("SSH_ASKPASS")
+}
+
+// vscodeAskpassNBSP is U+00A0 (NO-BREAK SPACE) — visually a space but not in
+// IFS (space/tab/newline), so a shell's word-splitting treats it as part of
+// one word (see vscodeAskpassArgs).
+const vscodeAskpassNBSP = " "
+
+// vscodeAskpassArgs rewrites question into the exact argv shape VS Code's own
+// git-extension askpass plumbing expects, so it renders a real input box
+// instead of throwing. VS Code's GIT_ASKPASS points at askpass.sh, which
+// re-invokes node as `... $VSCODE_GIT_ASKPASS_MAIN $VSCODE_GIT_ASKPASS_EXTRA_ARGS $*`
+// with an UNQUOTED `$*` — the shell joins and re-splits every argv element on
+// IFS before node ever sees it (assuming VSCODE_GIT_ASKPASS_EXTRA_ARGS is
+// empty, its default — verify with `echo $VSCODE_GIT_ASKPASS_EXTRA_ARGS` in a
+// VS Code terminal if this ever needs re-checking), so however many argv
+// elements we pass in, only their word-split shape survives. The extension's
+// handleAskpass(argv) then reads two FIXED positions, built for git's own
+// literal "Username/Password for '<url>':" shapes: argv[2] as the input box
+// placeholder (masked only if it matches /password/i) and argv[4] as a
+// pseudo-URL rendered as "Git: <argv[4]>" — and it THROWS if argv[4] is
+// undefined (fewer than 3 words), so an under-length prompt gets no box at
+// all, not just a garbled one. Replacing question's regular spaces with
+// vscodeAskpassNBSP keeps it as ONE word — with no embedded IFS char left to
+// re-split on, and no "password" substring, so it stays unmasked — and the
+// two literal trailing words "for"/"depguard" supply exactly the two more
+// words handleAskpass needs: argv[3]="for" (unused) and argv[4]="depguard"
+// (rendered as "Git: depguard"). Net effect: placeholder = the question,
+// prompt line = "Git: depguard".
+func vscodeAskpassArgs(question string) []string {
+	return []string{strings.ReplaceAll(question, " ", vscodeAskpassNBSP), "for", "depguard"}
+}
+
+// promptViaAskpass runs program with prompt as its sole argument — the
+// convention git itself uses for askpass helpers — and reads the first line
+// of stdout as the answer. VS Code sets GIT_ASKPASS (plus
+// VSCODE_GIT_ASKPASS_NODE/MAIN/EXTRA_ARGS) for every git process it spawns,
+// and a hook inherits that environment, so this is how a hook run from VS
+// Code's Source Control pops a VS Code input box instead of hanging on
+// /dev/tty with nobody watching it. When VSCODE_GIT_ASKPASS_MAIN is set, the
+// single prompt argument is replaced by vscodeAskpassArgs' three, to match
+// what VS Code's own askpass handler expects. Bounded by askpassTimeout: a
+// non-zero exit or empty answer comes back as "" (the caller's safe "not
+// accepted" default) and so does a timeout, except timedOut is also set so
+// the caller can report it distinctly.
+func promptViaAskpass(program, prompt string) (answer string, timedOut bool) {
+	args := []string{prompt}
+	if os.Getenv("VSCODE_GIT_ASKPASS_MAIN") != "" {
+		args = vscodeAskpassArgs(prompt)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), askpassTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, program, args...).Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", true
+	}
+	if err != nil {
+		return "", false
+	}
+	line, _, _ := strings.Cut(string(out), "\n")
+	return strings.TrimSpace(line), false
+}
+
+// promptChoice asks a single-line question through GIT_ASKPASS/SSH_ASKPASS
+// when either is set, falling back to /dev/tty otherwise — see
+// promptViaAskpass for why. detail is extra context printed ahead of the
+// question; an askpass box shows only the string it's handed, so
+// askpassQuestion must spell out the choices on its own (detail still goes to
+// stderr, where a hook's output is usually visible). interactive is false
+// only when neither an askpass helper nor a controlling terminal is
+// available, meaning the caller should proceed non-interactively. out is
+// where the caller should write its outcome message.
+func promptChoice(detail []string, ttyQuestion, askpassQuestion string) (out io.Writer, line string, interactive bool) {
+	if program := askpassProgram(); program != "" {
+		for _, l := range detail {
+			fmt.Fprintln(os.Stderr, l)
+		}
+		answer, timedOut := promptViaAskpass(program, askpassQuestion)
+		if timedOut {
+			fmt.Fprintf(os.Stderr, "guard: askpass (%s) timed out after %s\n", program, askpassTimeout)
+		}
+		return os.Stderr, answer, true
+	}
+	// Note: open /dev/tty (the controlling terminal) rather than reading os.Stdin
+	// like promptYN does — a git hook's stdin is ref data or /dev/null, not the
+	// keyboard. A failed open means no terminal and no askpass (CI), the
+	// non-interactive path.
+	ttyf, e := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if e != nil {
+		return nil, "", false
+	}
+	for _, l := range detail {
+		fmt.Fprintln(ttyf, l)
+	}
+	fmt.Fprint(ttyf, ttyQuestion)
+	line, _ = bufio.NewReader(ttyf).ReadString('\n')
+	return ttyf, line, true
 }
 
 // checkSecrets is the commit/push gate for credential files (DESIGN.md §11). It

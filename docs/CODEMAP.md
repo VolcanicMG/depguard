@@ -149,8 +149,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │                     fail-open on network errors (loud warning)
    │                     → enrichSeverities (advisory.Severities, per-vuln detail)
    │                     → partitionBySeverity: blockers gate, warns don't
-   │                     → confirmThroughWarnings (--confirm, /dev/tty): on "yes"
-   │                       records acceptances via waivers.Set → .guard-ignores
+   │                     → confirmThroughWarnings (--confirm, promptChoice: GIT_ASKPASS/
+   │                       SSH_ASKPASS then /dev/tty): on "yes" records acceptances
+   │                       via waivers.Set → .guard-ignores
    ├─ checkFreshness ─── scope = the versions THIS action adds:
    │                     pre-commit → staged lockfile vs HEAD
    │                     pre-push   → pushed sha vs pushBaseRef (remote sha, or the
@@ -223,6 +224,8 @@ the shared history.
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
 | Cooldown accept-all / auto-pin | `main.go` `confirmCooldown` / `pinAndReinstall` / `pinPackageJSON` / `setDepVersion`; pin target from `freshness.LatestSafe` |
+| Interactive-confirm prompt path (askpass vs /dev/tty) | `main.go` `promptChoice` / `promptViaAskpass` / `askpassProgram`; used by `confirmCooldown` + `confirmThroughWarnings` |
+| VS Code askpass argv shaping (why the question isn't a single argument there) | `main.go` `vscodeAskpassArgs` — called from `promptViaAskpass` when `VSCODE_GIT_ASKPASS_MAIN` is set |
 | New waiver-id kind | `main.go` `validWaiverID` + a `<kind>WaiverID` helper |
 | Append-to-a-list command | `config.AddSecretPath` / `AddAllow` (Load → dedup → SetValue); `main.go` `cmdSecretAdd` / `cmdAllow` + dispatch case |
 | Box hardening / seccomp | `box/box.go` `Run()` args + `seccompProfile` |

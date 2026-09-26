@@ -6,7 +6,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f)
-![version](https://img.shields.io/badge/version-1.2.2-2ea44f)
+![version](https://img.shields.io/badge/version-1.2.3-2ea44f)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-555)
 ![local-first](https://img.shields.io/badge/local--first-no%20cloud%20%C2%B7%20no%20telemetry-2ea44f)
 ![license](https://img.shields.io/badge/license-Apache%202.0-blue)
@@ -120,7 +120,7 @@ asset for your platform from the [latest release](../../releases/latest), drop i
 # 1. Install (Linux x86-64 shown — pick your asset from the release list)
 curl -fsSL -o guard https://github.com/VolcanicMG/depguard/releases/latest/download/guard-linux-amd64
 chmod +x guard && sudo mv guard /usr/local/bin/
-guard version                       # -> guard 1.2.2
+guard version                       # -> guard 1.2.3
 
 # 2. Protect a repo
 cd your-project
@@ -226,10 +226,11 @@ Catches deps that go bad *after* you installed them — and your own secrets on 
 **How `guard check` grades and recovers.** Advisories are tiered: high+/`MAL-*`/unscored
 **block**, moderate/low **warn** (tune with `advisory-threshold`). Cooldown violations
 are caught across every distinct version in the tree, whichever install path introduced
-them; `flag: new-deps` also lists packages a change adds. At a terminal (`--confirm`,
-which the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin &
+them; `flag: new-deps` also lists packages a change adds. With `--confirm` (which
+the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin &
 reinstall** (drop each direct dep to its latest version past the cooldown, then
-re-verify). CI always keeps the strict block.
+re-verify) — prompted through `GIT_ASKPASS`/`SSH_ASKPASS` when set (e.g. a VS
+Code input box), otherwise a terminal. CI always keeps the strict block.
 
 ### Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
 
