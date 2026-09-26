@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
 	"depguard/internal/config"
+	"depguard/internal/freshness"
 	"depguard/internal/hooks"
 	"depguard/internal/lockfile"
 	"depguard/internal/registry"
@@ -1149,5 +1152,139 @@ func TestGatherCheckRecordsPartialParse(t *testing.T) {
 	}
 	if res.OK {
 		t.Error("ok = true over a partial parse under on-check-error: fail")
+	}
+}
+
+// writeAskpass writes an executable fake askpass script to a temp dir and
+// returns its path, for TestConfirm*Askpass* below. It is invoked exactly the
+// way promptViaAskpass invokes a real one: one argv arg (the prompt), answer
+// on stdout.
+func writeAskpass(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "askpass.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// noSafeVersionServer answers every freshness.LatestSafe lookup with 404, so
+// confirmCooldown's tests don't depend on the real npm registry and always
+// land in the "no version past the cooldown yet" branch.
+func noSafeVersionServer(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestConfirmThroughWarningsAskpassAccept(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "echo y\n"))
+	dir := t.TempDir()
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	warns := []advisory.Vuln{{Package: "foo", Version: "1.0.0", ID: "GHSA-aaaa"}}
+
+	accepted, interactive, err := confirmThroughWarnings(dir, warns, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || !accepted {
+		t.Fatalf("accepted=%v interactive=%v, want true/true", accepted, interactive)
+	}
+	if _, err := os.Stat(filepath.Join(dir, waivers.FileName)); err != nil {
+		t.Errorf(".guard-ignores not written: %v", err)
+	}
+}
+
+func TestConfirmThroughWarningsAskpassReject(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "exit 1\n"))
+	dir := t.TempDir()
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	warns := []advisory.Vuln{{Package: "foo", Version: "1.0.0", ID: "GHSA-aaaa"}}
+
+	accepted, interactive, err := confirmThroughWarnings(dir, warns, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || accepted {
+		t.Fatalf("accepted=%v interactive=%v, want false/true (non-zero exit = not accepted)", accepted, interactive)
+	}
+	if _, err := os.Stat(filepath.Join(dir, waivers.FileName)); err == nil {
+		t.Error(".guard-ignores written on a rejected askpass answer")
+	}
+}
+
+func TestConfirmThroughWarningsAskpassTimeout(t *testing.T) {
+	old := askpassTimeout
+	askpassTimeout = 200 * time.Millisecond
+	defer func() { askpassTimeout = old }()
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "sleep 2\necho y\n"))
+	dir := t.TempDir()
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	warns := []advisory.Vuln{{Package: "foo", Version: "1.0.0", ID: "GHSA-aaaa"}}
+
+	accepted, interactive, err := confirmThroughWarnings(dir, warns, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || accepted {
+		t.Fatalf("accepted=%v interactive=%v, want false/true (a dead askpass must never hang or count as accepted)", accepted, interactive)
+	}
+}
+
+func TestConfirmCooldownAskpassAccept(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "echo a\n"))
+	dir := t.TempDir()
+	cfg := config.Config{Registry: noSafeVersionServer(t), Cooldown: 14 * 24 * time.Hour}
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
+
+	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || !resolved {
+		t.Fatalf("resolved=%v interactive=%v, want true/true", resolved, interactive)
+	}
+	if _, err := os.Stat(filepath.Join(dir, waivers.FileName)); err != nil {
+		t.Errorf(".guard-ignores not written: %v", err)
+	}
+}
+
+func TestConfirmCooldownAskpassReject(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "exit 1\n"))
+	dir := t.TempDir()
+	cfg := config.Config{Registry: noSafeVersionServer(t), Cooldown: 14 * 24 * time.Hour}
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
+
+	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || resolved {
+		t.Fatalf("resolved=%v interactive=%v, want false/true (non-zero exit = not accepted)", resolved, interactive)
+	}
+}
+
+func TestConfirmCooldownAskpassTimeout(t *testing.T) {
+	old := askpassTimeout
+	askpassTimeout = 200 * time.Millisecond
+	defer func() { askpassTimeout = old }()
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "sleep 2\necho a\n"))
+	dir := t.TempDir()
+	cfg := config.Config{Registry: noSafeVersionServer(t), Cooldown: 14 * 24 * time.Hour}
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
+
+	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || resolved {
+		t.Fatalf("resolved=%v interactive=%v, want false/true (a dead askpass must never hang or count as accepted)", resolved, interactive)
 	}
 }

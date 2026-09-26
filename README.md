@@ -226,10 +226,11 @@ Catches deps that go bad *after* you installed them — and your own secrets on 
 **How `guard check` grades and recovers.** Advisories are tiered: high+/`MAL-*`/unscored
 **block**, moderate/low **warn** (tune with `advisory-threshold`). Cooldown violations
 are caught across every distinct version in the tree, whichever install path introduced
-them; `flag: new-deps` also lists packages a change adds. At a terminal (`--confirm`,
-which the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin &
+them; `flag: new-deps` also lists packages a change adds. With `--confirm` (which
+the hooks pass) a cooldown hit offers **accept-all** (waive them) or **pin &
 reinstall** (drop each direct dep to its latest version past the cooldown, then
-re-verify). CI always keeps the strict block.
+re-verify) — prompted through `GIT_ASKPASS`/`SSH_ASKPASS` when set (e.g. a VS
+Code input box), otherwise a terminal. CI always keeps the strict block.
 
 ### Opt-in deeper trust checks — *`flag:`, fetched per package (too heavy for every commit)*
 

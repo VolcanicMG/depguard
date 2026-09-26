@@ -270,10 +270,13 @@ Tips:
 - **`advisory-threshold:` grades advisories.** Hits at/above it BLOCK; below it
   WARN. Default `high` (critical+high block, moderate+low warn). `MAL-*`
   malicious-package hits and advisories OSV couldn't score **always** block,
-  whatever the threshold (fail closed). On a commit/push at a terminal the hook
-  runs `guard check --confirm`: it lists any warnings and asks before proceeding,
-  and recording your acceptance writes a waiver into `.guard-ignores` so it's
-  auditable later. CI (no terminal) never prompts — warnings print, blockers gate.
+  whatever the threshold (fail closed). On a commit/push the hook runs
+  `guard check --confirm`: it lists any warnings and asks before proceeding, and
+  recording your acceptance writes a waiver into `.guard-ignores` so it's
+  auditable later. It prompts through `GIT_ASKPASS`/`SSH_ASKPASS` when either is
+  set (e.g. VS Code's Source Control "Sync Changes" pops a VS Code input box
+  instead of hanging), otherwise through `/dev/tty` on a real terminal. CI (no
+  terminal, no askpass) never prompts — warnings print, blockers gate.
 - **`secret-paths:` stops YOUR secrets from leaking.** List the files that must
   never reach the remote (`.env`, `secrets/`, `*.pem`, keys). If any matching file
   is staged or already tracked by git, `guard check` HARD-BLOCKS the commit/push —
@@ -289,11 +292,12 @@ Tips:
   The list is fully yours to extend — nothing is baked in. `guard secret-add
   "*.pem" "secrets/"` APPENDS patterns without restating the list (the convenience
   twin of `guard config set secret-paths …`, which replaces it).
-- **A cooldown hit at a terminal is recoverable in place.** On a commit/push the
+- **A cooldown hit is recoverable in place, interactively.** On a commit/push the
   hook's `guard check --confirm` offers, over all violations at once: **[a] accept
   all** (waive them) or **[p] pin & reinstall** — drop each direct dep to its
-  latest version past the cooldown, reinstall, and re-verify. CI keeps the strict
-  block; pinning never happens unattended.
+  latest version past the cooldown, reinstall, and re-verify. Same
+  askpass-then-`/dev/tty` prompt path as the advisory confirm above. CI keeps the
+  strict block; pinning never happens unattended.
 - **A typo in a bool fails closed.** `ignore-scripts: tru` errors out rather than
   silently disabling script neutralization. A typo'd `advisory-threshold` errors
   the same way (it never silently arms an unknown level). Unknown keys warn
