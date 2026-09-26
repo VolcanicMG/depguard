@@ -1763,9 +1763,11 @@ func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation
 	}
 	// An askpass box shows only the question string, so the per-package detail
 	// above isn't visible there — the choices get spelled out in the question
-	// itself instead.
+	// itself instead. Kept short and free of "password" (see
+	// vscodeAskpassPrompt): VS Code's own askpass shows this verbatim as the
+	// input box's placeholder.
 	question := "Choose: [a] accept all (waive)  [p] pin & reinstall  [N] abort: "
-	askpassQuestion := fmt.Sprintf("guard: %d package(s) inside the cooldown. Type a to accept all (waive), p to pin & reinstall, anything else to abort:", len(active))
+	askpassQuestion := "Cooldown: [a] accept all  [p] pin & reinstall  [N] abort"
 
 	out, line, interactiveTTY := promptChoice(detail, question, askpassQuestion)
 	if !interactiveTTY {
@@ -2522,7 +2524,9 @@ func checkAdvisories(snap snapshot, cfg config.Config, quiet, confirm bool, wf *
 // because a git hook's stdin carries ref data, not the keyboard.
 func confirmThroughWarnings(dir string, warns []advisory.Vuln, wf *waivers.File) (accepted, interactive bool, err error) {
 	question := fmt.Sprintf("\nguard: accept the %d warning advisory(ies) above and proceed? [y/N] ", len(warns))
-	askpassQuestion := fmt.Sprintf("guard: %d warning advisory(ies) found. Type y to accept and proceed, anything else to abort:", len(warns))
+	// Kept short and free of "password" (see vscodeAskpassPrompt): VS Code's
+	// own askpass shows this verbatim as the input box's placeholder.
+	askpassQuestion := fmt.Sprintf("Accept %d warning advisory(ies) and continue? [y/N]", len(warns))
 
 	out, line, interactive := promptChoice(nil, question, askpassQuestion)
 	if !interactive {
@@ -2562,20 +2566,56 @@ func askpassProgram() string {
 	return os.Getenv("SSH_ASKPASS")
 }
 
+// vscodeAskpassNBSP is U+00A0 (NO-BREAK SPACE) — visually a space but not in
+// IFS (space/tab/newline), so a shell's word-splitting treats it as part of
+// one word (see vscodeAskpassArgs).
+const vscodeAskpassNBSP = " "
+
+// vscodeAskpassArgs rewrites question into the exact argv shape VS Code's own
+// git-extension askpass plumbing expects, so it renders a real input box
+// instead of throwing. VS Code's GIT_ASKPASS points at askpass.sh, which
+// re-invokes node as `... $VSCODE_GIT_ASKPASS_MAIN $VSCODE_GIT_ASKPASS_EXTRA_ARGS $*`
+// with an UNQUOTED `$*` — the shell joins and re-splits every argv element on
+// IFS before node ever sees it (assuming VSCODE_GIT_ASKPASS_EXTRA_ARGS is
+// empty, its default — verify with `echo $VSCODE_GIT_ASKPASS_EXTRA_ARGS` in a
+// VS Code terminal if this ever needs re-checking), so however many argv
+// elements we pass in, only their word-split shape survives. The extension's
+// handleAskpass(argv) then reads two FIXED positions, built for git's own
+// literal "Username/Password for '<url>':" shapes: argv[2] as the input box
+// placeholder (masked only if it matches /password/i) and argv[4] as a
+// pseudo-URL rendered as "Git: <argv[4]>" — and it THROWS if argv[4] is
+// undefined (fewer than 3 words), so an under-length prompt gets no box at
+// all, not just a garbled one. Replacing question's regular spaces with
+// vscodeAskpassNBSP keeps it as ONE word — with no embedded IFS char left to
+// re-split on, and no "password" substring, so it stays unmasked — and the
+// two literal trailing words "for"/"depguard" supply exactly the two more
+// words handleAskpass needs: argv[3]="for" (unused) and argv[4]="depguard"
+// (rendered as "Git: depguard"). Net effect: placeholder = the question,
+// prompt line = "Git: depguard".
+func vscodeAskpassArgs(question string) []string {
+	return []string{strings.ReplaceAll(question, " ", vscodeAskpassNBSP), "for", "depguard"}
+}
+
 // promptViaAskpass runs program with prompt as its sole argument — the
 // convention git itself uses for askpass helpers — and reads the first line
 // of stdout as the answer. VS Code sets GIT_ASKPASS (plus
 // VSCODE_GIT_ASKPASS_NODE/MAIN/EXTRA_ARGS) for every git process it spawns,
 // and a hook inherits that environment, so this is how a hook run from VS
 // Code's Source Control pops a VS Code input box instead of hanging on
-// /dev/tty with nobody watching it. Bounded by askpassTimeout: a non-zero
-// exit or empty answer comes back as "" (the caller's safe "not accepted"
-// default) and so does a timeout, except timedOut is also set so the caller
-// can report it distinctly.
+// /dev/tty with nobody watching it. When VSCODE_GIT_ASKPASS_MAIN is set, the
+// single prompt argument is replaced by vscodeAskpassArgs' three, to match
+// what VS Code's own askpass handler expects. Bounded by askpassTimeout: a
+// non-zero exit or empty answer comes back as "" (the caller's safe "not
+// accepted" default) and so does a timeout, except timedOut is also set so
+// the caller can report it distinctly.
 func promptViaAskpass(program, prompt string) (answer string, timedOut bool) {
+	args := []string{prompt}
+	if os.Getenv("VSCODE_GIT_ASKPASS_MAIN") != "" {
+		args = vscodeAskpassArgs(prompt)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), askpassTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, program, prompt).Output()
+	out, err := exec.CommandContext(ctx, program, args...).Output()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", true
 	}

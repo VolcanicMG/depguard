@@ -274,9 +274,9 @@ Tips:
   `guard check --confirm`: it lists any warnings and asks before proceeding, and
   recording your acceptance writes a waiver into `.guard-ignores` so it's
   auditable later. It prompts through `GIT_ASKPASS`/`SSH_ASKPASS` when either is
-  set (e.g. VS Code's Source Control "Sync Changes" pops a VS Code input box
-  instead of hanging), otherwise through `/dev/tty` on a real terminal. CI (no
-  terminal, no askpass) never prompts — warnings print, blockers gate.
+  set (e.g. VS Code's Source Control "Sync Changes" pops a real VS Code input
+  box instead of hanging), otherwise through `/dev/tty` on a real terminal. CI
+  (no terminal, no askpass) never prompts — warnings print, blockers gate.
 - **`secret-paths:` stops YOUR secrets from leaking.** List the files that must
   never reach the remote (`.env`, `secrets/`, `*.pem`, keys). If any matching file
   is staged or already tracked by git, `guard check` HARD-BLOCKS the commit/push —

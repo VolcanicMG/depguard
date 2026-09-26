@@ -225,6 +225,7 @@ the shared history.
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
 | Cooldown accept-all / auto-pin | `main.go` `confirmCooldown` / `pinAndReinstall` / `pinPackageJSON` / `setDepVersion`; pin target from `freshness.LatestSafe` |
 | Interactive-confirm prompt path (askpass vs /dev/tty) | `main.go` `promptChoice` / `promptViaAskpass` / `askpassProgram`; used by `confirmCooldown` + `confirmThroughWarnings` |
+| VS Code askpass argv shaping (why the question isn't a single argument there) | `main.go` `vscodeAskpassArgs` — called from `promptViaAskpass` when `VSCODE_GIT_ASKPASS_MAIN` is set |
 | New waiver-id kind | `main.go` `validWaiverID` + a `<kind>WaiverID` helper |
 | Append-to-a-list command | `config.AddSecretPath` / `AddAllow` (Load → dedup → SetValue); `main.go` `cmdSecretAdd` / `cmdAllow` + dispatch case |
 | Box hardening / seccomp | `box/box.go` `Run()` args + `seccompProfile` |

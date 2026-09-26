@@ -1288,3 +1288,62 @@ func TestConfirmCooldownAskpassTimeout(t *testing.T) {
 		t.Fatalf("resolved=%v interactive=%v, want false/true (a dead askpass must never hang or count as accepted)", resolved, interactive)
 	}
 }
+
+// readLines reads path and splits it on '\n', dropping the trailing empty
+// element a final newline produces.
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+}
+
+// TestPromptViaAskpassVSCodeArgShape pins vscodeAskpassArgs' argv shaping: a
+// fake askpass script (mirroring how askpass.sh itself would see argv, not
+// how it re-splits it — that word-splitting quirk lives in VS Code's own
+// script, not ours) records $# and each arg it received. Without
+// VSCODE_GIT_ASKPASS_MAIN, the question travels as ONE argv element, git's
+// own askpass convention; with it set, promptViaAskpass must hand over
+// exactly the three words VS Code's handleAskpass(argv) expects (see
+// vscodeAskpassArgs), with regular spaces in the question replaced by NBSP.
+func TestPromptViaAskpassVSCodeArgShape(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("ASKPASS_OUT", outFile)
+	script := writeAskpass(t, `echo "$#" > "$ASKPASS_OUT"
+for a in "$@"; do printf '%s\n' "$a" >> "$ASKPASS_OUT"; done
+echo y
+`)
+	question := "Cooldown: [a] accept all  [p] pin & reinstall  [N] abort"
+
+	t.Run("no VSCODE_GIT_ASKPASS_MAIN", func(t *testing.T) {
+		if _, timedOut := promptViaAskpass(script, question); timedOut {
+			t.Fatal("unexpected timeout")
+		}
+		lines := readLines(t, outFile)
+		if lines[0] != "1" {
+			t.Fatalf("$# = %s, want 1 (prompt passed as a single argv element)", lines[0])
+		}
+		if lines[1] != question {
+			t.Errorf("argv[1] = %q, want the question unchanged", lines[1])
+		}
+	})
+
+	t.Run("VSCODE_GIT_ASKPASS_MAIN set", func(t *testing.T) {
+		t.Setenv("VSCODE_GIT_ASKPASS_MAIN", "/fake/path/to/askpass-main.js")
+		if _, timedOut := promptViaAskpass(script, question); timedOut {
+			t.Fatal("unexpected timeout")
+		}
+		lines := readLines(t, outFile)
+		if lines[0] != "3" {
+			t.Fatalf("$# = %s, want 3 (question, \"for\", \"depguard\")", lines[0])
+		}
+		if want := strings.ReplaceAll(question, " ", vscodeAskpassNBSP); lines[1] != want {
+			t.Errorf("argv[1] = %q, want NBSP-joined question %q", lines[1], want)
+		}
+		if lines[2] != "for" || lines[3] != "depguard" {
+			t.Errorf(`argv[2..3] = %q, %q, want "for", "depguard"`, lines[2], lines[3])
+		}
+	})
+}
