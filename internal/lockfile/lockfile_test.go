@@ -474,3 +474,34 @@ func TestInstalledAtDistinguishesAbsenceFromFailure(t *testing.T) {
 		t.Errorf("empty index: err = %v, want ErrNotExist", err)
 	}
 }
+
+// Ecosystem: any pypi entry makes the set pypi; empty and npm sets are npm.
+func TestEcosystem(t *testing.T) {
+	if got := Ecosystem(nil); got != "npm" {
+		t.Errorf("empty = %q", got)
+	}
+	if got := Ecosystem([]Pkg{{Name: "a"}, {Name: "b", Ecosystem: "npm"}}); got != "npm" {
+		t.Errorf("npm set = %q", got)
+	}
+	if got := Ecosystem([]Pkg{{Name: "a"}, {Name: "b", Ecosystem: "pypi"}}); got != "pypi" {
+		t.Errorf("mixed set = %q", got)
+	}
+}
+
+// requirements.txt dispatches to the pip parser, and InstalledAt finds it when
+// it is the only lockfile in the tree.
+func TestRequirementsDispatchAndDiscovery(t *testing.T) {
+	raw := []byte("requests==2.31.0\n")
+	got, _, err := parseNamed("requirements.txt", raw)
+	if err != nil || len(got) != 1 || got[0].Key() != "requests@2.31.0" || got[0].Ecosystem != "pypi" {
+		t.Fatalf("parseNamed: %+v, %v", got, err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, skipped, err := InstalledAt(dir, "")
+	if err != nil || skipped != 0 || len(got) != 1 || got[0].Ecosystem != "pypi" {
+		t.Fatalf("InstalledAt: %+v, %d, %v", got, skipped, err)
+	}
+}

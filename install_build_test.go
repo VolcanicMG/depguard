@@ -13,11 +13,17 @@ func TestDetectManager(t *testing.T) {
 		{"yarn.lock", "yarn"},
 		{"package-lock.json", "npm"},
 		{"", "npm"}, // no lockfile → npm default
+		{"requirements.txt", "pip"},
+		{"requirements.txt,package-lock.json", "npm"}, // node lockfile wins
+		{"requirements.txt,yarn.lock", "yarn"},
 	}
 	for _, c := range cases {
 		dir := t.TempDir()
-		if c.file != "" {
-			if err := os.WriteFile(filepath.Join(dir, c.file), []byte("x"), 0o644); err != nil {
+		for _, f := range strings.Split(c.file, ",") {
+			if f == "" {
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}

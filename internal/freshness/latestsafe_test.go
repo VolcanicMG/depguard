@@ -44,7 +44,7 @@ func TestLatestSafePicksNewestPastCooldown(t *testing.T) {
 	})
 	defer srv.Close()
 
-	got, err := LatestSafe(srv.URL, "pkg", 14*24*time.Hour)
+	got, err := LatestSafe(srv.URL, "npm", "pkg", 14*24*time.Hour)
 	if err != nil {
 		t.Fatalf("LatestSafe: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestLatestSafePicksNewestPastCooldown(t *testing.T) {
 func TestLatestSafeNoneQualify(t *testing.T) {
 	srv := packumentServer(t, "pkg", map[string]int{"1.0.0": 3, "1.0.1": 1})
 	defer srv.Close()
-	got, err := LatestSafe(srv.URL, "pkg", 14*24*time.Hour)
+	got, err := LatestSafe(srv.URL, "npm", "pkg", 14*24*time.Hour)
 	if err != nil {
 		t.Fatalf("LatestSafe: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestLatestSafeRegistryError(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotFound)
 	}))
 	defer srv.Close()
-	if _, err := LatestSafe(srv.URL, "pkg", 14*24*time.Hour); err == nil {
+	if _, err := LatestSafe(srv.URL, "npm", "pkg", 14*24*time.Hour); err == nil {
 		t.Fatal("LatestSafe should error on a non-200 registry response")
 	}
 }

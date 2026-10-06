@@ -39,6 +39,37 @@ func purlNpm(name, version string) string {
 	return fmt.Sprintf("pkg:npm/%s@%s", name, version)
 }
 
+// purlFor picks the purl type by ecosystem. pip names arrive PEP 503-normalized
+// from the parser, which is exactly the purl spec's pypi form.
+func purlFor(p lockfile.Pkg) string {
+	if p.Ecosystem == "pypi" {
+		return fmt.Sprintf("pkg:pypi/%s@%s", p.Name, p.Version)
+	}
+	return purlNpm(p.Name, p.Version)
+}
+
+// hashFor converts an entry's integrity to (cycloneDXAlg, spdxAlg, hex). pip
+// records "alg:hex" (space-joined when several; the first is used), npm an SRI.
+func hashFor(p lockfile.Pkg) (cdxAlg, spdxAlg, hexDigest string, ok bool) {
+	if p.Ecosystem != "pypi" {
+		return sriToHex(p.Integrity)
+	}
+	f := strings.Fields(p.Integrity)
+	if len(f) == 0 {
+		return "", "", "", false
+	}
+	alg, hexD, _ := strings.Cut(f[0], ":")
+	switch alg {
+	case "sha256":
+		return "SHA-256", "SHA256", strings.ToLower(hexD), true
+	case "sha384":
+		return "SHA-384", "SHA384", strings.ToLower(hexD), true
+	case "sha512":
+		return "SHA-512", "SHA512", strings.ToLower(hexD), true
+	}
+	return "", "", "", false
+}
+
 // sriToHex converts a Subresource-Integrity string ("sha512-<base64>") to a
 // (cycloneDXAlg, spdxAlg, hexDigest) triple. Returns ok=false for an empty or
 // unparseable value so callers simply omit the hash rather than emit a bad one.
@@ -109,8 +140,8 @@ func CycloneDX(meta Meta, pkgs []lockfile.Pkg) ([]byte, error) {
 
 	doc.Components = make([]cdxComponent, 0, len(pkgs))
 	for _, p := range pkgs {
-		c := cdxComponent{Type: "library", Name: p.Name, Version: p.Version, Purl: purlNpm(p.Name, p.Version)}
-		if cdxAlg, _, hexD, ok := sriToHex(p.Integrity); ok {
+		c := cdxComponent{Type: "library", Name: p.Name, Version: p.Version, Purl: purlFor(p)}
+		if cdxAlg, _, hexD, ok := hashFor(p); ok {
 			c.Hashes = []cdxHash{{Alg: cdxAlg, Content: hexD}}
 		}
 		doc.Components = append(doc.Components, c)
@@ -193,10 +224,10 @@ func SPDX(meta Meta, pkgs []lockfile.Pkg) ([]byte, error) {
 			ExternalRefs: []spdxExternalRef{{
 				ReferenceCategory: "PACKAGE-MANAGER",
 				ReferenceType:     "purl",
-				ReferenceLocator:  purlNpm(p.Name, p.Version),
+				ReferenceLocator:  purlFor(p),
 			}},
 		}
-		if _, spdxAlg, hexD, ok := sriToHex(p.Integrity); ok {
+		if _, spdxAlg, hexD, ok := hashFor(p); ok {
 			sp.Checksums = []spdxChecksum{{Algorithm: spdxAlg, ChecksumValue: hexD}}
 		}
 		doc.Packages = append(doc.Packages, sp)

@@ -25,7 +25,7 @@ Protection fires only when *you* act — install, commit, PR.
 - [Why](#why) · [How it works](#how-it-works) · [How it's different](#how-its-different) · [Quickstart](#quickstart)
 - [The five layers](#the-five-layers) · [What each layer stops](#what-each-layer-stops)
 - [Command reference](#command-reference) · [Use from an AI agent (MCP)](#use-it-from-your-ai-agent-mcp) · [Per-repo files](#per-repo-files-commit-them)
-- [Honest limits](#honest-limits) · [What's next](#whats-next) · [Tests](#tests) · [Docs](#docs)
+- [Python (pip)](#python-pip--whats-covered-today) · [Honest limits](#honest-limits) · [What's next](#whats-next) · [Tests](#tests) · [Docs](#docs)
 
 ## Why
 
@@ -127,6 +127,10 @@ cd your-project
 guard init                          # drops .guardrc, .npmrc, pre-commit/pre-push hooks
 guard install lodash                # instead of npm install
 ```
+
+Python? `guard init` in a repo with a `requirements.txt` (and no node lockfile) sets up
+the policy + hooks and `guard check` vets your pins — see
+[Python (pip)](#python-pip--whats-covered-today).
 
 **Per-OS install steps** (the right asset for Linux/macOS/Windows, checksum
 verification, macOS Gatekeeper, Windows PATH) and building from source live in
@@ -280,21 +284,25 @@ line per check, so a tree-wide outage is one message, not one per package.
 ```sh
 # ── Setup ──────────────────────────────────────────────────
 guard init [--ci] [--prebuild-box]   # drop .guardrc, .npmrc, git hooks (--ci adds a PR gate;
-                                     #   --prebuild-box builds the sandbox image now)
+                                     #   --prebuild-box builds the sandbox image now;
+                                     #   pip repo: no .npmrc)
 guard status                         # offline read: policy, hooks, sandbox, recorded decisions
 #   bypass a hook once (depguard only, other hooks still run): GUARD_SKIP=1 git push
 
 # ── Install · instead of npm ───────────────────────────────
 guard install <pkg>                  # protected install through the cooldown proxy
 guard ci                             # lockfile-exact install (npm ci), same protections
+                                     #   pip repo: both refuse (exit 2) — pip is check-only today
 
 # ── Audit ──────────────────────────────────────────────────
 guard check [--all] [--json] [--confirm] [--quiet] [--hook=pre-commit|pre-push]
                                      # advisories + cooldown + integrity + secrets (hooks run this)
+                                     #   reads package-lock.json / pnpm-lock.yaml / yarn.lock,
+                                     #   or a pip requirements.txt
                                      #   --hook= tells guard which git phase called it; at pre-push it
                                      #   reads git's ref lines on stdin and checks the OUTGOING commits
 guard scan <dir> [--json]            # static-scan one package dir (scripts, caps, injection)
-guard why <pkg> [--all]              # which direct dep(s) pull a package in (npm lockfile)
+guard why <pkg> [--all]              # which direct dep(s) pull a package in (npm lockfile; not pip)
 guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to stdout
 
 # ── Decisions & waivers ────────────────────────────────────
@@ -351,7 +359,32 @@ attempt prompt injection. The MCP surface is **vetting-only**; state-changing ac
 | `.guardrc` | policy: cooldown, allowed scopes, fallback mode, advisory severity threshold, secret-file paths — **review changes in PRs** (it controls the filter) |
 | `.guard-approvals` | ask-once script decisions, each bound to the tarball's integrity hash so a re-pointed or republished `name@version` re-prompts instead of inheriting the old yes — **review changes in PRs** (they're security decisions) |
 | `.guard-ignores` | reviewed-finding waivers — one per issue, version-pinned + optional expiry — **review changes in PRs** |
-| `.npmrc` | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
+| `.npmrc` (npm repos only) | `ignore-scripts=true` (even raw `npm install` can't run scripts) + `save-exact=true` (new deps pinned to the exact installed version — no `^`/`~`) |
+
+## Python (pip) — what's covered today
+
+**Phase 1: the check path.** `guard check` (so the hooks, CI, `--json` and the MCP
+`check_dependencies` tool) reads `requirements.txt` as the lockfile. There is no
+install-time protection for pip yet — `guard install` / `guard ci` refuse in a pip repo.
+
+| Layer | pip today |
+|---|---|
+| OSV advisories (PyPI namespace) | ✅ every pinned `name==version` |
+| Cooldown (publish age from PyPI's JSON API) | ✅ same scope as npm (staged / pushed additions, `--all`) |
+| Conflicting pins (same `name==version`, different `--hash`) | ✅ gates, not waivable |
+| Missing `--hash` | ⚠ one collapsed **warning**, never a gate — unhashed pins are pip's norm |
+| Secret-file gate, waivers, `on-check-error` | ✅ ecosystem-agnostic |
+| `guard sbom` | ✅ `pkg:pypi/…` purls + the first `--hash` |
+| Cooldown proxy, typosquat gate, script boxing, provenance, maintainer, licenses, `guard why` | ❌ npm only (skipped silently for pip) |
+
+Only exact pins (`name==version` / `===`) are checked. Ranges, bare names, `-e`,
+paths, VCS/URL requirements and `-r`/`-c` includes are **counted as skipped** and
+reported through `on-check-error` — never silently dropped. Generate the file with
+`pip-compile --generate-hashes` for full coverage. A repo with both a node lockfile
+and `requirements.txt` is checked as npm only (for now). PyPI advisories
+(`PYSEC-*`) usually carry only a CVSS vector, so guard scores them through their
+`GHSA-*` alias; one with **no scored alias still blocks** (fail closed) — review
+and `guard ignore` it.
 
 ## Honest limits
 
@@ -406,8 +439,10 @@ others leave.
 
 Directional, not commitments — depguard is **npm-first** today. On the radar:
 
-- **More ecosystems.** PyPI (Python) is the next target — a different registry API and
-  script model — then NuGet (.NET / C#), Cargo (Rust), and RubyGems. The layered model
+- **More ecosystems.** PyPI (Python) **phase 1 shipped: the check path** over
+  `requirements.txt` ([details](#python-pip--whats-covered-today)); next: a PyPI cooldown
+  proxy + sdist build boxing, then following `-r` includes. After that NuGet (.NET / C#),
+  Cargo (Rust), and RubyGems. The layered model
   (cooldown, name gate, scan, box, advisory re-check) is ecosystem-agnostic; each needs
   its own registry + lockfile adapter.
 - **pnpm / yarn parity.** Installs already route through the cooldown proxy for all three;

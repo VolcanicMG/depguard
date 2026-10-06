@@ -47,6 +47,9 @@ type Config struct {
 	NoContainerFallback FallbackMode
 	// Registry is the upstream npm registry the proxy fetches from.
 	Registry string
+	// PyPI is the PyPI base URL `guard check` reads publish times from for a
+	// requirements.txt project (JSON API at {PyPI}/pypi/<name>/json).
+	PyPI string
 	// Flag lists the diff signals `guard check` surfaces (DESIGN.md §10).
 	// "new-deps" reports the packages a lockfile change ADDS to the tree;
 	// "new-network" / "new-fs" are reserved for per-version capability
@@ -126,6 +129,7 @@ func Defaults() Config {
 		IgnoreScripts:       true,
 		NoContainerFallback: FallbackWarnApprove,
 		Registry:            "https://registry.npmjs.org",
+		PyPI:                "https://pypi.org",
 		// new-deps is cheap and non-blocking (a lockfile diff we already have),
 		// so it's on by default; an explicit `flag:` line replaces this.
 		Flag: []string{"new-deps"},
@@ -227,6 +231,12 @@ func Load(dir string) (Config, error) {
 				return c, fmt.Errorf("%s:%d: %w", FileName, ln+1, err)
 			}
 			c.Registry = reg
+		case "pypi":
+			reg := strings.TrimSuffix(val, "/")
+			if err := validateRegistry(reg); err != nil {
+				return c, fmt.Errorf("%s:%d: pypi: %w", FileName, ln+1, err)
+			}
+			c.PyPI = reg
 		default:
 			// Unknown keys don't error — an older binary reading a newer repo's
 			// policy must degrade gracefully, not crash (Open/Closed). But warn,
@@ -338,6 +348,12 @@ no-container-fallback: warn-approve
 #   default: https://registry.npmjs.org
 # registry: https://registry.npmjs.org
 
+# ── pypi ──────────────────────────────────────────────────────────────────────
+# PyPI base URL 'guard check' reads publish times from in a requirements.txt
+# (pip) project. Same https-or-loopback rule as registry.
+#   default: https://pypi.org
+# pypi: https://pypi.org
+
 # ── allow ─────────────────────────────────────────────────────────────────────
 # Package-name patterns you intentionally want fresh — your own scopes (you
 # publish them; waiting is pointless). Supports a single trailing '*' glob.
@@ -428,6 +444,15 @@ no-container-fallback: warn-approve
 # secret-paths: [".env", ".env.*", "secrets/", "*.pem", "*.key", "id_rsa"]
 `
 	return os.WriteFile(path, []byte(starter), 0o644)
+}
+
+// RegistryFor returns the registry base for an ecosystem as reported by
+// lockfile.Ecosystem: the PyPI base for "pypi", the npm registry otherwise.
+func (c Config) RegistryFor(eco string) string {
+	if eco == "pypi" {
+		return c.PyPI
+	}
+	return c.Registry
 }
 
 // validateRegistry rejects plaintext registries: .guardrc is committed, so a
@@ -589,7 +614,7 @@ func canonicalValue(key, value string) (string, error) {
 			return "", fmt.Errorf("advisory-threshold must be critical, high, moderate or low, got %q", value)
 		}
 		return sev.String(), nil
-	case "registry":
+	case "registry", "pypi":
 		reg := strings.TrimSuffix(value, "/")
 		if err := validateRegistry(reg); err != nil {
 			return "", err
@@ -607,7 +632,7 @@ func canonicalValue(key, value string) (string, error) {
 		}
 		return "[" + strings.Join(items, ", ") + "]", nil
 	default:
-		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, on-check-error, registry, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold, secret-paths)", key)
+		return "", fmt.Errorf("unknown key %q (editable: cooldown, ignore-scripts, no-container-fallback, untraced-boxed, on-check-error, registry, pypi, allow, internal-scopes, flag, license-deny, license-allow, advisory-threshold, secret-paths)", key)
 	}
 }
 

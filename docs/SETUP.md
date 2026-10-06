@@ -177,10 +177,32 @@ too-young version that is already committed. If you chain, put the depguard bloc
 `.guard-approvals` and `.guard-ignores` are created the first time you approve a
 script or waive a finding — they don't exist until needed.
 
+### Python (pip) repos
+
+A repo with a `requirements.txt` and **no** node lockfile is detected as pip.
+`guard init` writes `.guardrc` + the hooks (no `.npmrc` — nothing would read it).
+Pip support is **check-only** in this version:
+
+- `guard check` (hooks, CI, `--json`, MCP) reads `requirements.txt`: OSV advisories
+  in the PyPI namespace, the cooldown (publish age from PyPI's JSON API), and
+  conflicting pins (same `name==version` with different `--hash` values — gates).
+- `guard install` / `guard ci` **refuse** (exit 2): run `pip install -r requirements.txt`
+  yourself, then `guard check`. No cooldown proxy, no script boxing, no provenance,
+  maintainer or license checks for pip yet; `guard why` is npm-only.
+- **Generate the file with hashes:** `pip-compile --generate-hashes` (pip-tools). Only
+  exact pins (`name==version`) are checked; ranges, `-e`, paths, VCS/URL requirements
+  and `-r`/`-c` includes are counted as skipped and reported (gate under
+  `on-check-error: fail`). Pins without `--hash` produce one warning line, not a block.
+- `pypi:` in `.guardrc` sets the PyPI base (default `https://pypi.org`; https or
+  loopback only, like `registry:`) — point it at a mirror if you use one.
+- `PYSEC-*` advisories usually have no severity label; guard scores them through
+  their `GHSA-*` alias. One with no scored alias scores unknown and **blocks**
+  (fail closed); review, then `guard ignore advisory:<name>@<version>:<id>`.
+
 ### Commit the state
 
 ```sh
-git add .guardrc .npmrc            # + .guard-approvals / .guard-ignores once they exist
+git add .guardrc .npmrc            # (pip repo: no .npmrc) + .guard-approvals / .guard-ignores once they exist
 git commit -m "chore: add depguard policy"
 ```
 
@@ -241,6 +263,7 @@ secret-paths: [".env", ".env.*", "secrets/", "*.pem"]  # files that must NEVER b
 license-deny: ["GPL-3.0", "AGPL-3.0"]   # SPDX ids to BLOCK on installed deps (off by default; deny applied first)
 # license-allow: ["MIT", "Apache-2.0", "ISC", "BSD-3-Clause"]  # allowlist mode: ONLY these pass (stricter — pick one mode)
 # registry: https://registry.npmjs.org   # upstream; must be https (loopback http ok for tests)
+# pypi: https://pypi.org                  # PyPI base for pip repos' guard check (same https rule)
 ```
 
 Tips:

@@ -1242,7 +1242,7 @@ func TestConfirmCooldownAskpassAccept(t *testing.T) {
 	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
 	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
 
-	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	resolved, interactive, err := confirmCooldown(dir, cfg, "npm", active, wf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1261,7 +1261,7 @@ func TestConfirmCooldownAskpassReject(t *testing.T) {
 	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
 	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
 
-	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	resolved, interactive, err := confirmCooldown(dir, cfg, "npm", active, wf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1280,7 +1280,7 @@ func TestConfirmCooldownAskpassTimeout(t *testing.T) {
 	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
 	active := []freshness.Violation{{Name: "lodash", Version: "4.17.21", Age: time.Hour}}
 
-	resolved, interactive, err := confirmCooldown(dir, cfg, active, wf)
+	resolved, interactive, err := confirmCooldown(dir, cfg, "npm", active, wf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1346,4 +1346,49 @@ echo y
 			t.Errorf(`argv[2..3] = %q, %q, want "for", "depguard"`, lines[2], lines[3])
 		}
 	})
+}
+
+// A pip project has no package.json to pin: "p" is not offered and must abort,
+// never reach the npm reinstall path.
+func TestConfirmCooldownPyPINoPin(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", writeAskpass(t, "echo p\n"))
+	dir := t.TempDir()
+	cfg := config.Config{PyPI: noSafeVersionServer(t), Cooldown: 14 * 24 * time.Hour}
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	active := []freshness.Violation{{Name: "requests", Version: "2.31.0", Age: time.Hour}}
+
+	resolved, interactive, err := confirmCooldown(dir, cfg, "pypi", active, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interactive || resolved {
+		t.Fatalf("resolved=%v interactive=%v, want false/true", resolved, interactive)
+	}
+}
+
+// pip: an unhashed pin is a warning (ok stays true); a conflicting pin gates.
+func TestGatherCheckPyPIUnhashedWarnsConflictGates(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.PyPI = noSafeVersionServer(t) // loopback: OSV skipped, freshness degrades
+	cfg.Flag = append(cfg.Flag, "new-maintainer", "provenance")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("foo==1.0\nbar==2.0 --hash=sha256:aa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := gatherCheck(dir, cfg, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK || len(res.Unhashed) != 0 || len(res.UnhashedWarnings) != 1 || res.UnhashedWarnings[0] != "foo@1.0" {
+		t.Fatalf("unhashed pip: %+v", res)
+	}
+	if len(res.Maintainers) != 0 || len(res.Provenance) != 0 {
+		t.Errorf("npm-only layers ran for pip: %+v", res)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("foo==1.0 --hash=sha256:aa\nfoo==1.0 --hash=sha256:bb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ = gatherCheck(dir, cfg, true); res.OK || len(res.Conflicting) != 1 {
+		t.Fatalf("conflicting pip pin did not gate: %+v", res)
+	}
 }

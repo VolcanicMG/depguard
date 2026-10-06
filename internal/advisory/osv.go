@@ -181,6 +181,14 @@ func BlockingVersions(name string, versions []string, threshold Severity) (map[s
 	return out, nil
 }
 
+// osvEcosystem maps a lockfile entry to OSV's ecosystem name.
+func osvEcosystem(p lockfile.Pkg) string {
+	if p.Ecosystem == "pypi" {
+		return "PyPI"
+	}
+	return "npm"
+}
+
 // Check queries OSV for every name@version pair and returns the hits.
 // pkgs is the distinct set of installed versions — every version is queried,
 // including multiple versions of the same name (see lockfile.Pkg).
@@ -196,7 +204,7 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 		queries := make([]map[string]any, len(chunk))
 		for i, r := range chunk {
 			queries[i] = map[string]any{
-				"package": map[string]string{"name": r.Name, "ecosystem": "npm"},
+				"package": map[string]string{"name": r.Name, "ecosystem": osvEcosystem(r)},
 				"version": r.Version,
 			}
 		}
@@ -257,48 +265,89 @@ func Check(pkgs []lockfile.Pkg) ([]Vuln, error) {
 // resolve-time filter (via BlockingVersions) call it so the two paths tier by
 // the same severity model.
 //
+// A record with no label of its own (PyPI's PYSEC-* carry only a CVSS vector)
+// is scored by its first GHSA-* alias that has one. Alias fetches count
+// against maxSeverityFetches, and every fetched record is cached, so a GHSA
+// that is also in ids (or aliased twice) is fetched once.
+//
 // Fail-open per id: a network error or a record with no machine-readable
-// severity leaves that id absent from the map, which the caller reads as
-// SevUnknown — and SevUnknown BLOCKS. So a flaky OSV detail fetch can only make
-// the gate stricter, never let a hit through unscored.
+// severity (own or via alias) leaves that id absent from the map, which the
+// caller reads as SevUnknown — and SevUnknown BLOCKS. So a flaky OSV detail
+// fetch can only make the gate stricter, never let a hit through unscored.
 func Severities(ids []string) map[string]Severity {
 	out := make(map[string]Severity, len(ids))
 	client := &http.Client{Timeout: 30 * time.Second}
-	seen := map[string]bool{}
+	type rec struct {
+		sev     Severity
+		aliases []string
+		ok      bool
+	}
+	cache := map[string]rec{}
 	fetched := 0
+	// get returns the cached or freshly fetched record; ran=false once capped.
+	get := func(id string) (r rec, ran bool) {
+		if r, hit := cache[id]; hit {
+			return r, true
+		}
+		if fetched >= maxSeverityFetches {
+			return rec{}, false // remaining ids stay SevUnknown -> block (fail closed)
+		}
+		fetched++
+		r.sev, r.aliases, r.ok = fetchSeverity(client, id)
+		cache[id] = r
+		return r, true
+	}
+	seen := map[string]bool{}
 	for _, id := range ids {
 		if id == "" || seen[id] {
 			continue
 		}
 		seen[id] = true
-		if fetched >= maxSeverityFetches {
-			break // remaining ids stay SevUnknown -> block (fail closed)
+		r, ran := get(id)
+		if !ran {
+			break
 		}
-		fetched++
-		sev, ok := fetchSeverity(client, id)
-		if ok {
-			out[id] = sev
+		for _, a := range r.aliases {
+			if r.ok {
+				break
+			}
+			if !strings.HasPrefix(a, "GHSA-") {
+				continue
+			}
+			ar, ran := get(a)
+			if !ran {
+				break
+			}
+			if ar.ok {
+				r.sev, r.ok = ar.sev, true
+			}
+		}
+		if r.ok {
+			out[id] = r.sev
 		}
 	}
 	return out
 }
 
-// fetchSeverity GETs one OSV vuln record and extracts its severity. It reads
-// database_specific.severity first (GHSA's "CRITICAL"/"HIGH"/"MODERATE"/"LOW",
-// the label npm itself uses); failing that, a CVSS entry whose score is a bare
-// label (some feeds populate it that way). A CVSS *vector* string is NOT scored
-// here — computing a base score is out of scope for a zero-dep build, and an
-// unscored hit blocks anyway. ok is false on any error or no usable label.
-func fetchSeverity(client *http.Client, id string) (Severity, bool) {
+// fetchSeverity GETs one OSV vuln record and extracts its severity and its
+// aliases. It reads database_specific.severity first (GHSA's
+// "CRITICAL"/"HIGH"/"MODERATE"/"LOW", the label npm itself uses); failing that,
+// a CVSS entry whose score is a bare label (some feeds populate it that way). A
+// CVSS *vector* string is NOT scored here — computing a base score is out of
+// scope for a zero-dep build; Severities falls back to a GHSA alias instead,
+// and an unscored hit blocks anyway. ok is false on any error or no usable
+// label; aliases are returned whenever the record decoded.
+func fetchSeverity(client *http.Client, id string) (sev Severity, aliases []string, ok bool) {
 	resp, err := client.Get(osvVulnURL + id)
 	if err != nil {
-		return SevUnknown, false
+		return SevUnknown, nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return SevUnknown, false
+		return SevUnknown, nil, false
 	}
 	var d struct {
+		Aliases          []string `json:"aliases"`
 		DatabaseSpecific struct {
 			Severity string `json:"severity"`
 		} `json:"database_specific"`
@@ -308,15 +357,15 @@ func fetchSeverity(client *http.Client, id string) (Severity, bool) {
 		} `json:"severity"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxOSVResponse)).Decode(&d); err != nil {
-		return SevUnknown, false
+		return SevUnknown, nil, false
 	}
 	if s, ok := ParseSeverity(d.DatabaseSpecific.Severity); ok {
-		return s, true
+		return s, d.Aliases, true
 	}
 	for _, sv := range d.Severity {
 		if s, ok := ParseSeverity(sv.Score); ok {
-			return s, true
+			return s, d.Aliases, true
 		}
 	}
-	return SevUnknown, false
+	return SevUnknown, d.Aliases, false
 }

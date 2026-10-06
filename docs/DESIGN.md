@@ -1,6 +1,7 @@
 # depguard — Design Absence is established only by a SUCCESSFUL listing of the index or tree (`ls-files` / `ls-tree`); a failed probe is an error, because `cat-file -e` fails identically for "no such path" and "cannot read the index".
 
-A local-first guard against supply-chain attacks in package dependencies (npm first).
+A local-first guard against supply-chain attacks in package dependencies (npm first;
+PyPI check path via `requirements.txt` since phase 1 — §12 item 2).
 Automatic, per-repo, no background process.
 
 ---
@@ -20,6 +21,8 @@ background.
  tarball ≠ source tampering            kernel / container escapes (rare)
  secrets reaching the remote (.env,
    key material) — YOUR files leaking
+ PyPI (pip): check path only —
+   advisories, cooldown, pin conflicts
 ```
 
 **Honest stance:** no single check certifies a package "clean." depguard is
@@ -1013,7 +1016,19 @@ Named here so they are choices, not oversights:
 
 1. ~~§9 fallback~~ — **resolved: warn-then-approve** (run uncontained only on explicit
    approval; CI falls back to fail unless pre-approved in `.guard-approvals`).
-2. Ecosystem after npm (PyPI has different registry API + script model).
+2. ~~Ecosystem after npm~~ — **partially resolved (PyPI phase 1)**: `guard check`
+   reads `requirements.txt` (exact pins only; everything else counted as skipped and
+   routed through `on-check-error`). Shipped: OSV in the PyPI namespace, cooldown from
+   PyPI's JSON API (earliest upload per release), conflicting `--hash` pins gate,
+   unhashed pins WARN (they are pip's norm — gating would fail nearly every repo),
+   SBOM purls. npm-only layers (license, provenance, maintainer, `why`) are skipped,
+   not degraded. `guard install` refuses in a pip repo — guard must not imply
+   install-time protection it doesn't give. Remaining: a PyPI cooldown proxy, sdist
+   build boxing (setup.py is pip's install script), following `-r`/`-c` includes,
+   per-ecosystem multi-lockfile repos (today a node lockfile wins), and scoring
+   CVSS vectors directly. Label-less `PYSEC-*` advisories are scored via their
+   first labelled `GHSA-*` alias (alias fetches count against the severity-fetch
+   cap); one with no scored alias still scores unknown → blocks (fail closed).
 3. How shared verdicts are distributed/trusted (community feed vs local-only).
 4. ~~Exact provenance method~~ — **partially resolved (v0.8.0, §11e)**: npm
    build-provenance (Sigstore/SLSA) attestations are fetched and verified

@@ -87,3 +87,24 @@ func TestSPDXValid(t *testing.T) {
 		t.Errorf("missing resolved should map to NOASSERTION, got %v", p1["downloadLocation"])
 	}
 }
+
+func TestPyPIPurlAndHash(t *testing.T) {
+	p := lockfile.Pkg{Name: "foo-bar", Version: "1.0", Ecosystem: "pypi", Integrity: "sha256:AB sha256:cd"}
+	if got := purlFor(p); got != "pkg:pypi/foo-bar@1.0" {
+		t.Errorf("purl = %q", got)
+	}
+	if cdx, spdx, h, ok := hashFor(p); !ok || cdx != "SHA-256" || spdx != "SHA256" || h != "ab" {
+		t.Errorf("hash = (%q,%q,%q,%v), want first hash as SHA-256 ab", cdx, spdx, h, ok)
+	}
+	for in, alg := range map[string]string{"sha384:aa": "SHA-384", "sha512:aa": "SHA-512"} {
+		if cdx, _, _, ok := hashFor(lockfile.Pkg{Ecosystem: "pypi", Integrity: in}); !ok || cdx != alg {
+			t.Errorf("hashFor(%q) = %q", in, cdx)
+		}
+	}
+	if _, _, _, ok := hashFor(lockfile.Pkg{Ecosystem: "pypi"}); ok {
+		t.Error("unhashed pip pin should yield no hash")
+	}
+	if got := purlFor(lockfile.Pkg{Name: "lodash", Version: "1.0.0"}); got != "pkg:npm/lodash@1.0.0" {
+		t.Errorf("npm purl = %q", got)
+	}
+}

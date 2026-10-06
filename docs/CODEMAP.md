@@ -57,6 +57,12 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │                               gates apply without a tarball URL. Both parsers
  │                               ERROR when they read content but recognize none of
  │                               it — an unparsed lockfile must not look empty
+ │   ├── lockfile/requirements.go pip requirements.txt parser (check path): exact
+ │                               `name==version` pins (+ --hash → Integrity) become
+ │                               Pkg{Ecosystem:"pypi", FromRegistry}; ranges, -e,
+ │                               paths, URLs, -r/-c/-f count as skipped; option-only
+ │                               lines are ignored. lockfileNames tries it LAST, so
+ │                               a node lockfile wins in a mixed repo
  │   ├── lockfile/graph.go       package-lock graph rebuild for `guard why` (parent→child edges)
  │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
@@ -75,7 +81,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
      ├── helpers/registry.mjs    mock npm registry w/ fabricated publish ages
      ├── helpers/tar.mjs         hand-rolled USTAR+gzip (zero test deps)
      ├── helpers/run.mjs         temp projects + binary spawner
-     └── *.test.mjs              cooldown / additions / scripts / init / secrets suites
+     └── *.test.mjs              cooldown / additions / scripts / init / secrets / python suites
 ```
 
 ## Flow: `guard install` (and `guard ci`)
@@ -152,6 +158,12 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │                     → confirmThroughWarnings (--confirm, promptChoice: GIT_ASKPASS/
    │                       SSH_ASKPASS then /dev/tty): on "yes" records acceptances
    │                       via waivers.Set → .guard-ignores
+   ├─ ecosystem gate ── snapshot.ecosystem() / lockfile.Ecosystem(pkgs): "pypi"
+   │                    skips license/provenance/maintainer SILENTLY (they read
+   │                    node_modules / npm packuments); cfg.RegistryFor(eco) feeds
+   │                    freshness + the off-registry host; OSV queries per-pkg
+   │                    ecosystem (osvEcosystem); pip unhashed pins WARN (one
+   │                    collapsed line, CheckResult.unhashedWarnings), npm's gate
    ├─ checkFreshness ─── scope = the versions THIS action adds:
    │                     pre-commit → staged lockfile vs HEAD
    │                     pre-push   → pushed sha vs pushBaseRef (remote sha, or the
@@ -198,7 +210,8 @@ the shared history.
    ├─ config.WriteDefault ── .guardrc (refuses to overwrite)
    └─ hooks.Install
         ├─ installNpmrc ──── ignore-scripts=true (appends; never duplicates,
-        │                    never overrides an existing human choice)
+        │                    never overrides an existing human choice); skipped
+        │                    when detectManager says "pip" (Install's npmrc arg)
         ├─ pre-commit/pre-push shims → call global `guard check --quiet`
         └─ --ci: .github/workflows/depguard.yml (deliberate FIXME — you must
                  pin YOUR release URL + checksum; no floating tags)
@@ -219,7 +232,8 @@ the shared history.
 | License-policy gate | `license/license.go` (SPDX deny/allow); wired in `main.go` `checkLicenses` |
 | SBOM output (CycloneDX / SPDX) | `sbom/sbom.go`; `main.go` `cmdSBOM` |
 | `guard why` dependency graph | `lockfile/graph.go` (`BuildGraph` / `Paths`); `main.go` `cmdWhy` |
-| Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `Installed()`; set `Pkg.FromRegistry` if the format omits tarball URLs |
+| Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `parseNamed`; set `Pkg.FromRegistry` if the format omits tarball URLs, `Pkg.Ecosystem` if it isn't npm |
+| pip / requirements.txt behavior | parser `lockfile/requirements.go`; PyPI lookups `freshness.go` (`pypiPublishTime`/`pypiLatestSafe`); `config.RegistryFor`; `main.go` `detectManager` ("pip"), `refusePip` (install/ci exit 2), ecosystem gates in `cmdCheck`/`gatherCheck`/`installGates`/`checkLockfileIntegrity` |
 | Lockfile-integrity gate scope | `main.go` `checkableDep` / `hasTarballURL` — used by BOTH `gatherCheck` and `checkLockfileIntegrity` |
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
@@ -240,7 +254,7 @@ the shared history.
 | Terminal color | `internal/ui/ui.go` (gate = NO_COLOR + both streams TTY) |
 | Approval semantics | `approvals/approvals.go` (decisions) + `main.go` `promptApproval`/`runApproved` |
 | Hook/CI behavior | `hooks/hooks.go` — `HookDir` follows ONLY `core.hooksPath` (a bare `.husky` dir is inert; `huskyInactive` flags it so init/status say so). `hooks/hooks.go` (the shims) — they only ever call `guard check --hook=<phase>`; bump `shimVersion` on any body change or installed shims never upgrade. `HookDir` resolves `core.hooksPath` / husky / `.git/hooks` and is shared by `Install` and `Installed` |
-| Another ecosystem (PyPI) | new siblings of `registry`/`lockfile`/`scanner`; `main.go` orchestration is npm-shaped today |
+| Another ecosystem | PyPI check path is the template: a parser setting `Pkg.Ecosystem`, `advisory.osvEcosystem`, `freshness` dispatch on eco, `config.RegistryFor`; install path (proxy/scanner/box) is still npm-shaped |
 
 ## Invariants — do not break
 

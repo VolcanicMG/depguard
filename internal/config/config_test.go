@@ -252,3 +252,34 @@ func TestDegrade(t *testing.T) {
 		t.Errorf("Degrade(nil) = %v, want nil", err)
 	}
 }
+
+// TestPyPIKey pins the pypi base: default, parse, trailing-slash trim, the
+// https-or-loopback rule, and RegistryFor's ecosystem dispatch.
+func TestPyPIKey(t *testing.T) {
+	if got := Defaults().PyPI; got != "https://pypi.org" {
+		t.Errorf("default PyPI = %q", got)
+	}
+	load := func(body string) (Config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, FileName), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(dir)
+	}
+	c, err := load("pypi: https://mirror.example/\n")
+	if err != nil || c.PyPI != "https://mirror.example" {
+		t.Fatalf("parse: %q, %v", c.PyPI, err)
+	}
+	if c.RegistryFor("pypi") != "https://mirror.example" || c.RegistryFor("npm") != c.Registry || c.RegistryFor("") != c.Registry {
+		t.Error("RegistryFor dispatch wrong")
+	}
+	if _, err := load("pypi: http://evil.example\n"); err == nil {
+		t.Error("plaintext pypi accepted")
+	}
+	if c, err := load("pypi: http://127.0.0.1:9\n"); err != nil || c.PyPI != "http://127.0.0.1:9" {
+		t.Errorf("loopback pypi rejected: %v", err)
+	}
+	if _, err := canonicalValue("pypi", "http://evil.example"); err == nil {
+		t.Error("canonicalValue accepted plaintext pypi")
+	}
+}

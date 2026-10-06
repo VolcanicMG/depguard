@@ -60,6 +60,21 @@ type Pkg struct {
 	// the cooldown and the SBOM must see it; only the integrity gates skip it,
 	// because it has nothing of its own to verify.
 	Bundled bool
+	// Ecosystem is "pypi" for a requirements.txt entry; "" means npm (every
+	// node lockfile parser leaves it empty).
+	Ecosystem string
+}
+
+// Ecosystem reports which registry a parsed package set belongs to: "pypi" if
+// any entry is a PyPI pin, else "npm". One lockfile is read per project, so a
+// set is never mixed.
+func Ecosystem(pkgs []Pkg) string {
+	for _, p := range pkgs {
+		if p.Ecosystem == "pypi" {
+			return "pypi"
+		}
+	}
+	return "npm"
 }
 
 // Key is the dedupe/identity key for a package version ("name@version").
@@ -82,8 +97,8 @@ func InstalledPaths(dir string) ([]Entry, error) {
 // written under a given name.
 //
 // It auto-detects the lockfile: package-lock.json (npm), then pnpm-lock.yaml,
-// then yarn.lock. The check path (advisory/cooldown/integrity) thus covers all
-// three package managers; `guard install` itself remains npm-shaped because it
+// then yarn.lock, then requirements.txt (pip). The check path
+// (advisory/cooldown/integrity) thus covers all four; `guard install` itself remains npm-shaped because it
 // shells out to npm.
 func Installed(dir string) ([]Pkg, error) {
 	pkgs, _, err := InstalledAt(dir, "")
@@ -91,7 +106,9 @@ func Installed(dir string) ([]Pkg, error) {
 }
 
 // lockfileNames is the search order for "which lockfile does this project use".
-var lockfileNames = []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+// ponytail: first match wins, so a repo with a node lockfile AND requirements.txt
+// is checked as npm only; a per-ecosystem multi-lockfile scan is the upgrade.
+var lockfileNames = []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "requirements.txt"}
 
 // InstalledAt is Installed for a specific git ref: "" reads the WORKING TREE,
 // ":" reads the index (what a commit would contain), and a sha reads that
@@ -194,6 +211,12 @@ func parseNamed(name string, raw []byte) (pkgs []Pkg, skipped int, err error) {
 	switch filepath.Base(name) {
 	case "pnpm-lock.yaml":
 		p, n, perr := parsePnpm(raw)
+		if perr != nil {
+			return nil, 0, perr
+		}
+		return dedupePkgs(p), n, nil
+	case "requirements.txt":
+		p, n, perr := parseRequirements(raw)
 		if perr != nil {
 			return nil, 0, perr
 		}

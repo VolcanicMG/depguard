@@ -318,3 +318,70 @@ func TestCheckResultCountMismatch(t *testing.T) {
 		}
 	}
 }
+
+// PyPI pins must be queried in OSV's "PyPI" namespace; everything else is npm.
+func TestOSVEcosystem(t *testing.T) {
+	for eco, want := range map[string]string{"pypi": "PyPI", "": "npm", "npm": "npm"} {
+		if got := osvEcosystem(lockfile.Pkg{Ecosystem: eco}); got != want {
+			t.Errorf("osvEcosystem(%q) = %q, want %q", eco, got, want)
+		}
+	}
+}
+
+// PYSEC-* records carry no severity label; their GHSA alias does. The alias
+// scores the PYSEC id, is fetched once, and an unscored alias stays absent.
+func TestSeveritiesFallsBackToGHSAAlias(t *testing.T) {
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/")
+		hits[id]++
+		switch id {
+		case "PYSEC-1":
+			w.Write([]byte(`{"aliases":["CVE-1","GHSA-mod"],"severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N"}]}`))
+		case "PYSEC-2":
+			w.Write([]byte(`{"aliases":["GHSA-none"]}`))
+		case "GHSA-mod":
+			w.Write([]byte(`{"database_specific":{"severity":"MODERATE"}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	old := osvVulnURL
+	osvVulnURL = srv.URL + "/"
+	defer func() { osvVulnURL = old }()
+
+	got := Severities([]string{"PYSEC-1", "PYSEC-2", "GHSA-mod"})
+	if got["PYSEC-1"] != SevModerate || got["GHSA-mod"] != SevModerate {
+		t.Errorf("alias fallback: %v", got)
+	}
+	if _, ok := got["PYSEC-2"]; ok {
+		t.Error("PYSEC with an unscored alias must stay absent (blocks)")
+	}
+	if hits["GHSA-mod"] != 1 || hits["CVE-1"] != 0 {
+		t.Errorf("fetches = %v, want GHSA-mod once and no CVE fetch", hits)
+	}
+}
+
+// Alias fetches count against the cap: with cap 1 the alias is never fetched.
+func TestSeveritiesAliasRespectsCap(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if strings.HasSuffix(r.URL.Path, "PYSEC-1") {
+			w.Write([]byte(`{"aliases":["GHSA-mod"]}`))
+			return
+		}
+		w.Write([]byte(`{"database_specific":{"severity":"MODERATE"}}`))
+	}))
+	defer srv.Close()
+	old, oldCap := osvVulnURL, maxSeverityFetches
+	osvVulnURL = srv.URL + "/"
+	maxSeverityFetches = 1
+	defer func() { osvVulnURL = old; maxSeverityFetches = oldCap }()
+
+	got := Severities([]string{"PYSEC-1", "GHSA-other"})
+	if hits != 1 || len(got) != 0 {
+		t.Errorf("hits=%d got=%v, want 1 fetch and nothing scored", hits, got)
+	}
+}

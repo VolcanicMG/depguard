@@ -332,15 +332,17 @@ func installNpmrc(dir string) (bool, error) {
 	return true, os.WriteFile(path, []byte(content), 0o644)
 }
 
-// Install writes the git hooks + .npmrc (always) and CI workflow (when ci is
+// Install writes the git hooks, .npmrc (when npmrc is true) and CI workflow (when ci is
 // true). Returns what it wrote for the init summary, plus any warnings about a
 // hook setup that will not actually fire.
-func Install(dir string, ci bool) (written []string, warnings []string, err error) {
+func Install(dir string, ci, npmrc bool) (written []string, warnings []string, err error) {
 	if huskyInactive(dir) {
 		warnings = append(warnings, "husky dir present but not active (core.hooksPath is unset) — hooks installed to .git/hooks; run 'husky install' if you meant to use husky")
 	}
 
-	if wrote, err := installNpmrc(dir); err != nil {
+	if !npmrc {
+		// caller says nothing here reads .npmrc (a pip project)
+	} else if wrote, err := installNpmrc(dir); err != nil {
 		return nil, warnings, err
 	} else if wrote {
 		written = append(written, ".npmrc (ignore-scripts + save-exact)")

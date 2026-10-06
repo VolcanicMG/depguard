@@ -80,6 +80,7 @@ Two deliberate harness choices:
 | `scripts.test.mjs` | 7 | `marker.txt` — the fixture's postinstall writes it, so its existence *is* "did the script run"; `.guard-approvals` content; boxed+traced run via real docker — incl. a benign script passing the syscall trace AND an exfil script convicted (output discarded, approval auto-denied); plus `guard prewarm` building the image and `guard clean [--image]` reclaiming it. Box tests auto-skip without docker |
 | `init.test.mjs` | 6 | files dropped by `guard init` (.guardrc, hooks, `.npmrc`), executable bits, no-clobber on re-run, clean failure outside git |
 | `secrets.test.mjs` | 6 | the secret-file gate: staged `.env` blocked, untracked file ignored, `*.pem` basename glob, `guard ignore secret:<path>` waiver clears it, `--json` flips `ok` to false, `guard secret-add` appends a pattern |
+| `python.test.mjs` | 5 | pip / `requirements.txt` (offline — `pypi:` points at a closed loopback port): `guard init` writes no `.npmrc`; hashed pins pass; unhashed pins warn once (collapsed) and stay `ok`; a conflicting `--hash` pair gates; `guard install` exits 2 |
 
 ## Adding a test
 

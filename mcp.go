@@ -116,7 +116,7 @@ func toolDefs() []map[string]any {
 		},
 		{
 			"name":        "check_dependencies",
-			"description": "Run depguard's full lockfile check on a project directory: OSV advisories, cooldown violations, off-registry/unhashed lockfile entries, newly-added deps, and (if enabled) maintainer changes. Returns a structured result. This is the SAME check depguard's pre-commit/pre-push git hooks run, so a failing result (ok:false) is what blocks a commit/push; the human's deliberate escape hatch for the local hook is `GUARD_SKIP=1 git push` (depguard only).",
+			"description": "Run depguard's full lockfile check on a project directory (package-lock.json, pnpm-lock.yaml, yarn.lock, or a pip requirements.txt): OSV advisories, cooldown violations, off-registry/unhashed lockfile entries, newly-added deps, and (if enabled) maintainer changes. Returns a structured result. This is the SAME check depguard's pre-commit/pre-push git hooks run, so a failing result (ok:false) is what blocks a commit/push; the human's deliberate escape hatch for the local hook is `GUARD_SKIP=1 git push` (depguard only).",
 			"inputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"dir": strProp("absolute path to the project directory (containing a lockfile)")},

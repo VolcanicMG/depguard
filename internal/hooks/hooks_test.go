@@ -216,7 +216,7 @@ func TestHookDirFollowsCoreHooksPath(t *testing.T) {
 	if got, want := HookDir(dir), filepath.Join(dir, "myhooks"); got != want {
 		t.Fatalf("HookDir = %q, want %q", got, want)
 	}
-	if _, _, err := Install(dir, false); err != nil {
+	if _, _, err := Install(dir, false, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "myhooks", "pre-commit")); err != nil {
@@ -314,7 +314,7 @@ func TestHookDirIgnoresInactiveHusky(t *testing.T) {
 	if !huskyInactive(dir) {
 		t.Error("huskyInactive = false, so nothing would warn the user")
 	}
-	_, warnings, err := Install(dir, false)
+	_, warnings, err := Install(dir, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestInstallWarnsOnTrailingExit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(hookDir, "pre-commit"), []byte(foreign), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, warnings, err := Install(dir, false)
+	_, warnings, err := Install(dir, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,5 +474,19 @@ func TestInstalledDetectsUnreachableBlock(t *testing.T) {
 	}
 	if Installed(dir).PrePushUnreachable {
 		t.Error("a normally-chained hook was reported unreachable")
+	}
+}
+
+// A pip project (npmrc=false) gets hooks but no .npmrc.
+func TestInstallSkipsNpmrc(t *testing.T) {
+	dir := gitRepo(t, "")
+	if _, _, err := Install(dir, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".npmrc")); !os.IsNotExist(err) {
+		t.Errorf(".npmrc written with npmrc=false (err=%v)", err)
+	}
+	if st := Installed(dir); !st.PreCommit || !st.PrePush {
+		t.Errorf("hooks missing: %+v", st)
 	}
 }

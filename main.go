@@ -110,9 +110,10 @@ func usage(w io.Writer) {
 
   guard init [--ci]               set up this repo (.guardrc, git hooks, CI gate)
   guard status                    is this repo protected? (policy, hooks, sandbox, decisions)
-  guard install [npm args...]     npm install, filtered + scripts neutralized
+  guard install [npm args...]     npm install, filtered + scripts neutralized (pip: refused, check-only)
   guard ci                        npm ci — lockfile-exact, same protections
-  guard check [--quiet] [--json] [--confirm]  re-check repo (advisories, cooldown, integrity, secret files)
+  guard check [--quiet] [--json] [--confirm]  re-check repo (advisories, cooldown, integrity, secret files;
+                                  npm/pnpm/yarn lockfiles or pip requirements.txt)
   guard scan <dir> [--json]       static-scan one package dir (scripts, caps, injection)
   guard why <package> [--all]     show which direct dep(s) pull a package in (npm lockfile)
   guard sbom [--spdx]             write an SBOM of installed deps to stdout (CycloneDX, or SPDX)
@@ -216,7 +217,9 @@ func cmdInit(args []string) error {
 	} else {
 		fmt.Fprintln(os.Stderr, "guard:", err, "— keeping it")
 	}
-	hookFiles, hookWarnings, err := hooks.Install(dir, ci)
+	// A pip project gets the hooks + policy but no .npmrc (nothing reads it).
+	pip := detectManager(dir) == "pip"
+	hookFiles, hookWarnings, err := hooks.Install(dir, ci, !pip)
 	if err != nil {
 		return err
 	}
@@ -257,7 +260,11 @@ func cmdInit(args []string) error {
 	}
 
 	fmt.Println("\nNext steps:")
-	fmt.Println("  1. use 'guard install <pkg>' instead of 'npm install <pkg>'")
+	if pip {
+		fmt.Println("  1. pip is check-only for now: 'guard check' vets requirements.txt (pin with pip-compile --generate-hashes)")
+	} else {
+		fmt.Println("  1. use 'guard install <pkg>' instead of 'npm install <pkg>'")
+	}
 	fmt.Println("  2. your commits & pushes now run 'guard check' automatically (the hooks above)")
 	fmt.Println("  3. check protection anytime with 'guard status'")
 	tip := "Optional: enable build-provenance + license gates in .guardrc (see the comments there)."
@@ -271,17 +278,33 @@ func cmdInit(args []string) error {
 // ─── guard install ───────────────────────────────────────────────────────────
 
 // detectManager picks the package manager for an install from the lockfile
-// present in dir: pnpm-lock.yaml -> pnpm, yarn.lock -> yarn, else npm (also the
-// default in a fresh repo with no lockfile yet). Lockfile presence is each
-// manager's own "this is a <mgr> project" signal, so we reuse it.
+// present in dir: pnpm-lock.yaml -> pnpm, yarn.lock -> yarn, requirements.txt
+// with no node lockfile -> pip, else npm (also the default in a fresh repo with
+// no lockfile yet). Lockfile presence is each manager's own "this is a <mgr>
+// project" signal, so we reuse it.
 func detectManager(dir string) string {
-	if _, err := os.Stat(filepath.Join(dir, "pnpm-lock.yaml")); err == nil {
-		return "pnpm"
+	has := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name))
+		return err == nil
 	}
-	if _, err := os.Stat(filepath.Join(dir, "yarn.lock")); err == nil {
+	switch {
+	case has("pnpm-lock.yaml"):
+		return "pnpm"
+	case has("yarn.lock"):
 		return "yarn"
+	case !has("package-lock.json") && has("requirements.txt"):
+		return "pip"
 	}
 	return "npm"
+}
+
+// refusePip stops install/ci in a pip project: phase 1 has no PyPI proxy or
+// script boxing, so guard must not pretend to protect an install. Exits 2.
+func refusePip(dir string) {
+	if detectManager(dir) == "pip" {
+		fmt.Fprintln(os.Stderr, "guard install: pip projects are check-only in this version — run `pip install -r requirements.txt` then `guard check`")
+		os.Exit(2)
+	}
 }
 
 // installInvocation is how to run a protected install for one package manager:
@@ -349,6 +372,7 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	if err != nil {
 		return err
 	}
+	refusePip(dir)
 	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
@@ -473,11 +497,14 @@ func installGates(dir string, cfg config.Config, wf *waivers.File) error {
 	// The freshly resolved tree IS the working tree here — nothing is staged or
 	// pushed yet, so there is no other snapshot to judge.
 	snap := worktreeSnapshot(dir)
+	npm := snap.ecosystem() != "pypi"
 	advErr := checkAdvisories(snap, cfg, false, false, wf)
 	intErr := checkLockfileIntegrity(snap, cfg, wf, false)
-	licErr := checkLicenses(snap, cfg, wf, false)
-	var provErr error
-	if cfg.Flagged("provenance") {
+	var licErr, provErr error
+	if npm {
+		licErr = checkLicenses(snap, cfg, wf, false)
+	}
+	if npm && cfg.Flagged("provenance") {
 		provErr = checkProvenance(snap, cfg, false)
 	}
 	freshErr := checkFreshness(snap, cfg, false, false, false, wf, nil, "")
@@ -894,9 +921,14 @@ func cmdCheck(args []string) error {
 	advErr := checkAdvisories(snap, cfg, quiet, confirm, wf)
 	freshErr := checkFreshness(snap, cfg, quiet, all, confirm, wf, refs, remote)
 	intErr := checkLockfileIntegrity(snap, cfg, wf, quiet)
-	licErr := checkLicenses(snap, cfg, wf, quiet)
-	var provErr error
-	if cfg.Flagged("provenance") {
+	// License, provenance and maintainer checks read node_modules / npm
+	// packuments: skipped outright for a pip project, not reported as degraded.
+	npm := snap.ecosystem() != "pypi"
+	var licErr, provErr error
+	if npm {
+		licErr = checkLicenses(snap, cfg, wf, quiet)
+	}
+	if npm && cfg.Flagged("provenance") {
 		provErr = checkProvenance(snap, cfg, quiet)
 	}
 	// Informational diff signals (never gate the commit/PR). Run here so a
@@ -905,7 +937,7 @@ func cmdCheck(args []string) error {
 		reportNewDeps(dir, quiet)
 	}
 	var maintErr error
-	if cfg.Flagged("new-maintainer") {
+	if npm && cfg.Flagged("new-maintainer") {
 		maintErr = checkMaintainers(dir, cfg, quiet)
 	}
 	// One-line rollup so the overall verdict is scannable regardless of how many
@@ -1023,6 +1055,9 @@ type CheckResult struct {
 	Cooldown         []freshness.Violation `json:"cooldownViolations"`
 	OffRegistry      []string              `json:"offRegistry"`
 	Unhashed         []string              `json:"unhashed"`
+	// UnhashedWarnings are pip pins without --hash. Unhashed pins are pip's
+	// norm, so they warn instead of gating (npm's Unhashed above still gates).
+	UnhashedWarnings []string `json:"unhashedWarnings,omitempty"`
 	// Conflicting are name@version pairs the lockfile records at two paths with
 	// DIFFERENT tarballs or hashes. The lockfile contradicts itself, so no
 	// single answer about what will be installed is trustworthy — not waivable.
@@ -1225,7 +1260,9 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	// registry, a lookup failure is recorded as DEGRADED rather than swallowed:
 	// the advisory layer stays fail-open (an OSV outage must not block every
 	// commit), but a green --json/MCP result can no longer hide that it didn't run.
-	if !isLoopbackHost(hostOf(cfg.Registry)) {
+	eco := lockfile.Ecosystem(pkgs)
+	reg := cfg.RegistryFor(eco)
+	if !isLoopbackHost(hostOf(reg)) {
 		if v, err := advisory.Check(pkgs); err != nil {
 			res.Degraded = append(res.Degraded, "advisory check skipped: "+err.Error())
 		} else {
@@ -1236,7 +1273,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			res.Advisories, res.AdvisoryWarnings = partitionBySeverity(active, cfg.AdvisoryThreshold)
 		}
 	}
-	regHost := hostOf(cfg.Registry)
+	regHost := hostOf(reg)
 	for _, p := range pkgs {
 		if p.Conflict {
 			res.Conflicting = append(res.Conflicting, p.Key())
@@ -1259,6 +1296,8 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 		if p.Integrity == "" {
 			if id := unhashedWaiverID(p.Key()); waivedActive(wf, id, now) {
 				res.Waived = append(res.Waived, id)
+			} else if p.Ecosystem == "pypi" {
+				res.UnhashedWarnings = append(res.UnhashedWarnings, p.Key())
 			} else {
 				res.Unhashed = append(res.Unhashed, p.Key())
 			}
@@ -1281,13 +1320,16 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 			fresh = add
 		}
 	}
-	viol, warns := freshness.Check(cfg.Registry, fresh, cfg.Cooldown, cfg.Allowed)
+	viol, warns := freshness.Check(reg, fresh, cfg.Cooldown, cfg.Allowed)
 	if len(viol) > 0 {
 		res.Cooldown = activeCooldown(viol, wf, now, &res.Waived)
 	}
 	// Per-package fetch failures are fail-open too — but recorded, not dropped.
 	res.Degraded = append(res.Degraded, warns...)
-	if cfg.Flagged("new-maintainer") {
+	// npm-only layers below (packuments, node_modules, Sigstore) are skipped
+	// for pip, not reported as degraded.
+	npm := eco != "pypi"
+	if npm && cfg.Flagged("new-maintainer") {
 		ch, mwarns := maintainer.Check(cfg.Registry, pkgs, cfg.Allowed, nil)
 		if len(ch) > 0 {
 			res.Maintainers = ch
@@ -1298,7 +1340,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	}
 	// License gate (no-op unless a deny/allow list is configured). Reads
 	// node_modules; an absent tree is recorded as degraded, not a clean pass.
-	if len(cfg.LicenseDeny) > 0 || len(cfg.LicenseAllow) > 0 {
+	if npm && (len(cfg.LicenseDeny) > 0 || len(cfg.LicenseAllow) > 0) {
 		if entries, lerr := lockfile.InstalledPaths(dir); lerr == nil {
 			lres := license.Check(dir, entries, cfg.LicenseDeny, cfg.LicenseAllow)
 			if lres.Degraded {
@@ -1314,7 +1356,7 @@ func gatherCheck(dir string, cfg config.Config, all bool) (CheckResult, error) {
 	// reporting ok:true while the text path gates. One registry fetch per
 	// package, so it's off by default.
 	invalidProv := 0
-	if cfg.Flagged("provenance") {
+	if npm && cfg.Flagged("provenance") {
 		apkgs := make([]attestation.Pkg, 0, len(pkgs))
 		for _, p := range pkgs {
 			apkgs = append(apkgs, attestation.Pkg{Name: p.Name, Version: p.Version, Integrity: p.Integrity})
@@ -1377,9 +1419,11 @@ func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, 
 		}
 		return v.label + ": " + key
 	}
-	regHost := hostOf(cfg.Registry)
 	now := time.Now()
 	var offReg, noHash, conflict []string
+	// pip pins without --hash are the norm, so they warn (collapsed) instead of
+	// gating; npm's unhashed finding stays a gate.
+	pyPinned, pyUnhashed := 0, 0
 	// waiveOrKeep routes one integrity finding: an active waiver suppresses it
 	// (shown muted), an expired waiver re-gates it loudly, otherwise it gates.
 	waiveOrKeep := func(id, display string, into *[]string) {
@@ -1397,6 +1441,7 @@ func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, 
 		}
 	}
 	for _, v := range views {
+		regHost := hostOf(cfg.RegistryFor(lockfile.Ecosystem(v.pkgs)))
 		for _, p := range v.pkgs {
 			// Not waivable: a self-contradicting lockfile has to be fixed, not
 			// accepted — we can't say which of the two records will win.
@@ -1416,10 +1461,20 @@ func checkLockfileIntegrity(snap snapshot, cfg config.Config, wf *waivers.File, 
 						label(v, fmt.Sprintf("%s — tarball host %q ≠ registry %q", p.Key(), h, regHost)), &offReg)
 				}
 			}
+			if p.Ecosystem == "pypi" {
+				pyPinned++
+				if p.Integrity == "" && !waivedActive(wf, unhashedWaiverID(p.Key()), now) {
+					pyUnhashed++
+				}
+				continue
+			}
 			if p.Integrity == "" {
 				waiveOrKeep(unhashedWaiverID(p.Key()), label(v, p.Key()), &noHash)
 			}
 		}
+	}
+	if pyUnhashed > 0 {
+		fmt.Fprintf(os.Stderr, "guard: %s %d of %d pinned requirements carry no --hash — run pip-compile --generate-hashes\n", ui.Warn(), pyUnhashed, pyPinned)
 	}
 	if len(offReg) == 0 && len(noHash) == 0 && len(conflict) == 0 {
 		if !quiet && degraded == nil {
@@ -1634,6 +1689,8 @@ func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, 
 		}
 		return err
 	}
+	// From the full snapshot, before scoping can shrink pkgs to nothing.
+	eco := lockfile.Ecosystem(pkgs)
 
 	scope := "lockfile additions"
 	scoped := false
@@ -1669,7 +1726,7 @@ func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, 
 		return nil
 	}
 
-	violations, warnings := freshness.Check(cfg.Registry, pkgs, cfg.Cooldown, cfg.Allowed)
+	violations, warnings := freshness.Check(cfg.RegistryFor(eco), pkgs, cfg.Cooldown, cfg.Allowed)
 	// Per-package fetch errors are fail-open by default (a registry blip must
 	// not block every commit in every repo) — but always loud, and gating under
 	// on-check-error: fail. Collapsed to ONE line: a tree-wide registry outage
@@ -1715,7 +1772,7 @@ func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, 
 	// version past the cooldown and reinstall. With no terminal we fall through to
 	// the hard block below — install enforcement and CI stay strict.
 	if confirm {
-		resolved, interactive, cerr := confirmCooldown(dir, cfg, active, wf)
+		resolved, interactive, cerr := confirmCooldown(dir, cfg, eco, active, wf)
 		if cerr != nil {
 			return cerr
 		}
@@ -1743,12 +1800,12 @@ func checkFreshness(snap snapshot, cfg config.Config, quiet, all, confirm bool, 
 // through GIT_ASKPASS/SSH_ASKPASS when set (see promptChoice), otherwise reads
 // /dev/tty, not stdin: a git hook's stdin carries ref data, not the keyboard
 // (mirrors confirmThroughWarnings).
-func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation, wf *waivers.File) (resolved, interactive bool, err error) {
+func confirmCooldown(dir string, cfg config.Config, eco string, active []freshness.Violation, wf *waivers.File) (resolved, interactive bool, err error) {
 	// One registry fetch per package to name the concrete pin target up front, so
 	// the human chooses with the real version in hand rather than a guess.
 	safe := map[string]string{}
 	for _, v := range active {
-		if s, e := freshness.LatestSafe(cfg.Registry, v.Name, cfg.Cooldown); e == nil && s != "" {
+		if s, e := freshness.LatestSafe(cfg.RegistryFor(eco), eco, v.Name, cfg.Cooldown); e == nil && s != "" {
 			safe[v.Name] = s
 		}
 	}
@@ -1768,12 +1825,24 @@ func confirmCooldown(dir string, cfg config.Config, active []freshness.Violation
 	// input box's placeholder.
 	question := "Choose: [a] accept all (waive)  [p] pin & reinstall  [N] abort: "
 	askpassQuestion := "Cooldown: [a] accept all  [p] pin & reinstall  [N] abort"
+	// ponytail: pin & reinstall edits package.json and runs npm; a pip pin
+	// means editing requirements.txt — accept/waive only until that lands.
+	canPin := eco != "pypi"
+	if !canPin {
+		detail = append(detail, "  (pin & reinstall is npm-only — edit the pin in requirements.txt by hand)")
+		question = "Choose: [a] accept all (waive)  [N] abort: "
+		askpassQuestion = "Cooldown: [a] accept all  [N] abort"
+	}
 
 	out, line, interactiveTTY := promptChoice(detail, question, askpassQuestion)
 	if !interactiveTTY {
 		return false, false, nil // no terminal, no askpass — caller hard-blocks
 	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
+	choice := strings.ToLower(strings.TrimSpace(line))
+	if !canPin && (choice == "p" || choice == "pin") {
+		choice = "" // not offered → abort, like any other unknown answer
+	}
+	switch choice {
 	case "a", "accept":
 		reason := "accepted " + time.Now().UTC().Format("2006-01-02") + " via guard check --confirm"
 		for _, v := range active {
@@ -2032,6 +2101,13 @@ func (s snapshot) pkgs() ([]lockfile.Pkg, int, error) {
 		return nil, 0, os.ErrNotExist
 	}
 	return lockfile.Union(sets...), skipped, nil
+}
+
+// ecosystem is the snapshot's lockfile ecosystem; "npm" when unreadable, so the
+// npm-only checks make their own call about a missing lockfile.
+func (s snapshot) ecosystem() string {
+	pkgs, _, _ := s.pkgs()
+	return lockfile.Ecosystem(pkgs)
 }
 
 // gatePkgs is the shared front door for every lockfile gate: the snapshot's
@@ -2819,6 +2895,10 @@ func cmdWhy(args []string) error {
 	if err != nil {
 		return err
 	}
+	if detectManager(dir) == "pip" {
+		fmt.Fprintln(os.Stderr, "guard why: not supported for requirements.txt (it records no dependency graph)")
+		os.Exit(2)
+	}
 	g, err := lockfile.BuildGraph(dir)
 	if os.IsNotExist(err) {
 		return fmt.Errorf("guard why needs an npm package-lock.json (pnpm/yarn dependency graphs aren't supported)")
@@ -2886,7 +2966,7 @@ func cmdSbom(args []string) error {
 	}
 	pkgs, err := lockfile.Installed(dir)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("no lockfile found (package-lock.json / pnpm-lock.yaml / yarn.lock) — nothing to bill")
+		return fmt.Errorf("no lockfile found (package-lock.json / pnpm-lock.yaml / yarn.lock / requirements.txt) — nothing to bill")
 	}
 	if err != nil {
 		return err
@@ -3516,6 +3596,7 @@ func printConfig(cfg config.Config) {
 	fmt.Printf("ignore-scripts:        %v\n", cfg.IgnoreScripts)
 	fmt.Printf("no-container-fallback: %s\n", cfg.NoContainerFallback)
 	fmt.Printf("registry:              %s\n", cfg.Registry)
+	fmt.Printf("pypi:                  %s\n", cfg.PyPI)
 	fmt.Printf("allow:                 %s\n", listOrNone(cfg.Allow))
 	fmt.Printf("internal-scopes:       %s\n", listOrNone(cfg.InternalScopes))
 	fmt.Printf("flag:                  %s\n", listOrNone(cfg.Flag))
