@@ -1,4 +1,5 @@
-// PyPI phase 1: requirements.txt is a check-only lockfile. Offline by design —
+// PyPI phase 1: requirements.txt as the lockfile for guard check (install is
+// covered by pip-install.test.mjs). Offline by design —
 // .guardrc points `pypi:` at a closed loopback port, so freshness lookups fail
 // fast and degrade to a warning (on-check-error defaults to warn). OSV sees
 // fixture names that exist nowhere: no hits online, fail-open offline.
@@ -41,6 +42,10 @@ describe('pip / requirements.txt', () => {
     expect(existsSync(join(dir, '.git', 'hooks', 'pre-commit'))).toBe(true);
     expect(existsSync(join(dir, '.git', 'hooks', 'pre-push'))).toBe(true);
     expect(existsSync(join(dir, '.npmrc'))).toBe(false);
+    // ...and status doesn't report the .npmrc nothing reads as missing.
+    const st = await guard(dir, ['status']);
+    expect(st.stdout).toContain('.guardrc');
+    expect(st.stdout).not.toContain('.npmrc');
   });
 
   it('a hashed pinned file passes guard check', async () => {
@@ -69,14 +74,5 @@ describe('pip / requirements.txt', () => {
     const res = await guard(dir, ['check', '--all', '--quiet']);
     expect(res.code).not.toBe(0);
     expect(res.stderr).toContain('conflicting');
-  });
-
-  it('guard install refuses with exit 2 and touches nothing', async () => {
-    const dir = pipProject(`depguard-fixture-alpha==1.0.0 --hash=${H1}\n`);
-    const res = await guard(dir, ['install']);
-    expect(res.code).toBe(2);
-    expect(res.stderr).toContain('pip projects are check-only');
-    expect(existsSync(join(dir, 'node_modules'))).toBe(false);
-    expect(existsSync(join(dir, 'package-lock.json'))).toBe(false);
   });
 });

@@ -275,7 +275,7 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 	// OPEN on lookup errors: an OSV outage must not break every install (the
 	// cooldown layer still stands).
 	if !isLoopbackHost(hostOf(p.cfg.Registry)) && len(survivors) > 0 {
-		if flagged, err := osvBlockingVersions(name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
+		if flagged, err := osvBlockingVersions("npm", name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
 			kept := survivors[:0]
 			for _, v := range survivors {
 				if id, bad := flagged[v]; bad {

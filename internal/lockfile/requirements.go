@@ -8,6 +8,7 @@ package lockfile
 import (
 	"errors"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -37,13 +38,15 @@ func normalizePyName(n string) string {
 
 // parseRequirements extracts exact pins from a requirements.txt. Each pinned
 // line yields a Pkg (FromRegistry, Ecosystem "pypi", Integrity = its --hash
-// values space-joined in file order). Unpinned specifiers, editables, paths,
+// values sorted and space-joined, so hash order never reads as a conflict). Unpinned specifiers, editables, paths,
 // VCS/direct URLs and -r/-c/-f lines count as skipped; pure option lines
 // (--index-url, --pre, ...) are ignored. Content that yields neither is an
 // error, mirroring altlock: an unparsed file must not look empty.
 func parseRequirements(raw []byte) ([]Pkg, int, error) {
-	// Join backslash continuations before anything else, as pip does.
-	text := strings.ReplaceAll(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\\\n", " ")
+	// Join backslash continuations before anything else, as pip does. A BOM
+	// would otherwise glue onto the first name and skip it.
+	text := strings.TrimPrefix(string(raw), "\ufeff")
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\\\n", " ")
 	var out []Pkg
 	skipped, content := 0, 0
 	for _, ln := range strings.Split(text, "\n") {
@@ -60,7 +63,8 @@ func parseRequirements(raw []byte) ([]Pkg, int, error) {
 			if !strings.HasPrefix(opt, "--") && len(opt) > 2 {
 				opt = opt[:2] // -rfile.txt
 			}
-			if reqSourceOpts[opt] {
+			// A lone --hash belongs to a requirement we failed to join to it.
+			if reqSourceOpts[opt] || opt == "--hash" {
 				skipped++
 			}
 			continue
@@ -78,6 +82,7 @@ func parseRequirements(raw []byte) ([]Pkg, int, error) {
 			skipped++
 			continue
 		}
+		sort.Strings(hashes) // order-insensitive: same hash set, same Integrity
 		out = append(out, Pkg{
 			Name:         normalizePyName(m[1]),
 			Version:      strings.ToLower(strings.TrimSpace(m[3])),

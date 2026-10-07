@@ -181,14 +181,28 @@ script or waive a finding — they don't exist until needed.
 
 A repo with a `requirements.txt` and **no** node lockfile is detected as pip.
 `guard init` writes `.guardrc` + the hooks (no `.npmrc` — nothing would read it).
-Pip support is **check-only** in this version:
+What pip gets in this version:
 
 - `guard check` (hooks, CI, `--json`, MCP) reads `requirements.txt`: OSV advisories
   in the PyPI namespace, the cooldown (publish age from PyPI's JSON API), and
   conflicting pins (same `name==version` with different `--hash` values — gates).
-- `guard install` / `guard ci` **refuse** (exit 2): run `pip install -r requirements.txt`
-  yourself, then `guard check`. No cooldown proxy, no script boxing, no provenance,
-  maintainer or license checks for pip yet; `guard why` is npm-only.
+- `guard install <pkg>` / `guard ci` run `pip install --index-url <proxy> --only-binary=:all:`
+  (`ci` adds `-r requirements.txt`) against an ephemeral PyPI index proxy that hides
+  too-fresh, OSV-blocked and typosquat versions. Needs pip ≥ 22.3 (PEP 691 JSON index;
+  older pip gets a 406). Pass pip's own flags through as usual (`--target`, `--upgrade`, …).
+- **Wheels only.** A wheel runs no code at install; an sdist runs setup.py / a PEP 517
+  backend on your machine, and sdist boxing isn't built yet. When pip can't find a
+  wheel guard says so; `--allow-sdist` permits the source build, **unboxed**, with a
+  warning. Prefer pinning a version that ships a wheel.
+- pip doesn't edit `requirements.txt` — pin what you installed (`pip freeze | grep -i <pkg>`)
+  or `guard check` won't cover it.
+- guard strips `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` from pip's environment, but an
+  `extra-index-url` in **`pip.conf`** is still consulted unfiltered (same caveat class
+  as registry flags in `.npmrc`). Remove it, or run pip with `PIP_CONFIG_FILE=/dev/null`.
+- Refused pip flags (exit 2, before anything runs): `--index-url`/`-i`, `--extra-index-url`,
+  `--find-links`/`-f`, `--no-index` — they route around the proxy; set `pypi:` instead.
+- `--no-binary` is refused unless you also pass `--allow-sdist`.
+- No provenance, maintainer or license checks for pip yet; `guard why` is npm-only.
 - **Generate the file with hashes:** `pip-compile --generate-hashes` (pip-tools). Only
   exact pins (`name==version`) are checked; ranges, `-e`, paths, VCS/URL requirements
   and `-r`/`-c` includes are counted as skipped and reported (gate under

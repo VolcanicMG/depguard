@@ -129,7 +129,8 @@ guard install lodash                # instead of npm install
 ```
 
 Python? `guard init` in a repo with a `requirements.txt` (and no node lockfile) sets up
-the policy + hooks and `guard check` vets your pins — see
+the policy + hooks, `guard install <pkg>` runs pip through the filtering index proxy
+(wheels only), and `guard check` vets your pins — see
 [Python (pip)](#python-pip--whats-covered-today).
 
 **Per-OS install steps** (the right asset for Linux/macOS/Windows, checksum
@@ -292,7 +293,9 @@ guard status                         # offline read: policy, hooks, sandbox, rec
 # ── Install · instead of npm ───────────────────────────────
 guard install <pkg>                  # protected install through the cooldown proxy
 guard ci                             # lockfile-exact install (npm ci), same protections
-                                     #   pip repo: both refuse (exit 2) — pip is check-only today
+                                     #   pip repo: pip install via the PyPI index proxy, WHEELS ONLY
+                                     #   (ci = -r requirements.txt); --allow-sdist permits source
+                                     #   builds, which run UNBOXED on this host
 
 # ── Audit ──────────────────────────────────────────────────
 guard check [--all] [--json] [--confirm] [--quiet] [--hook=pre-commit|pre-push]
@@ -363,9 +366,11 @@ attempt prompt injection. The MCP surface is **vetting-only**; state-changing ac
 
 ## Python (pip) — what's covered today
 
-**Phase 1: the check path.** `guard check` (so the hooks, CI, `--json` and the MCP
-`check_dependencies` tool) reads `requirements.txt` as the lockfile. There is no
-install-time protection for pip yet — `guard install` / `guard ci` refuse in a pip repo.
+**Phases 1–2: the check path and the install proxy.** `guard check` (so the hooks,
+CI, `--json` and the MCP `check_dependencies` tool) reads `requirements.txt` as the
+lockfile. `guard install <pkg>` / `guard ci` run pip against an ephemeral PEP 691
+index proxy that hides too-fresh, OSV-blocked and typosquat versions, with
+`--only-binary=:all:` — pip's equivalent of `--ignore-scripts`.
 
 | Layer | pip today |
 |---|---|
@@ -374,8 +379,10 @@ install-time protection for pip yet — `guard install` / `guard ci` refuse in a
 | Conflicting pins (same `name==version`, different `--hash`) | ✅ gates, not waivable |
 | Missing `--hash` | ⚠ one collapsed **warning**, never a gate — unhashed pins are pip's norm |
 | Secret-file gate, waivers, `on-check-error` | ✅ ecosystem-agnostic |
-| `guard sbom` | ✅ `pkg:pypi/…` purls + the first `--hash` |
-| Cooldown proxy, typosquat gate, script boxing, provenance, maintainer, licenses, `guard why` | ❌ npm only (skipped silently for pip) |
+| `guard sbom` | ✅ `pkg:pypi/…` purls + one `--hash` (hashes are sorted, so a reordered list is not a conflict) |
+| Install-time cooldown + OSV + name gate (index proxy) | ✅ `guard install` / `guard ci` (JSON Simple API: pip ≥ 22.3) |
+| Install-time code | ⚠ **wheels only**; sdists need `--allow-sdist` and build **unboxed** |
+| Provenance, maintainer, licenses, `guard why` | ❌ npm only (skipped silently for pip) |
 
 Only exact pins (`name==version` / `===`) are checked. Ranges, bare names, `-e`,
 paths, VCS/URL requirements and `-r`/`-c` includes are **counted as skipped** and
@@ -384,7 +391,13 @@ reported through `on-check-error` — never silently dropped. Generate the file 
 and `requirements.txt` is checked as npm only (for now). PyPI advisories
 (`PYSEC-*`) usually carry only a CVSS vector, so guard scores them through their
 `GHSA-*` alias; one with **no scored alias still blocks** (fail closed) — review
-and `guard ignore` it.
+and `guard ignore` it. pip doesn't edit `requirements.txt`: pin what `guard install`
+added (`pip freeze`) so `guard check` covers it. A `pip.conf` `extra-index-url` is
+still consulted **unfiltered** (guard strips only the `PIP_INDEX_URL` /
+`PIP_EXTRA_INDEX_URL` env vars), and the name gate's PyPI list is a small curated set.
+pip flags that would route around the proxy (`--index-url`/`-i`, `--extra-index-url`,
+`--find-links`/`-f`, `--no-index`) are refused (exit 2); so is `--no-binary` without
+`--allow-sdist`.
 
 ## Honest limits
 
@@ -439,9 +452,9 @@ others leave.
 
 Directional, not commitments — depguard is **npm-first** today. On the radar:
 
-- **More ecosystems.** PyPI (Python) **phase 1 shipped: the check path** over
-  `requirements.txt` ([details](#python-pip--whats-covered-today)); next: a PyPI cooldown
-  proxy + sdist build boxing, then following `-r` includes. After that NuGet (.NET / C#),
+- **More ecosystems.** PyPI (Python) **phases 1–2 shipped: the check path over
+  `requirements.txt` and the install-time index proxy** ([details](#python-pip--whats-covered-today));
+  next (phase 3): boxing sdist builds, then following `-r` includes. After that NuGet (.NET / C#),
   Cargo (Rust), and RubyGems. The layered model
   (cooldown, name gate, scan, box, advisory re-check) is ecosystem-agnostic; each needs
   its own registry + lockfile adapter.

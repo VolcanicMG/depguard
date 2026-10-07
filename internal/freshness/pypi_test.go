@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,89 @@ func TestPyLess(t *testing.T) {
 	for v, want := range map[string]bool{"1.2.3": true, "1.0rc1": false, "1.0.post1": false, "1.0.dev0": false, "1..0": false, "1.0+local": false} {
 		if pyStable(v) != want {
 			t.Errorf("pyStable(%q) != %v", v, want)
+		}
+	}
+}
+
+// jsonServer answers every request with body (status 200) or the given status.
+func jsonServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func pypiPkg(v string) []lockfile.Pkg {
+	return []lockfile.Pkg{{Name: "pkg", Version: v, Ecosystem: "pypi"}}
+}
+
+// A malformed upload time is ignored; the other files still date the release.
+func TestPyPIMalformedUploadTimeIgnored(t *testing.T) {
+	srv := jsonServer(t, 200, fmt.Sprintf(`{"urls":[{"upload_time_iso_8601":"yesterday-ish"},{"upload_time_iso_8601":%q}]}`, daysAgo(40)))
+	if viol, warns := Check(srv.URL, pypiPkg("1.0"), 14*24*time.Hour, nil); len(viol) != 0 || len(warns) != 0 {
+		t.Errorf("viol=%v warns=%v, want clean", viol, warns)
+	}
+	srv = jsonServer(t, 200, `{"urls":[{"upload_time_iso_8601":"garbage"}]}`)
+	if viol, _ := Check(srv.URL, pypiPkg("1.0"), time.Hour, nil); len(viol) != 1 || viol[0].Age != 0 {
+		t.Errorf("only-malformed times must read as no timestamp (fail closed): %v", viol)
+	}
+}
+
+// Exactly cooldown old is past it; one second younger is inside it.
+func TestPyPICooldownBoundary(t *testing.T) {
+	cool := 14 * 24 * time.Hour
+	for _, c := range []struct {
+		age  time.Duration
+		viol bool
+	}{{cool, false}, {cool - time.Second, true}} {
+		ts := time.Now().Add(-c.age).UTC().Format(time.RFC3339Nano)
+		srv := jsonServer(t, 200, fmt.Sprintf(`{"urls":[{"upload_time_iso_8601":%q}]}`, ts))
+		if viol, _ := Check(srv.URL, pypiPkg("1.0"), cool, nil); (len(viol) == 1) != c.viol {
+			t.Errorf("age %v: violations %v, want violation=%v", c.age, viol, c.viol)
+		}
+	}
+}
+
+// A network failure is a per-package warning naming the package, not a violation.
+func TestPyPINetworkErrorWarns(t *testing.T) {
+	srv := jsonServer(t, 200, "{}")
+	url := srv.URL
+	srv.Close()
+	viol, warns := Check(url, pypiPkg("1.0"), time.Hour, nil)
+	if len(viol) != 0 || len(warns) != 1 || !strings.HasPrefix(warns[0], "pkg@1.0:") {
+		t.Errorf("viol=%v warns=%v", viol, warns)
+	}
+}
+
+func TestLatestSafePyPIEdges(t *testing.T) {
+	f := func(d int) string { return fmt.Sprintf(`[{"upload_time_iso_8601":%q}]`, daysAgo(d)) }
+	cool := 14 * 24 * time.Hour
+	body := fmt.Sprintf(`{"releases":{"1.0":%s,"1.1+cpu":%s,"1.2.dev1":%s,"1.3a1":%s,"1.4":[],"1.5":%s,"0.9":%s}}`,
+		f(90), f(60), f(60), f(60), f(30), f(120))
+	if got, err := LatestSafe(jsonServer(t, 200, body).URL, "pypi", "pkg", cool); err != nil || got != "1.5" {
+		t.Errorf("LatestSafe = %q, %v; want 1.5 (local/dev/pre/empty skipped)", got, err)
+	}
+	if got, _ := LatestSafe(jsonServer(t, 200, body).URL, "pypi", "pkg", 100*24*time.Hour); got != "0.9" {
+		t.Errorf("highest past a 100d cooldown = %q, want 0.9 (not the newest)", got)
+	}
+	if got, err := LatestSafe(jsonServer(t, 200, fmt.Sprintf(`{"releases":{"1.0":%s}}`, f(1))).URL, "pypi", "pkg", cool); err != nil || got != "" {
+		t.Errorf("none qualify: %q, %v", got, err)
+	}
+	if _, err := LatestSafe(jsonServer(t, 500, "").URL, "pypi", "pkg", cool); err == nil {
+		t.Error("500 must error")
+	}
+	if _, err := LatestSafe(jsonServer(t, 200, "<html>").URL, "pypi", "pkg", cool); err == nil {
+		t.Error("garbage must error")
+	}
+}
+
+func TestPyLessMore(t *testing.T) {
+	for _, c := range [][2]string{{"2", "10"}, {"1.0", "1.0.1"}, {"1.9", "1.10"}, {"0.9.9", "1"}} {
+		if !pyLess(c[0], c[1]) || pyLess(c[1], c[0]) {
+			t.Errorf("want %s < %s", c[0], c[1])
 		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1390,5 +1391,139 @@ func TestGatherCheckPyPIUnhashedWarnsConflictGates(t *testing.T) {
 	}
 	if res, _ = gatherCheck(dir, cfg, true); res.OK || len(res.Conflicting) != 1 {
 		t.Fatalf("conflicting pip pin did not gate: %+v", res)
+	}
+}
+
+// pypiRecorder is a PyPI JSON-API stub: every release is 400 days old, and it
+// records which name/version pairs were asked about.
+func pypiRecorder(t *testing.T) (url string, asked func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	old := time.Now().AddDate(0, 0, -400).UTC().Format(time.RFC3339)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/pypi/"), "/json"))
+		mu.Unlock()
+		w.Write([]byte(`{"urls":[{"upload_time_iso_8601":"` + old + `"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := append([]string(nil), seen...)
+		sort.Strings(out)
+		return out
+	}
+}
+
+// pipRepo makes a git repo whose HEAD commits requirements.txt = committed.
+func pipRepo(t *testing.T, committed string) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	writeReq(t, dir, committed)
+	run("add", "requirements.txt")
+	run("commit", "-qm", "base")
+	return dir
+}
+
+func writeReq(t *testing.T, dir, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gatherCheck on pip: waivers suppress the unhashed warning, the skipped count
+// reaches Degraded, scoping follows HEAD, and npm-only layers never run.
+func TestGatherCheckPyPIDetails(t *testing.T) {
+	url, asked := pypiRecorder(t)
+	cfg := config.Defaults()
+	cfg.PyPI = url
+	cfg.Flag = []string{"new-deps", "new-maintainer", "provenance"}
+	cfg.LicenseDeny = []string{"GPL-3.0"}
+	dir := pipRepo(t, "a==1.0\n")
+	writeReq(t, dir, "a==1.0\nb==2.0\nc>=1\n")
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	if err := wf.Set("unhashed:b@2.0", "reviewed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := gatherCheck(dir, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.UnhashedWarnings, []string{"a@1.0"}) || !reflect.DeepEqual(res.Waived, []string{"unhashed:b@2.0"}) {
+		t.Errorf("unhashed=%v waived=%v", res.UnhashedWarnings, res.Waived)
+	}
+	if len(res.Degraded) != 1 || !strings.Contains(res.Degraded[0], "1 unrecognized") {
+		t.Errorf("degraded = %v, want only the skipped-entry line", res.Degraded)
+	}
+	if !res.OK || len(res.Maintainers) != 0 || len(res.Provenance) != 0 || len(res.License) != 0 {
+		t.Errorf("npm-only layers ran or gated: %+v", res)
+	}
+	if got := asked(); !reflect.DeepEqual(got, []string{"b/2.0"}) || !reflect.DeepEqual(res.NewDeps, []string{"b@2.0"}) {
+		t.Errorf("scoped run asked %v (newDeps %v), want only b/2.0", got, res.NewDeps)
+	}
+	if _, err := gatherCheck(dir, cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := asked(); !reflect.DeepEqual(got, []string{"a/1.0", "b/2.0", "b/2.0"}) {
+		t.Errorf("--all asked %v, want a and b", got)
+	}
+}
+
+// At pre-commit the cooldown judges what the INDEX adds over HEAD, not the tree.
+func TestCheckFreshnessPreCommitScopePip(t *testing.T) {
+	url, asked := pypiRecorder(t)
+	cfg := config.Defaults()
+	cfg.PyPI = url
+	dir := pipRepo(t, "a==1.0\n")
+	writeReq(t, dir, "a==1.0\nb==2.0\n")
+	if out, err := exec.Command("git", "-C", dir, "add", "requirements.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v %s", err, out)
+	}
+	writeReq(t, dir, "a==1.0\nb==2.0\nunstaged==9.9\n")
+	wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+	if err := checkFreshness(hookSnapshot(dir, "pre-commit", nil), cfg, true, false, false, wf, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := asked(); !reflect.DeepEqual(got, []string{"b/2.0"}) {
+		t.Errorf("pre-commit asked %v, want only the staged addition b/2.0", got)
+	}
+}
+
+// pip cooldown confirm: "a" waives every version; anything else aborts.
+func TestConfirmCooldownPyPIAnswers(t *testing.T) {
+	active := []freshness.Violation{{Name: "a", Version: "1.0", Age: time.Hour}, {Name: "b", Version: "2.0", Age: time.Hour}}
+	for answer, resolved := range map[string]bool{"a": true, "accept": true, "N": false, "": false, "garbage": false, "pin": false, "p": false} {
+		t.Run("answer="+answer, func(t *testing.T) {
+			t.Setenv("GIT_ASKPASS", writeAskpass(t, "echo '"+answer+"'\n"))
+			dir := t.TempDir()
+			cfg := config.Config{PyPI: noSafeVersionServer(t), Cooldown: 14 * 24 * time.Hour}
+			wf := &waivers.File{Schema: 1, Ignores: map[string]waivers.Entry{}}
+			got, interactive, err := confirmCooldown(dir, cfg, "pypi", active, wf)
+			if err != nil || !interactive || got != resolved {
+				t.Fatalf("resolved=%v interactive=%v err=%v, want resolved=%v", got, interactive, err, resolved)
+			}
+			if resolved && !reflect.DeepEqual(wf.IDs(), []string{"cooldown:a@1.0", "cooldown:b@2.0"}) {
+				t.Errorf("waivers = %v", wf.IDs())
+			}
+			if !resolved && len(wf.IDs()) != 0 {
+				t.Errorf("abort recorded waivers: %v", wf.IDs())
+			}
+		})
 	}
 }

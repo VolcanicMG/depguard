@@ -283,3 +283,43 @@ func TestPyPIKey(t *testing.T) {
 		t.Error("canonicalValue accepted plaintext pypi")
 	}
 }
+
+// pypi: follows registry's https-or-loopback rule, trims the slash so joined
+// URLs never double it, and round-trips through `guard config set`.
+func TestPyPIKeyEdges(t *testing.T) {
+	load := func(body string) (Config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, FileName), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(dir)
+	}
+	for _, ok := range []string{"http://127.0.0.1:9", "http://localhost:1", "http://[::1]:1", "https://mirror.example/pypi"} {
+		if _, err := load("pypi: " + ok + "\n"); err != nil {
+			t.Errorf("%s rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://pypi.example", "ftp://pypi.example", "http://10.0.0.1"} {
+		if _, err := load("pypi: " + bad + "\n"); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	c, err := load("pypi: https://mirror.example/pypi/\n")
+	if err != nil || strings.Contains(c.RegistryFor("pypi")+"/simple/x/", "//simple") {
+		t.Errorf("trailing slash not trimmed: %q %v", c.PyPI, err)
+	}
+
+	dir := t.TempDir()
+	if err := WriteDefault(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetValue(dir, "pypi", "https://mirror.example/"); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(dir); err != nil || c.PyPI != "https://mirror.example" || c.Registry != Defaults().Registry {
+		t.Errorf("config set pypi round-trip: %q %v", c.PyPI, err)
+	}
+	if _, err := SetValue(dir, "pypi", "http://pypi.example"); err == nil {
+		t.Error("config set accepted a plaintext pypi")
+	}
+}

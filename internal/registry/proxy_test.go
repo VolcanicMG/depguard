@@ -69,7 +69,7 @@ func TestRewriteAllowStillBypasses(t *testing.T) {
 // allowlisted name whose only version is OSV-blocked still gets it dropped.
 func TestRewriteAllowStillFiltersOSV(t *testing.T) {
 	old := osvBlockingVersions
-	osvBlockingVersions = func(string, []string, advisory.Severity) (map[string]string, error) {
+	osvBlockingVersions = func(string, string, []string, advisory.Severity) (map[string]string, error) {
 		return map[string]string{"1.0.0": "MAL-2024-0001"}, nil
 	}
 	defer func() { osvBlockingVersions = old }()
@@ -97,7 +97,7 @@ func TestRewriteAllowStillFiltersOSV(t *testing.T) {
 // name with a signature PRESENT but not verifiable is dropped.
 func TestRewriteAllowStillFiltersInvalidSignature(t *testing.T) {
 	old := osvBlockingVersions
-	osvBlockingVersions = func(string, []string, advisory.Severity) (map[string]string, error) { return nil, nil }
+	osvBlockingVersions = func(string, string, []string, advisory.Severity) (map[string]string, error) { return nil, nil }
 	defer func() { osvBlockingVersions = old }()
 
 	p := &Proxy{cfg: config.Config{Allow: []string{"@acme/*"}, Registry: "https://registry.example"}}
@@ -123,7 +123,7 @@ func TestRewriteAllowStillFiltersInvalidSignature(t *testing.T) {
 // cooldown) survives for an allowlisted name — proving the skip is real.
 func TestRewriteAllowSkipsCooldown(t *testing.T) {
 	old := osvBlockingVersions
-	osvBlockingVersions = func(string, []string, advisory.Severity) (map[string]string, error) { return nil, nil }
+	osvBlockingVersions = func(string, string, []string, advisory.Severity) (map[string]string, error) { return nil, nil }
 	defer func() { osvBlockingVersions = old }()
 
 	p := &Proxy{cfg: config.Config{Allow: []string{"@acme/*"}, Cooldown: 30 * 24 * time.Hour, Registry: "https://registry.example"}}

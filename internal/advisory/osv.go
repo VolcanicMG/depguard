@@ -119,11 +119,11 @@ var maxOSVResponse int64 = 32 << 20 // 32 MiB (var so a test can lower it)
 // CheckVersions queries OSV for several versions of ONE package and returns
 // the versions that carry at least one advisory, mapped to the first hit's id.
 // Used by the proxy to drop known-bad versions at resolve time (avoid, not
-// just recover).
-func CheckVersions(name string, versions []string) (map[string]string, error) {
+// just recover). eco is a lockfile.Pkg ecosystem ("npm" or "pypi").
+func CheckVersions(eco, name string, versions []string) (map[string]string, error) {
 	pkgs := make([]lockfile.Pkg, len(versions))
 	for i, v := range versions {
-		pkgs[i] = lockfile.Pkg{Name: name, Version: v}
+		pkgs[i] = lockfile.Pkg{Name: name, Version: v, Ecosystem: eco}
 	}
 	vulns, err := Check(pkgs)
 	if err != nil {
@@ -151,10 +151,11 @@ func CheckVersions(name string, versions []string) (map[string]string, error) {
 // Cost: one extra GET per DISTINCT id, only when there are hits. Fail-closed per
 // id: a fetch that can't score an id leaves it SevUnknown, which blocks — a flaky
 // detail fetch can only make the filter stricter, never leak a hit through.
-func BlockingVersions(name string, versions []string, threshold Severity) (map[string]string, error) {
+// eco picks the OSV namespace ("npm" or "pypi"), so the PyPI proxy shares it.
+func BlockingVersions(eco, name string, versions []string, threshold Severity) (map[string]string, error) {
 	pkgs := make([]lockfile.Pkg, len(versions))
 	for i, v := range versions {
-		pkgs[i] = lockfile.Pkg{Name: name, Version: v}
+		pkgs[i] = lockfile.Pkg{Name: name, Version: v, Ecosystem: eco}
 	}
 	vulns, err := Check(pkgs)
 	if err != nil {

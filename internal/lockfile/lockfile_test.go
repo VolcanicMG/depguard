@@ -505,3 +505,90 @@ func TestRequirementsDispatchAndDiscovery(t *testing.T) {
 		t.Fatalf("InstalledAt: %+v, %d, %v", got, skipped, err)
 	}
 }
+
+// gitRun runs one git command in dir with a fixed identity, failing the test.
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func pipKeys(t *testing.T, dir, ref string) []string {
+	t.Helper()
+	pkgs, _, err := InstalledAt(dir, ref)
+	if err != nil {
+		t.Fatalf("InstalledAt(%q): %v", ref, err)
+	}
+	var out []string
+	for _, p := range pkgs {
+		out = append(out, p.Key())
+	}
+	return out
+}
+
+// The hooks read requirements.txt from the index / a commit exactly like a
+// node lockfile: HEAD = A, index = A+C, tree = A+B.
+func TestInstalledAtRequirementsRefs(t *testing.T) {
+	dir := gitRepo(t)
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a==1.0\n")
+	gitRun(t, dir, "add", "requirements.txt")
+	gitRun(t, dir, "commit", "-qm", "one")
+	gitRun(t, dir, "commit", "-q", "--allow-empty", "-m", "two")
+	write("a==1.0\nc==3.0\n")
+	gitRun(t, dir, "add", "requirements.txt")
+	write("a==1.0\nb==2.0\n")
+
+	for ref, want := range map[string][]string{"": {"a@1.0", "b@2.0"}, ":": {"a@1.0", "c@3.0"}, "HEAD": {"a@1.0"}} {
+		if got := pipKeys(t, dir, ref); !reflect.DeepEqual(got, want) {
+			t.Errorf("InstalledAt(%q) = %v, want %v", ref, got, want)
+		}
+	}
+	// A real ref without the file is absence; a bogus ref is an ERROR, never "no deps".
+	gitRun(t, dir, "checkout", "-q", "--orphan", "empty")
+	gitRun(t, dir, "rm", "-q", "-f", "--cached", "requirements.txt")
+	gitRun(t, dir, "commit", "-q", "--allow-empty", "-m", "bare")
+	if _, _, err := InstalledAt(dir, "HEAD"); !os.IsNotExist(err) {
+		t.Errorf("ref without requirements.txt: err = %v, want ErrNotExist", err)
+	}
+	if _, _, err := InstalledAt(dir, "no-such-ref"); err == nil || os.IsNotExist(err) {
+		t.Errorf("bogus ref: err = %v, want a real error", err)
+	}
+}
+
+// A node lockfile wins over requirements.txt in a mixed repo.
+func TestNodeLockfileWinsOverRequirements(t *testing.T) {
+	for name, body := range map[string]string{
+		"package-lock.json": npmLock("left-pad"),
+		"pnpm-lock.yaml":    "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.0.0:\n    resolution: {integrity: sha512-a}\n",
+	} {
+		dir := t.TempDir()
+		for f, b := range map[string]string{name: body, "requirements.txt": "requests==2.31.0\n"} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte(b), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pkgs, _, err := InstalledAt(dir, "")
+		if err != nil || len(pkgs) != 1 || pkgs[0].Name != "left-pad" || Ecosystem(pkgs) != "npm" {
+			t.Errorf("%s + requirements.txt: %+v %v", name, pkgs, err)
+		}
+	}
+}
+
+func TestEcosystemOfUnion(t *testing.T) {
+	a := []Pkg{{Name: "x", Version: "1", Ecosystem: "pypi"}}
+	b := []Pkg{{Name: "y", Version: "2", Ecosystem: "pypi"}}
+	if u := Union(a, b); len(u) != 2 || Ecosystem(u) != "pypi" {
+		t.Errorf("Union = %+v", u)
+	}
+}

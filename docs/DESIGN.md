@@ -1,7 +1,7 @@
 # depguard — Design Absence is established only by a SUCCESSFUL listing of the index or tree (`ls-files` / `ls-tree`); a failed probe is an error, because `cat-file -e` fails identically for "no such path" and "cannot read the index".
 
 A local-first guard against supply-chain attacks in package dependencies (npm first;
-PyPI check path via `requirements.txt` since phase 1 — §12 item 2).
+PyPI check path + install-time index proxy since phases 1–2 — §12 item 2).
 Automatic, per-repo, no background process.
 
 ---
@@ -21,8 +21,9 @@ background.
  tarball ≠ source tampering            kernel / container escapes (rare)
  secrets reaching the remote (.env,
    key material) — YOUR files leaking
- PyPI (pip): check path only —
-   advisories, cooldown, pin conflicts
+ PyPI (pip): check path + index
+   proxy (wheels only; sdist builds
+   not yet boxed)
 ```
 
 **Honest stance:** no single check certifies a package "clean." depguard is
@@ -190,6 +191,19 @@ Inside, per request:
 | Name gate (typosquat / homoglyph / confusion) | metadata only | impostor + internal-scope names — fail closed |
 | Advisory / yank feed (OSV etc.) | feed lookup | already-reported malware |
 | Registry signature verify | per-version sig | present-but-invalid npm ECDSA signatures |
+
+**PyPI index proxy (pip).** Same shape for `guard install` in a pip repo: pip gets
+`--index-url` pointing at an ephemeral PEP 691 JSON Simple index that serves only
+`/simple/<name>/`. Per page it applies the name gate (a curated PyPI list —
+npm's would block `requests`), the cooldown (a version's age is its EARLIEST file's
+`upload-time`; no time → dropped, fail closed), and the OSV drop in the PyPI
+namespace, removing every file of a blocked version plus its `versions` entry.
+Unparseable filenames are dropped. Any fetch/parse error is a 500, never a
+pass-through, and non-JSON clients get 406. File URLs stay absolute: pip downloads
+artifacts from PyPI's file host directly and verifies each against the page's
+sha256, so the proxy never streams them. pip runs with `--only-binary=:all:` —
+wheels run no code at install; sdist builds would run on the host, unboxed, so they
+need an explicit `--allow-sdist`. Not covered: a `pip.conf` extra index.
 
 The static tarball scan (§6) is **not** a proxy filter — the proxy streams tarballs
 through unmodified; the scan runs later, at script-**approval** time.
@@ -1016,15 +1030,15 @@ Named here so they are choices, not oversights:
 
 1. ~~§9 fallback~~ — **resolved: warn-then-approve** (run uncontained only on explicit
    approval; CI falls back to fail unless pre-approved in `.guard-approvals`).
-2. ~~Ecosystem after npm~~ — **partially resolved (PyPI phase 1)**: `guard check`
+2. ~~Ecosystem after npm~~ — **partially resolved (PyPI phases 1–2)**: `guard check`
    reads `requirements.txt` (exact pins only; everything else counted as skipped and
    routed through `on-check-error`). Shipped: OSV in the PyPI namespace, cooldown from
    PyPI's JSON API (earliest upload per release), conflicting `--hash` pins gate,
    unhashed pins WARN (they are pip's norm — gating would fail nearly every repo),
    SBOM purls. npm-only layers (license, provenance, maintainer, `why`) are skipped,
-   not degraded. `guard install` refuses in a pip repo — guard must not imply
-   install-time protection it doesn't give. Remaining: a PyPI cooldown proxy, sdist
-   build boxing (setup.py is pip's install script), following `-r`/`-c` includes,
+   not degraded. Phase 2: `guard install` / `guard ci` run pip through the PyPI
+   index proxy (§5), wheels only. Remaining: sdist build boxing (setup.py / PEP 517
+   is pip's install script — today `--allow-sdist` runs it unboxed), following `-r`/`-c` includes,
    per-ecosystem multi-lockfile repos (today a node lockfile wins), and scoring
    CVSS vectors directly. Label-less `PYSEC-*` advisories are scored via their
    first labelled `GHSA-*` alias (alias fetches count against the severity-fetch

@@ -58,8 +58,9 @@ fails open by design, so tests pass either way).
 | File | Job |
 |---|---|
 | `helpers/registry.mjs` | `MockRegistry` — `publish(name, version, {ageDays, scripts, files})`, serves packuments + tarballs on a random port |
+| `helpers/pypi.mjs` | `MockPyPI` — `publish(name, version, {ageDays, sdist})`, serves PEP 691 JSON `/simple/<name>/` pages AND the JSON API (`/pypi/<name>/json`, `/pypi/<name>/<ver>/json`) from the same fabricated `upload-time`s, so both the install proxy and `guard check`'s cooldown run offline; file URLs point at a closed port |
 | `helpers/tar.mjs` | `packTgz(files)` — minimal USTAR+gzip encoder so fabricated tarballs need no tar dependency |
-| `helpers/run.mjs` | `makeProject(registryUrl, opts)` — temp dir with `package.json` + `.guardrc` pointed at the mock; `guard(dir, args)` — spawns the binary, resolves `{code, stdout, stderr}` |
+| `helpers/run.mjs` | `makeProject(registryUrl, opts)` — temp dir with `package.json` + `.guardrc` pointed at the mock; `guard(dir, args)` — spawns the binary, resolves `{code, stdout, stderr}` (optional 3rd arg: extra env) |
 | `globalSetup.mjs` | builds the binary once per suite run |
 
 Two deliberate harness choices:
@@ -80,7 +81,9 @@ Two deliberate harness choices:
 | `scripts.test.mjs` | 7 | `marker.txt` — the fixture's postinstall writes it, so its existence *is* "did the script run"; `.guard-approvals` content; boxed+traced run via real docker — incl. a benign script passing the syscall trace AND an exfil script convicted (output discarded, approval auto-denied); plus `guard prewarm` building the image and `guard clean [--image]` reclaiming it. Box tests auto-skip without docker |
 | `init.test.mjs` | 6 | files dropped by `guard init` (.guardrc, hooks, `.npmrc`), executable bits, no-clobber on re-run, clean failure outside git |
 | `secrets.test.mjs` | 6 | the secret-file gate: staged `.env` blocked, untracked file ignored, `*.pem` basename glob, `guard ignore secret:<path>` waiver clears it, `--json` flips `ok` to false, `guard secret-add` appends a pattern |
-| `python.test.mjs` | 5 | pip / `requirements.txt` (offline — `pypi:` points at a closed loopback port): `guard init` writes no `.npmrc`; hashed pins pass; unhashed pins warn once (collapsed) and stay `ok`; a conflicting `--hash` pair gates; `guard install` exits 2 |
+| `python.test.mjs` | 4 | pip / `requirements.txt` check path (offline — `pypi:` points at a closed loopback port): `guard init` writes no `.npmrc`; hashed pins pass; unhashed pins warn once (collapsed) and stay `ok`; a conflicting `--hash` pair gates |
+| `pip-check.test.mjs` | 7 | pip repos without pip, against `MockPyPI`'s JSON API: pre-commit cooldown judges only the staged addition and `guard ignore cooldown:` clears it; `--json` (`unhashedWarnings`, `conflicting` + `ok`); MCP `check_dependencies` on a pip dir; a mixed package-lock + requirements.txt repo is checked as npm; `guard sbom` / `--spdx` purls + SHA-256; `--extra-index-url` / `--no-binary` refused with exit 2; `guard why` exits 2 |
+| `pip-install.test.mjs` | 4 | `guard install` through real pip + the PyPI index proxy against `MockPyPI` (skipped when `pip` isn't on PATH): the too-fresh version is hidden and pip picks the old wheel; `PIP_EXTRA_INDEX_URL` is stripped; an sdist-only project gets the `--allow-sdist` hint, and the flag's unboxed warning; `--allow-sdist` unlocks `--no-binary`; a typosquat name is hidden (pip: "No matching distribution", guard: "see the hidden versions above") and `allow:` lets it through. File URLs are unfetchable, so pip always fails after resolving and nothing installs |
 
 ## Adding a test
 

@@ -110,7 +110,8 @@ func usage(w io.Writer) {
 
   guard init [--ci]               set up this repo (.guardrc, git hooks, CI gate)
   guard status                    is this repo protected? (policy, hooks, sandbox, decisions)
-  guard install [npm args...]     npm install, filtered + scripts neutralized (pip: refused, check-only)
+  guard install [npm args...]     npm install, filtered + scripts neutralized
+                                  (pip repo: pip install via the PyPI proxy, wheels only; --allow-sdist)
   guard ci                        npm ci — lockfile-exact, same protections
   guard check [--quiet] [--json] [--confirm]  re-check repo (advisories, cooldown, integrity, secret files;
                                   npm/pnpm/yarn lockfiles or pip requirements.txt)
@@ -261,7 +262,7 @@ func cmdInit(args []string) error {
 
 	fmt.Println("\nNext steps:")
 	if pip {
-		fmt.Println("  1. pip is check-only for now: 'guard check' vets requirements.txt (pin with pip-compile --generate-hashes)")
+		fmt.Println("  1. use 'guard install <pkg>' / 'guard ci' instead of pip install (wheels only; pin in requirements.txt via pip-compile --generate-hashes)")
 	} else {
 		fmt.Println("  1. use 'guard install <pkg>' instead of 'npm install <pkg>'")
 	}
@@ -298,15 +299,6 @@ func detectManager(dir string) string {
 	return "npm"
 }
 
-// refusePip stops install/ci in a pip project: phase 1 has no PyPI proxy or
-// script boxing, so guard must not pretend to protect an install. Exits 2.
-func refusePip(dir string) {
-	if detectManager(dir) == "pip" {
-		fmt.Fprintln(os.Stderr, "guard install: pip projects are check-only in this version — run `pip install -r requirements.txt` then `guard check`")
-		os.Exit(2)
-	}
-}
-
 // installInvocation is how to run a protected install for one package manager:
 // the binary, its args, and the registry-override env vars to append. Returned
 // (not executed) by buildInstall so command construction is unit-testable
@@ -321,7 +313,8 @@ type installInvocation struct {
 // ephemeral proxy. sub is "install" or "ci". "ci" maps to each manager's
 // frozen-lockfile install (npm has a real `ci` subcommand; pnpm/yarn take
 // `install --frozen-lockfile`). ignoreScripts adds --ignore-scripts, honored by
-// all three.
+// all three. For "pip", proxyURL is the Simple index, ignoreScripts becomes
+// --only-binary=:all: and "ci" installs -r requirements.txt.
 func buildInstall(mgr, sub string, userArgs []string, proxyURL string, ignoreScripts bool) installInvocation {
 	// Registry env covers managers that read it over their rc file: npm + pnpm
 	// honor npm_config_registry; yarn berry honors YARN_NPM_REGISTRY_SERVER and
@@ -338,6 +331,17 @@ func buildInstall(mgr, sub string, userArgs []string, proxyURL string, ignoreScr
 		return args
 	}
 	switch mgr {
+	case "pip":
+		// --only-binary=:all: is pip's --ignore-scripts: no sdist build runs.
+		// No env: pipEnv strips the index vars instead of overriding them.
+		args := []string{"install", "--index-url", proxyURL}
+		if ignoreScripts {
+			args = append(args, "--only-binary=:all:")
+		}
+		if sub == "ci" {
+			args = append(args, "-r", "requirements.txt")
+		}
+		return installInvocation{"pip", append(args, userArgs...), nil}
 	case "pnpm":
 		args := frozenArgs(sub, userArgs)
 		args = append(args, "--registry="+proxyURL) // pnpm accepts the flag too
@@ -372,7 +376,6 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	if err != nil {
 		return err
 	}
-	refusePip(dir)
 	cfg, err := config.Load(dir)
 	if err != nil {
 		return err
@@ -388,6 +391,9 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	// lifecycle-script approval flow (§7–§8) stays npm-only — see the note after
 	// the install.
 	mgr := detectManager(dir)
+	if mgr == "pip" {
+		return installPip(dir, cfg, npmCmd, npmArgs)
+	}
 
 	// 1. Ephemeral proxy: exists only for this command (§5).
 	proxy, err := registry.Start(cfg)
@@ -409,29 +415,7 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 
 	// 3. Tell the human what the filter hid and why — even when npm failed,
 	// because "all versions in cooldown" IS the explanation for the failure.
-	if blocked := proxy.BlockedVersions(); len(blocked) > 0 {
-		fmt.Fprintf(os.Stderr, "\nguard: filtered %d version(s):\n", len(blocked))
-		byPkg := map[string][]registry.Blocked{}
-		for _, b := range blocked {
-			byPkg[b.Package] = append(byPkg[b.Package], b)
-		}
-		names := make([]string, 0, len(byPkg))
-		for n := range byPkg {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		for _, n := range names {
-			bs := byPkg[n]
-			// One line per package, not per version — npm fetches metadata
-			// for the whole tree and this list gets long. Report the DOMINANT
-			// reason, not an arbitrary first entry: a package's versions are
-			// usually hidden for one reason (a wide advisory range, or "all in
-			// cooldown"), and blaming the wrong one misleads diagnosis.
-			ex := dominantBlocked(bs)
-			fmt.Fprintf(os.Stderr, "  %-30s %d version(s), e.g. %s (%s)\n",
-				n, len(bs), ex.Version, ex.Reason)
-		}
-	}
+	reportBlocked(proxy.BlockedVersions())
 	// Deprecated default-resolutions (informational, not a failure).
 	if dep := proxy.DeprecatedVersions(); len(dep) > 0 {
 		fmt.Fprintf(os.Stderr, "\nguard: %d package(s) resolve to a DEPRECATED version:\n", len(dep))
@@ -481,6 +465,186 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	}
 
 	return nil
+}
+
+// reportBlocked prints what the proxy hid, one line per package.
+func reportBlocked(blocked []registry.Blocked) {
+	if len(blocked) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nguard: filtered %d version(s):\n", len(blocked))
+	byPkg := map[string][]registry.Blocked{}
+	for _, b := range blocked {
+		byPkg[b.Package] = append(byPkg[b.Package], b)
+	}
+	names := make([]string, 0, len(byPkg))
+	for n := range byPkg {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		bs := byPkg[n]
+		// One line per package, not per version — the manager fetches metadata
+		// for the whole tree and this list gets long. Report the DOMINANT
+		// reason, not an arbitrary first entry: a package's versions are
+		// usually hidden for one reason (a wide advisory range, or "all in
+		// cooldown"), and blaming the wrong one misleads diagnosis.
+		ex := dominantBlocked(bs)
+		fmt.Fprintf(os.Stderr, "  %-30s %d version(s), e.g. %s (%s)\n",
+			n, len(bs), ex.Version, ex.Reason)
+	}
+}
+
+// installPip is cmdInstall for a pip project: pip resolves through the PyPI
+// index proxy (§5) with --only-binary=:all: — wheels run no code at install,
+// sdists run setup.py / a PEP 517 backend on the host, and sdist boxing is not
+// built yet. --allow-sdist opts into unboxed source builds. The lockfile gates
+// then run over requirements.txt like any check.
+func installPip(dir string, cfg config.Config, sub string, userArgs []string) error {
+	args, allowSdist := splitAllowSdist(userArgs)
+	onlyBinary := cfg.IgnoreScripts && !allowSdist
+	if err := pipArgBlocker(args, !onlyBinary); err != nil {
+		fmt.Fprintln(os.Stderr, "guard install:", err)
+		os.Exit(2)
+	}
+	if !onlyBinary {
+		fmt.Fprintf(os.Stderr, "guard: %s source distributions allowed — sdist builds run setup.py / PEP 517 backends on this host, UNBOXED\n", ui.Warn())
+	}
+	proxy, err := registry.StartPyPI(cfg)
+	if err != nil {
+		return fmt.Errorf("start proxy: %w", err)
+	}
+	defer proxy.Stop()
+
+	inv := buildInstall("pip", sub, args, proxy.URL(), onlyBinary)
+	tail := &tailBuffer{max: 64 << 10}
+	pm := exec.Command(inv.name, inv.args...)
+	pm.Stdout, pm.Stderr, pm.Stdin = io.MultiWriter(os.Stdout, tail), io.MultiWriter(os.Stderr, tail), os.Stdin
+	pm.Env = pipEnv(os.Environ())
+	pipErr := pm.Run()
+
+	reportBlocked(proxy.BlockedVersions())
+	if pipErr != nil {
+		if hint := pipFailHint(string(tail.b), onlyBinary, len(proxy.BlockedVersions())); hint != "" {
+			fmt.Fprintln(os.Stderr, "guard:", hint)
+		}
+		var ee *exec.ExitError
+		if errors.As(pipErr, &ee) {
+			os.Exit(ee.ExitCode())
+		}
+		return fmt.Errorf("pip %s failed: %w", sub, pipErr)
+	}
+
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+	if err := installGates(dir, cfg, wf); err != nil {
+		return err
+	}
+	if sub == "install" {
+		if pkgs := pipPackageArgs(args); len(pkgs) > 0 {
+			fmt.Fprintf(os.Stderr, "guard: pin it in requirements.txt (pip freeze | grep -i %s) so guard check covers it\n", pkgs[0])
+		}
+	}
+	return nil
+}
+
+// splitAllowSdist removes guard's own --allow-sdist flag so it never reaches pip.
+func splitAllowSdist(userArgs []string) (args []string, allow bool) {
+	for _, a := range userArgs {
+		if a == "--allow-sdist" {
+			allow = true
+			continue
+		}
+		args = append(args, a)
+	}
+	return args, allow
+}
+
+// pipArgBlocker refuses user pip flags that would route around the proxy (pip
+// honors the LAST --index-url and adds every extra index unfiltered) or, without
+// sdistOK, re-enable source builds. Checked before the proxy starts.
+func pipArgBlocker(args []string, sdistOK bool) error {
+	bypass := map[string]bool{"--index-url": true, "--extra-index-url": true, "--find-links": true, "--no-index": true}
+	for i, a := range args {
+		opt, val, hasVal := strings.Cut(a, "=")
+		if !hasVal && i+1 < len(args) {
+			val = args[i+1]
+		}
+		if !strings.HasPrefix(opt, "--") && (strings.HasPrefix(opt, "-i") || strings.HasPrefix(opt, "-f")) {
+			opt = opt[:2] // -iURL / -fURL
+		}
+		switch {
+		case bypass[opt] || opt == "-i" || opt == "-f":
+			return fmt.Errorf("%s bypasses the guard proxy; set `pypi:` in .guardrc instead", opt)
+		case opt == "--no-binary" && !sdistOK:
+			return errors.New("--no-binary re-enables source builds; pass --allow-sdist to accept unboxed sdist builds")
+		case opt == "--only-binary" && strings.Contains(val, ":none:") && !sdistOK:
+			// :none: clears guard's own --only-binary=:all:.
+			return errors.New("--only-binary=:none: re-enables source builds; pass --allow-sdist to accept unboxed sdist builds")
+		}
+	}
+	return nil
+}
+
+// pipFailHint explains a failed wheels-only pip run. When the proxy hid
+// versions, those are the likelier cause than a missing wheel, so it points
+// there instead of suggesting --allow-sdist. "" = nothing to add.
+func pipFailHint(out string, onlyBinary bool, blocked int) string {
+	if !onlyBinary || !(strings.Contains(out, "only-binary") || strings.Contains(out, "No matching distribution")) {
+		return ""
+	}
+	if blocked > 0 {
+		return "pip found no installable version — see the hidden versions above"
+	}
+	return "pip needs to build a source distribution for this (sdist builds are not boxed yet); rerun with --allow-sdist to build it unboxed, or pin a version that ships a wheel"
+}
+
+// pipEnv drops env that would add or swap pip's index behind the proxy's back.
+// A pip.conf extra-index-url is NOT covered (documented, like .npmrc flags).
+func pipEnv(env []string) []string {
+	var out []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "PIP_INDEX_URL=") || strings.HasPrefix(e, "PIP_EXTRA_INDEX_URL=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// pipPackageArgs returns the requirement arguments of a `pip install` argv,
+// skipping flags and the values of the common value-taking options.
+func pipPackageArgs(args []string) []string {
+	takesValue := map[string]bool{"-r": true, "--requirement": true, "-c": true, "--constraint": true,
+		"-t": true, "--target": true, "-i": true, "--index-url": true, "--extra-index-url": true,
+		"-f": true, "--find-links": true, "--prefix": true, "--root": true, "-e": true, "--editable": true}
+	var out []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case takesValue[args[i]]:
+			i++
+		case !strings.HasPrefix(args[i], "-"):
+			out = append(out, args[i])
+		}
+	}
+	return out
+}
+
+// tailBuffer keeps the last max bytes written — enough of pip's output to spot
+// why it failed without holding a whole verbose log.
+type tailBuffer struct {
+	b   []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if len(t.b) > t.max {
+		t.b = t.b[len(t.b)-t.max:]
+	}
+	return len(p), nil
 }
 
 // installGates runs the lockfile gates `guard install` applies to the freshly
@@ -3283,7 +3447,9 @@ func cmdStatus(args []string) error {
 	// Files
 	fmt.Println("\n" + ui.Bold("protection files"))
 	row(".guardrc", fileState(config.FileName))
-	row(".npmrc", npmrcState(dir))
+	if detectManager(dir) != "pip" {
+		row(".npmrc", npmrcState(dir)) // nothing reads .npmrc in a pip repo
+	}
 	row(".guard-approvals", fileState(approvals.FileName))
 	row(".guard-ignores", fileState(waivers.FileName))
 

@@ -35,14 +35,15 @@ export function makeProject(registryUrl, { cooldown = '14d', allow, git = false 
  * exercising the non-interactive paths the same way CI would.
  * @param {string} dir - project directory
  * @param {string[]} args - guard CLI args
+ * @param {Record<string,string>} [env] - extra env for this run (merged over process.env)
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
-export function guard(dir, args) {
+export function guard(dir, args, env = {}) {
   return new Promise((resolve) => {
     execFile(
       GUARD,
       args,
-      { cwd: dir, timeout: 120_000, env: process.env },
+      { cwd: dir, timeout: 120_000, env: { ...process.env, ...env } },
       (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stdout, stderr }),
     );
   });

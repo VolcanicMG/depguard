@@ -43,12 +43,42 @@ var known = map[string]bool{
 	"preact": true, // one insert from "react"
 }
 
-// Suspicion reports whether a package name looks like a typosquat or homoglyph
-// attack, returning a human-readable reason when it does. Exact matches to a
-// popular name (the real package) and entries on the known-good list are never
-// flagged. Callers treat a true result as fail-closed: block the name and tell
-// the human how to clear it if it was intentional.
+// pypiPopular is popular's PyPI twin, matched against PEP 503-normalized names.
+// The npm list can't be reused: "requests" is one edit from npm's "request".
+// Short names are left out on purpose — every 3-4 letter PyPI name has real
+// one-edit neighbours.
+var pypiPopular = map[string]bool{
+	"boto3": true, "certifi": true, "cryptography": true, "django": true,
+	"flask": true, "jinja2": true, "matplotlib": true, "numpy": true,
+	"pandas": true, "pydantic": true, "pytest": true, "pyyaml": true,
+	"requests": true, "scipy": true, "setuptools": true, "urllib3": true,
+}
+
+// pypiKnown clears real PyPI packages one edit from a pypiPopular name.
+var pypiKnown = map[string]bool{
+	"boto":  true, // boto3's predecessor
+	"jinja": true, // one delete from jinja2
+	"panda": true, // one delete from pandas
+	"pyaml": true, // one delete from pyyaml
+	"scapy": true, // one substitution from scipy
+}
+
+// Suspicion reports whether an npm package name looks like a typosquat or
+// homoglyph attack, returning a human-readable reason when it does. Exact
+// matches to a popular name (the real package) and entries on the known-good
+// list are never flagged. Callers treat a true result as fail-closed: block the
+// name and tell the human how to clear it if it was intentional.
 func Suspicion(name string) (reason string, suspicious bool) {
+	return suspicion(name, popular, known)
+}
+
+// SuspicionPyPI is Suspicion against the PyPI popular list (name already PEP
+// 503-normalized). The homoglyph rule is the same.
+func SuspicionPyPI(name string) (reason string, suspicious bool) {
+	return suspicion(name, pypiPopular, pypiKnown)
+}
+
+func suspicion(name string, popular, known map[string]bool) (reason string, suspicious bool) {
 	if name == "" {
 		return "", false
 	}

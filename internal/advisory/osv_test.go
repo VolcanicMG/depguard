@@ -1,9 +1,12 @@
 package advisory
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"depguard/internal/lockfile"
@@ -272,7 +275,7 @@ func TestBlockingVersionsTiersBySeverity(t *testing.T) {
 	defer func() { osvBatchURL, osvVulnURL = ob, ov }()
 
 	// Default HIGH threshold: moderate does NOT gate; clean is absent.
-	got, err := BlockingVersions("pkg", versions, SevHigh)
+	got, err := BlockingVersions("npm", "pkg", versions, SevHigh)
 	if err != nil {
 		t.Fatalf("BlockingVersions: %v", err)
 	}
@@ -288,7 +291,7 @@ func TestBlockingVersionsTiersBySeverity(t *testing.T) {
 	}
 
 	// Lowering the threshold to MODERATE pulls the moderate hit into blocking.
-	got, err = BlockingVersions("pkg", versions, SevModerate)
+	got, err = BlockingVersions("npm", "pkg", versions, SevModerate)
 	if err != nil {
 		t.Fatalf("BlockingVersions (moderate): %v", err)
 	}
@@ -383,5 +386,97 @@ func TestSeveritiesAliasRespectsCap(t *testing.T) {
 	got := Severities([]string{"PYSEC-1", "GHSA-other"})
 	if hits != 1 || len(got) != 0 {
 		t.Errorf("hits=%d got=%v, want 1 fetch and nothing scored", hits, got)
+	}
+}
+
+// batchRecorder is an OSV querybatch stub that records every posted query and
+// answers with no hits.
+func batchRecorder(t *testing.T) (*[][2]string, func()) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen [][2]string // {ecosystem, name@version}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Queries []struct {
+				Package struct{ Name, Ecosystem string }
+				Version string
+			}
+		}
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		mu.Lock()
+		for _, q := range body.Queries {
+			seen = append(seen, [2]string{q.Package.Ecosystem, q.Package.Name + "@" + q.Version})
+		}
+		mu.Unlock()
+		w.Write([]byte(`{"results":[` + strings.TrimSuffix(strings.Repeat(`{},`, len(body.Queries)), ",") + `]}`))
+	}))
+	old := osvBatchURL
+	osvBatchURL = srv.URL
+	return &seen, func() { osvBatchURL = old; srv.Close() }
+}
+
+// Each query carries its own package's ecosystem, even in one mixed batch.
+func TestCheckPostsPerPackageEcosystem(t *testing.T) {
+	seen, done := batchRecorder(t)
+	defer done()
+	if _, err := Check([]lockfile.Pkg{
+		{Name: "foo-bar", Version: "1.0", Ecosystem: "pypi"},
+		{Name: "lodash", Version: "4.17.21"},
+		{Name: "requests", Version: "2.31.0", Ecosystem: "pypi"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := [][2]string{{"PyPI", "foo-bar@1.0"}, {"npm", "lodash@4.17.21"}, {"PyPI", "requests@2.31.0"}}
+	if !reflect.DeepEqual(*seen, want) {
+		t.Errorf("posted %v, want %v", *seen, want)
+	}
+}
+
+// The single-package lookups the proxies use post the requested namespace.
+func TestVersionLookupsPostEcosystem(t *testing.T) {
+	for eco, want := range map[string]string{"pypi": "PyPI", "npm": "npm"} {
+		seen, done := batchRecorder(t)
+		if _, err := CheckVersions(eco, "pkg", []string{"1.0"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := BlockingVersions(eco, "pkg", []string{"2.0"}, SevHigh); err != nil {
+			t.Fatal(err)
+		}
+		done()
+		if len(*seen) != 2 || (*seen)[0][0] != want || (*seen)[1][0] != want {
+			t.Errorf("%s: posted %v, want ecosystem %s", eco, *seen, want)
+		}
+	}
+}
+
+// Alias edge cases: a CVE-only alias list scores nothing; the first GHSA alias
+// that SCORES wins even if an earlier one has no label; MAL-* still blocks.
+func TestSeveritiesAliasEdges(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case "PYSEC-cve":
+			w.Write([]byte(`{"aliases":["CVE-1"]}`))
+		case "PYSEC-two":
+			w.Write([]byte(`{"aliases":["GHSA-unlabelled","GHSA-high"]}`))
+		case "GHSA-high":
+			w.Write([]byte(`{"database_specific":{"severity":"HIGH"}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	old := osvVulnURL
+	osvVulnURL = srv.URL + "/"
+	defer func() { osvVulnURL = old }()
+
+	got := Severities([]string{"PYSEC-cve", "PYSEC-two"})
+	if _, ok := got["PYSEC-cve"]; ok {
+		t.Error("CVE-only aliases must leave the id absent")
+	}
+	if got["PYSEC-two"] != SevHigh {
+		t.Errorf("second GHSA alias should score: %v", got)
+	}
+	if !(Vuln{ID: "MAL-2026-1"}).Blocks(SevCritical) {
+		t.Error("an unlabelled MAL-* must block")
 	}
 }

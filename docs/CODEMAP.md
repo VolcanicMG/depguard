@@ -22,6 +22,10 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── approvals/approvals.go  .guard-approvals: ask-once script decisions
  │   ├── waivers/waivers.go      .guard-ignores: reviewed-finding waivers (suppress check gates)
  │   ├── ui/ui.go                tiny NO_COLOR-aware ANSI color helper (status + check glyphs)
+ │   ├── registry/pypi.go        PyPI twin: PEP 691 JSON /simple/<name>/ filter
+ │                               (SuspicionPyPI name gate → cooldown by earliest
+ │                               upload-time → OSV "pypi"); JSON only (406), fail
+ │                               closed (500); artifacts never proxied
  │   ├── registry/proxy.go       ephemeral filtering proxy (cooldown + typosquat +
  │   │                           OSV + signature + dependency-confusion gates)
  │   ├── scanner/scanner.go      static scan: scripts + capability + LLM-injection
@@ -79,9 +83,10 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   └── run.mjs                 narrates guard handling each, asserts outcomes
  └── test/                       vitest black-box e2e suite (runs the real binary)
      ├── helpers/registry.mjs    mock npm registry w/ fabricated publish ages
+     ├── helpers/pypi.mjs        mock PyPI (PEP 691 index + JSON API) w/ fabricated upload ages
      ├── helpers/tar.mjs         hand-rolled USTAR+gzip (zero test deps)
      ├── helpers/run.mjs         temp projects + binary spawner
-     └── *.test.mjs              cooldown / additions / scripts / init / secrets / python suites
+     └── *.test.mjs              cooldown / additions / scripts / init / secrets / python / pip-check / pip-install suites
 ```
 
 ## Flow: `guard install` (and `guard ci`)
@@ -92,6 +97,10 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    ├─ config.Load ──────────── .guardrc (validates registry is https/loopback)
    ├─ approvals.Load ───────── .guard-approvals
    │
+   ├─ mgr == "pip" → installPip: registry.StartPyPI → pip install --index-url
+   │     <proxy>/simple/ --only-binary=:all: (dropped by --allow-sdist, with a
+   │     warning) → reportBlocked → installGates over requirements.txt; pipEnv
+   │     strips PIP_INDEX_URL/PIP_EXTRA_INDEX_URL; no script approval (npm-only)
    ├─ registry.Start ───────── proxy on 127.0.0.1:random, THIS command only
    │     └─ servePackument → rewrite():  allowlist bypass → typosquat/homoglyph
    │                          NAME gate (empties versions, fail closed) →
@@ -222,7 +231,7 @@ the shared history.
 | Change | Touch |
 |---|---|
 | New version-filter rule | `registry/proxy.go` `rewrite()` — add a filter, keep fail-closed |
-| Typosquat list / distance rule | `typosquat/typosquat.go` (`popular`, `known`, `Suspicion`) |
+| Typosquat list / distance rule | `typosquat/typosquat.go` (`popular`, `known`, `Suspicion`; PyPI: `pypiPopular`, `pypiKnown`, `SuspicionPyPI`) |
 | New static-scan capability signal | `scanner/scanner.go` `capabilityPatterns` table |
 | New LLM-injection signal | `scanner/scanner.go` `injectionPatterns` / `isBidiControl` / `isZeroWidth` |
 | New MCP tool | `mcp.go` `toolDefs()` + `callTool()` — keep the untrusted-data banner |
@@ -233,7 +242,7 @@ the shared history.
 | SBOM output (CycloneDX / SPDX) | `sbom/sbom.go`; `main.go` `cmdSBOM` |
 | `guard why` dependency graph | `lockfile/graph.go` (`BuildGraph` / `Paths`); `main.go` `cmdWhy` |
 | Another lockfile format | `lockfile/altlock.go` + dispatch in `lockfile.go` `parseNamed`; set `Pkg.FromRegistry` if the format omits tarball URLs, `Pkg.Ecosystem` if it isn't npm |
-| pip / requirements.txt behavior | parser `lockfile/requirements.go`; PyPI lookups `freshness.go` (`pypiPublishTime`/`pypiLatestSafe`); `config.RegistryFor`; `main.go` `detectManager` ("pip"), `refusePip` (install/ci exit 2), ecosystem gates in `cmdCheck`/`gatherCheck`/`installGates`/`checkLockfileIntegrity` |
+| pip / requirements.txt behavior | parser `lockfile/requirements.go`; PyPI lookups `freshness.go` (`pypiPublishTime`/`pypiLatestSafe`); `config.RegistryFor`; install filter `registry/pypi.go`; `main.go` `detectManager` ("pip"), `installPip` / `buildInstall("pip")` / `pipEnv`, ecosystem gates in `cmdCheck`/`gatherCheck`/`installGates`/`checkLockfileIntegrity` |
 | Lockfile-integrity gate scope | `main.go` `checkableDep` / `hasTarballURL` — used by BOTH `gatherCheck` and `checkLockfileIntegrity` |
 | New `.guardrc` key | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | Secret-file gate behavior | `secrets/secrets.go` (`Find` / `matchAny` / `gitFiles`); wired in `main.go` `checkSecrets` + `gatherCheck` |
