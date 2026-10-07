@@ -1,7 +1,7 @@
 # depguard — Design Absence is established only by a SUCCESSFUL listing of the index or tree (`ls-files` / `ls-tree`); a failed probe is an error, because `cat-file -e` fails identically for "no such path" and "cannot read the index".
 
 A local-first guard against supply-chain attacks in package dependencies (npm first;
-PyPI check path + install-time index proxy since phases 1–2 — §12 item 2).
+PyPI check path, install-time index proxy and boxed sdist trial builds since phases 1–3 — §12 item 2).
 Automatic, per-repo, no background process.
 
 ---
@@ -21,9 +21,9 @@ background.
  tarball ≠ source tampering            kernel / container escapes (rare)
  secrets reaching the remote (.env,
    key material) — YOUR files leaking
- PyPI (pip): check path + index
-   proxy (wheels only; sdist builds
-   not yet boxed)
+ PyPI (pip): check path, index
+   proxy, sdists trial-built in the
+   box before pip builds them
 ```
 
 **Honest stance:** no single check certifies a package "clean." depguard is
@@ -202,8 +202,8 @@ Unparseable filenames are dropped. Any fetch/parse error is a 500, never a
 pass-through, and non-JSON clients get 406. File URLs stay absolute: pip downloads
 artifacts from PyPI's file host directly and verifies each against the page's
 sha256, so the proxy never streams them. pip runs with `--only-binary=:all:` —
-wheels run no code at install; sdist builds would run on the host, unboxed, so they
-need an explicit `--allow-sdist`. Not covered: a `pip.conf` extra index.
+wheels run no code at install; sdists need `--allow-sdist` and go through the §8
+trial build first. Not covered: a `pip.conf` extra index.
 
 The static tarball scan (§6) is **not** a proxy filter — the proxy streams tarballs
 through unmodified; the scan runs later, at script-**approval** time.
@@ -421,6 +421,49 @@ silently moving on. The verdict is reusable (cached by hash, shareable).
 
 **Static + dynamic together** closes the obfuscation gap: you can hide from a code
 reader, but you can't hide the `connect()` to your server when we watch syscalls.
+
+### pip source distributions — the trial build
+
+An sdist's `setup.py` / PEP 517 backend is pip's install script, and pip has no
+"download without executing" for one (resolution itself runs the metadata hooks).
+So with `--allow-sdist` **pip never touches an sdist guard hasn't admitted**:
+
+```
+ pip download --only-binary=:all:  ── fails: "no matching distribution for X<2"
+   │
+ guard: page via its OWN proxy (cooldown/OSV/name gate apply) → highest stable
+        .tar.gz satisfying the specifier → fetch, sha256-verified vs the page
+   → static scan (Python set, .pth, build facts) → approval (ask once, bound to
+     the sdist's sha256; no tty ⇒ nothing recorded, exit naming `guard approve`)
+   → build requirements fetched as WHEELS only (executes nothing)
+   → TRIAL BUILD in the box: `pip wheel --no-index` from a read-only stash,
+     net=none, everything writable on tmpfs, strace — the wheel is thrown away
+   │       unsafe ⇒ approval flipped to denied · unobserved/failed ⇒ refused
+   ▼ clean
+ pip download --no-binary X ... → pip install --no-index --find-links <stash>
+                                  (pip builds X on the HOST, for real)
+```
+
+- **The verdict, not the artifact.** The box output is discarded, so the box's
+  python never has to match your venv. The price is a **double build**: the host
+  build is a second execution of code already observed once.
+- **What the verdict proves:** during one build, under the box's conditions, the
+  code made no network attempt and read no credential path (§8 trace rules). It
+  does **not** prove the host build behaves the same: code can branch on its
+  environment (no network → stay quiet; a real `$HOME` → act). That gap is the same
+  one npm scripts have, narrowed by the static scan and by every sdist needing an
+  explicit, hash-bound approval. Uncontained approval (`--uncontained`, policy
+  permitting — §9) skips the trial build entirely, as for npm.
+- **Build requirements are untrusted input**: they come from the sdist's own
+  pyproject and become pip argv, so each must be a plain PEP 508 requirement (no
+  option, URL, path or `name @ url`) or the sdist is refused before pip sees them.
+- **pip builds exactly what was observed.** guard picks the version the way pip
+  would (incl. `requires-python` against the host interpreter; unevaluable → skipped),
+  then pins it in a guard-owned constraints file passed to every pip call, and before
+  the host install re-verifies the stash: every sdist in it must have an approval for
+  exactly its sha256, or nothing is installed.
+- Only `.tar.gz` sdists (PEP 625) are handled; specifiers guard can't evaluate
+  (pre-releases, `===`) ask you to pin.
 
 ---
 
@@ -1030,15 +1073,16 @@ Named here so they are choices, not oversights:
 
 1. ~~§9 fallback~~ — **resolved: warn-then-approve** (run uncontained only on explicit
    approval; CI falls back to fail unless pre-approved in `.guard-approvals`).
-2. ~~Ecosystem after npm~~ — **partially resolved (PyPI phases 1–2)**: `guard check`
+2. ~~Ecosystem after npm~~ — **partially resolved (PyPI phases 1–3)**: `guard check`
    reads `requirements.txt` (exact pins only; everything else counted as skipped and
    routed through `on-check-error`). Shipped: OSV in the PyPI namespace, cooldown from
    PyPI's JSON API (earliest upload per release), conflicting `--hash` pins gate,
    unhashed pins WARN (they are pip's norm — gating would fail nearly every repo),
    SBOM purls. npm-only layers (license, provenance, maintainer, `why`) are skipped,
    not degraded. Phase 2: `guard install` / `guard ci` run pip through the PyPI
-   index proxy (§5), wheels only. Remaining: sdist build boxing (setup.py / PEP 517
-   is pip's install script — today `--allow-sdist` runs it unboxed), following `-r`/`-c` includes,
+   index proxy (§5), wheels only; phase 3: `--allow-sdist` admits sdists one by one
+   through scan → approval → boxed trial build (§8). Remaining: attestations for
+   PyPI (PEP 740), uv/poetry lockfiles, following `-r`/`-c` includes,
    per-ecosystem multi-lockfile repos (today a node lockfile wins), and scoring
    CVSS vectors directly. Label-less `PYSEC-*` advisories are scored via their
    first labelled `GHSA-*` alias (alias fetches count against the severity-fetch

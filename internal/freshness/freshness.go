@@ -14,12 +14,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"depguard/internal/lockfile"
+	"depguard/internal/pyver"
 	"depguard/internal/semver"
 )
 
@@ -233,41 +232,12 @@ func pypiLatestSafe(client *http.Client, base, name string, cooldown time.Durati
 	best := ""
 	for v, files := range doc.Releases {
 		t := earliestUpload(files)
-		if !pyStable(v) || t.IsZero() || t.After(cutoff) {
+		if !pyver.Stable(v) || t.IsZero() || t.After(cutoff) {
 			continue
 		}
-		if best == "" || pyLess(best, v) {
+		if best == "" || pyver.Less(best, v) {
 			best = v
 		}
 	}
 	return best, nil
-}
-
-// pyStable reports a plain release version: dot-separated digit runs only.
-func pyStable(v string) bool {
-	for _, part := range strings.Split(v, ".") {
-		if part == "" || strings.Trim(part, "0123456789") != "" {
-			return false
-		}
-	}
-	return true
-}
-
-// pyLess compares two pyStable versions numerically, missing parts as 0
-// (PEP 440: 1.0 == 1.0.0).
-func pyLess(a, b string) bool {
-	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
-	for i := 0; i < max(len(pa), len(pb)); i++ {
-		var x, y int
-		if i < len(pa) {
-			x, _ = strconv.Atoi(pa[i])
-		}
-		if i < len(pb) {
-			y, _ = strconv.Atoi(pb[i])
-		}
-		if x != y {
-			return x < y
-		}
-	}
-	return false
 }

@@ -70,23 +70,6 @@ func TestLatestSafePyPI(t *testing.T) {
 	}
 }
 
-func TestPyLess(t *testing.T) {
-	cases := []struct {
-		a, b string
-		less bool
-	}{{"1.9", "1.10", true}, {"1.0", "1.0.0", false}, {"1.0.0", "1.0", false}, {"2", "1.99", false}}
-	for _, c := range cases {
-		if pyLess(c.a, c.b) != c.less {
-			t.Errorf("pyLess(%s,%s) != %v", c.a, c.b, c.less)
-		}
-	}
-	for v, want := range map[string]bool{"1.2.3": true, "1.0rc1": false, "1.0.post1": false, "1.0.dev0": false, "1..0": false, "1.0+local": false} {
-		if pyStable(v) != want {
-			t.Errorf("pyStable(%q) != %v", v, want)
-		}
-	}
-}
-
 // jsonServer answers every request with body (status 200) or the given status.
 func jsonServer(t *testing.T, status int, body string) *httptest.Server {
 	t.Helper()
@@ -159,13 +142,5 @@ func TestLatestSafePyPIEdges(t *testing.T) {
 	}
 	if _, err := LatestSafe(jsonServer(t, 200, "<html>").URL, "pypi", "pkg", cool); err == nil {
 		t.Error("garbage must error")
-	}
-}
-
-func TestPyLessMore(t *testing.T) {
-	for _, c := range [][2]string{{"2", "10"}, {"1.0", "1.0.1"}, {"1.9", "1.10"}, {"0.9.9", "1"}} {
-		if !pyLess(c[0], c[1]) || pyLess(c[1], c[0]) {
-			t.Errorf("want %s < %s", c[0], c[1])
-		}
 	}
 }

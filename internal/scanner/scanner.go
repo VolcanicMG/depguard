@@ -104,6 +104,35 @@ var capabilityPatterns = []struct {
 	{regexp.MustCompile(`[A-Za-z0-9+/]{350,}={0,2}`), "long base64-like blob (possible packed payload)", Warn},
 }
 
+// pyCapabilityPatterns is capabilityPatterns for Python source (setup.py, an
+// in-tree build backend, the package itself). Same severity model: build code
+// legitimately reads env and writes files; reaching the network, spawning,
+// loading native code or hiding what runs is what a reviewer must see.
+// Like the JS set, matches count anywhere in the file (comments included) —
+// these are signals for a human, not a verdict.
+var pyCapabilityPatterns = []struct {
+	re   *regexp.Regexp
+	what string
+	sev  Severity
+}{
+	{regexp.MustCompile(`\b(?:import|from)\s+(?:socket|urllib3?|requests|httpx|aiohttp|ftplib|smtplib|http\.client)\b|\burlopen\s*\(|socket\.socket\s*\(`), "opens network connections", Warn},
+	{regexp.MustCompile(`\bsubprocess\b|\bos\.(?:system|popen|exec[lv]p?e?|spawn[lv]p?e?)\s*\(`), "spawns child processes", Warn},
+	{regexp.MustCompile(`\.ssh|id_rsa|\.npmrc|\.pypirc|\.netrc|\.aws|\.docker/config`), "references secret file paths (~/.ssh, .pypirc, .aws)", Danger},
+	{regexp.MustCompile(`wallet\.dat|keystore|\.electrum|metamask|(?i)clipboard|/\.config/(solana|ethereum)`), "references crypto-wallet / clipboard (common stealer target)", Danger},
+	{regexp.MustCompile(`os\.(?:environ|getenv)[^\n]{0,60}(?:AWS|TOKEN|SECRET|KEY|PASSWORD)`), "reads credential-like environment variables", Danger},
+	{regexp.MustCompile(`\b(?:import|from)\s+(?:ctypes|cffi)\b`), "loads native code (ctypes / cffi)", Warn},
+	// Decode-then-run is the classic packed payload; it outranks the parts.
+	{regexp.MustCompile(`(?s)b64decode.{0,300}\b(?:exec|eval)\s*\(|\b(?:exec|eval)\s*\(.{0,300}b64decode`), "decodes base64 and executes it (obfuscated payload)", Danger},
+	// Only a LITERAL (or decoded blob) handed to exec/eval/compile: the common
+	// `exec(open("pkg/version.py").read())` in setup.py is not flagged.
+	{regexp.MustCompile(`\b(?:exec|eval|compile)\s*\(\s*(?:[rbuRBU]?['"]|base64|codecs|zlib|bytes\.fromhex|marshal)`), "dynamic code execution of an inline literal (exec / eval / compile)", Danger},
+	{regexp.MustCompile(`__import__\s*\(\s*[^'"\s)]|importlib\.import_module\s*\(\s*[^'"\s)]`), "dynamic import (obscures what's loaded)", Warn},
+	{regexp.MustCompile(`\b(?:marshal|pickle)\.loads?\s*\(`), "deserializes marshal / pickle data (can carry code)", Warn},
+	{regexp.MustCompile(`\bshutil\.rmtree\s*\(|\bos\.(?:remove|unlink|rmdir)\s*\(`), "deletes files", Warn},
+	{regexp.MustCompile(`\bcmdclass\s*=`), "custom setup.py command hooks (cmdclass)", Warn},
+	{regexp.MustCompile(`[A-Za-z0-9+/]{350,}={0,2}`), "long base64-like blob (possible packed payload)", Warn},
+}
+
 // injectionPatterns flag text aimed at an LLM/agent that might READ this
 // package — the prompt-injection vector. As agentic review and MCP servers
 // increasingly judge dependencies, a package can carry instructions ("ignore
@@ -219,6 +248,13 @@ func scanFileStream(rel string, r io.Reader, rep *Report, seen map[string]bool) 
 		seen[binWhat] = true
 		rep.Findings = append(rep.Findings, Finding{Severity: Warn, What: binWhat, Where: rel})
 	}
+	// A .pth file in site-packages is executed by EVERY python start, not just
+	// at install — the persistence trick of several PyPI stealers.
+	const pthWhat = "ships a .pth file (code that runs at every Python interpreter start)"
+	if filepath.Ext(rel) == ".pth" && !seen[pthWhat] {
+		seen[pthWhat] = true
+		rep.Findings = append(rep.Findings, Finding{Severity: Danger, What: pthWhat, Where: rel})
+	}
 	code, text := isCodeFile(rel), isTextFile(rel)
 	if !code && !text {
 		return // not scanned as source; the caller need not have read r
@@ -250,7 +286,11 @@ func scanReader(rel string, r io.Reader, code bool, rep *Report, seen map[string
 			window = append(window, buf[:n]...)
 
 			if code {
-				scanPatterns(rel, window, capabilityFinders, rep, seen, lineBase)
+				finders := capabilityFinders
+				if filepath.Ext(rel) == ".py" {
+					finders = pyCapabilityFinders
+				}
+				scanPatterns(rel, window, finders, rep, seen, lineBase)
 			}
 			scanInjection(rel, window, code, rep, seen, lineBase)
 
@@ -294,6 +334,15 @@ var binaryExts = map[string]bool{
 var capabilityFinders = func() []finder {
 	fs := make([]finder, len(capabilityPatterns))
 	for i, cp := range capabilityPatterns {
+		fs[i] = finder{cp.re, cp.what, cp.sev}
+	}
+	return fs
+}()
+
+// pyCapabilityFinders is the same adapter for the Python set.
+var pyCapabilityFinders = func() []finder {
+	fs := make([]finder, len(pyCapabilityPatterns))
+	for i, cp := range pyCapabilityPatterns {
 		fs[i] = finder{cp.re, cp.what, cp.sev}
 	}
 	return fs
@@ -384,9 +433,10 @@ func lineAt(src []byte, off int) int { return 1 + strings.Count(string(src[:off]
 var codeExts = map[string]bool{
 	".js": true, ".cjs": true, ".mjs": true,
 	".ts": true, ".cts": true, ".mts": true, ".tsx": true, ".jsx": true,
+	".py": true,
 }
 
-// isCodeFile reports whether path is JS/TS source (gets the capability sweep).
+// isCodeFile reports whether path is JS/TS or Python source (gets a capability sweep).
 func isCodeFile(path string) bool { return codeExts[filepath.Ext(path)] }
 
 // isTextFile reports whether path is human-facing prose or manifest where an
@@ -397,7 +447,7 @@ func isTextFile(path string) bool {
 		return true
 	}
 	switch filepath.Ext(base) {
-	case ".md", ".markdown", ".txt", ".rst":
+	case ".md", ".markdown", ".txt", ".rst", ".toml", ".cfg":
 		return true
 	}
 	return false

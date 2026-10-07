@@ -37,6 +37,7 @@ import (
 	"depguard/internal/license"
 	"depguard/internal/lockfile"
 	"depguard/internal/maintainer"
+	"depguard/internal/pyver"
 	"depguard/internal/registry"
 	"depguard/internal/sbom"
 	"depguard/internal/scanner"
@@ -496,10 +497,10 @@ func reportBlocked(blocked []registry.Blocked) {
 }
 
 // installPip is cmdInstall for a pip project: pip resolves through the PyPI
-// index proxy (§5) with --only-binary=:all: — wheels run no code at install,
-// sdists run setup.py / a PEP 517 backend on the host, and sdist boxing is not
-// built yet. --allow-sdist opts into unboxed source builds. The lockfile gates
-// then run over requirements.txt like any check.
+// index proxy (§5) with --only-binary=:all: — wheels run no code at install.
+// With --allow-sdist (or ignore-scripts: false) source distributions are
+// allowed, each one reviewed and trial-built in the box first (pip_sdist.go).
+// The lockfile gates then run over requirements.txt like any check.
 func installPip(dir string, cfg config.Config, sub string, userArgs []string) error {
 	args, allowSdist := splitAllowSdist(userArgs)
 	onlyBinary := cfg.IgnoreScripts && !allowSdist
@@ -507,32 +508,34 @@ func installPip(dir string, cfg config.Config, sub string, userArgs []string) er
 		fmt.Fprintln(os.Stderr, "guard install:", err)
 		os.Exit(2)
 	}
-	if !onlyBinary {
-		fmt.Fprintf(os.Stderr, "guard: %s source distributions allowed — sdist builds run setup.py / PEP 517 backends on this host, UNBOXED\n", ui.Warn())
-	}
 	proxy, err := registry.StartPyPI(cfg)
 	if err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}
 	defer proxy.Stop()
 
-	inv := buildInstall("pip", sub, args, proxy.URL(), onlyBinary)
-	tail := &tailBuffer{max: 64 << 10}
-	pm := exec.Command(inv.name, inv.args...)
-	pm.Stdout, pm.Stderr, pm.Stdin = io.MultiWriter(os.Stdout, tail), io.MultiWriter(os.Stderr, tail), os.Stdin
-	pm.Env = pipEnv(os.Environ())
-	pipErr := pm.Run()
-
-	reportBlocked(proxy.BlockedVersions())
-	if pipErr != nil {
-		if hint := pipFailHint(string(tail.b), onlyBinary, len(proxy.BlockedVersions())); hint != "" {
-			fmt.Fprintln(os.Stderr, "guard:", hint)
+	if onlyBinary {
+		out, code := runPip(buildInstall("pip", sub, args, proxy.URL(), true).args)
+		reportBlocked(proxy.BlockedVersions())
+		if code != 0 {
+			if hint := pipFailHint(out, true, len(proxy.BlockedVersions())); hint != "" {
+				fmt.Fprintln(os.Stderr, "guard:", hint)
+			}
+			err = &exitError{max(code, 1), ""}
 		}
-		var ee *exec.ExitError
-		if errors.As(pipErr, &ee) {
-			os.Exit(ee.ExitCode())
+	} else {
+		err = installPipSdists(dir, cfg, sub, args, proxy)
+	}
+	var ee *exitError
+	if errors.As(err, &ee) {
+		if ee.msg != "" {
+			fmt.Fprintln(os.Stderr, "guard:", ee.msg)
 		}
-		return fmt.Errorf("pip %s failed: %w", sub, pipErr)
+		proxy.Stop() // os.Exit skips the defer
+		os.Exit(ee.code)
+	}
+	if err != nil {
+		return err
 	}
 
 	wf, err := waivers.Load(dir)
@@ -579,10 +582,10 @@ func pipArgBlocker(args []string, sdistOK bool) error {
 		case bypass[opt] || opt == "-i" || opt == "-f":
 			return fmt.Errorf("%s bypasses the guard proxy; set `pypi:` in .guardrc instead", opt)
 		case opt == "--no-binary" && !sdistOK:
-			return errors.New("--no-binary re-enables source builds; pass --allow-sdist to accept unboxed sdist builds")
+			return errors.New("--no-binary re-enables source builds; pass --allow-sdist to have guard review and trial-build each sdist in the box")
 		case opt == "--only-binary" && strings.Contains(val, ":none:") && !sdistOK:
 			// :none: clears guard's own --only-binary=:all:.
-			return errors.New("--only-binary=:none: re-enables source builds; pass --allow-sdist to accept unboxed sdist builds")
+			return errors.New("--only-binary=:none: re-enables source builds; pass --allow-sdist to have guard review and trial-build each sdist in the box")
 		}
 	}
 	return nil
@@ -598,7 +601,7 @@ func pipFailHint(out string, onlyBinary bool, blocked int) string {
 	if blocked > 0 {
 		return "pip found no installable version — see the hidden versions above"
 	}
-	return "pip needs to build a source distribution for this (sdist builds are not boxed yet); rerun with --allow-sdist to build it unboxed, or pin a version that ships a wheel"
+	return "pip needs to build a source distribution for this; rerun with --allow-sdist to review it and trial-build it in the box first, or pin a version that ships a wheel"
 }
 
 // pipEnv drops env that would add or swap pip's index behind the proxy's back.
@@ -617,13 +620,10 @@ func pipEnv(env []string) []string {
 // pipPackageArgs returns the requirement arguments of a `pip install` argv,
 // skipping flags and the values of the common value-taking options.
 func pipPackageArgs(args []string) []string {
-	takesValue := map[string]bool{"-r": true, "--requirement": true, "-c": true, "--constraint": true,
-		"-t": true, "--target": true, "-i": true, "--index-url": true, "--extra-index-url": true,
-		"-f": true, "--find-links": true, "--prefix": true, "--root": true, "-e": true, "--editable": true}
 	var out []string
 	for i := 0; i < len(args); i++ {
 		switch {
-		case takesValue[args[i]]:
+		case pipValueOpts[args[i]]:
 			i++
 		case !strings.HasPrefix(args[i], "-"):
 			out = append(out, args[i])
@@ -800,7 +800,7 @@ func handleScripts(dir string, cfg config.Config, appr *approvals.File) error {
 			if cfg.Flagged("new-network") || cfg.Flagged("new-fs") {
 				newCaps = priorCapabilityDiff(cfg, e.Name, e.Version, rep)
 			}
-			decision := promptApproval(key, rep, runtime, cfg, newCaps)
+			decision := promptApproval(key, rep, runtime, cfg, newCaps, false)
 			appr.Set(key, decision, "", e.Integrity)
 			if err := appr.Save(dir); err != nil {
 				return err
@@ -841,19 +841,8 @@ func handleScripts(dir string, cfg config.Config, appr *approvals.File) error {
 // newCaps holds capabilities this version added over the previous one (§6
 // diff), shown prominently because "newly opened a socket" is higher signal
 // than the absolute capability list.
-func promptApproval(key string, rep scanner.Report, runtime string, cfg config.Config, newCaps []scanner.Finding) approvals.Decision {
-	fmt.Printf("\n── %s wants to run install scripts ──\n", key)
-	for phase, cmd := range rep.Scripts {
-		fmt.Printf("   %s: %s\n", phase, truncate(cmd, 80))
-	}
-	if len(rep.Findings) > 0 {
-		fmt.Println("   static scan:")
-		for _, f := range rep.Findings {
-			fmt.Printf("     [%s] %s (%s)\n", f.Severity, f.What, f.Where)
-		}
-	} else {
-		fmt.Println("   static scan: no capability flags")
-	}
+func promptApproval(key string, rep scanner.Report, runtime string, cfg config.Config, newCaps []scanner.Finding, sdist bool) approvals.Decision {
+	printScanReport(key, rep, sdist)
 	if len(newCaps) > 0 {
 		fmt.Println("   " + ui.Warn() + " NEW since the previous version:")
 		for _, f := range newCaps {
@@ -862,7 +851,11 @@ func promptApproval(key string, rep scanner.Report, runtime string, cfg config.C
 	}
 
 	if runtime != "" {
-		fmt.Printf("   Script would run BOXED: no network, package dir only (%s).\n", runtime)
+		if sdist {
+			fmt.Printf("   It is trial-built BOXED first (no network, nothing on the host writable, %s); pip builds it on the host only if that run is clean.\n", runtime)
+		} else {
+			fmt.Printf("   Script would run BOXED: no network, package dir only (%s).\n", runtime)
+		}
 		if promptYN("   Allow?") {
 			return approvals.ApprovedBoxed
 		}
@@ -875,11 +868,37 @@ func promptApproval(key string, rep scanner.Report, runtime string, cfg config.C
 		return approvals.Denied
 	}
 	fmt.Println("   " + ui.Warn() + " No container runtime found (docker/podman).")
-	fmt.Println("   Running this script means executing its code on your machine, UNCONTAINED.")
+	fmt.Println("   Running this " + map[bool]string{false: "script", true: "build"}[sdist] + " means executing its code on your machine, UNCONTAINED.")
 	if promptYN("   Run uncontained anyway?") {
 		return approvals.ApprovedUncontained
 	}
 	return approvals.Denied
+}
+
+// printScanReport shows what a package would run and what the static scan saw —
+// the facts behind the approval question, also printed when no one can answer.
+func printScanReport(key string, rep scanner.Report, sdist bool) {
+	what := "install scripts"
+	if sdist {
+		what = "a source build (setup.py / build backend)"
+	}
+	fmt.Printf("\n── %s wants to run %s ──\n", key, what)
+	phases := make([]string, 0, len(rep.Scripts))
+	for phase := range rep.Scripts {
+		phases = append(phases, phase)
+	}
+	sort.Strings(phases) // stable order; map iteration is random
+	for _, phase := range phases {
+		fmt.Printf("   %s: %s\n", phase, truncate(rep.Scripts[phase], 80))
+	}
+	if len(rep.Findings) > 0 {
+		fmt.Println("   static scan:")
+		for _, f := range rep.Findings {
+			fmt.Printf("     [%s] %s (%s)\n", f.Severity, f.What, f.Where)
+		}
+	} else {
+		fmt.Println("   static scan: no capability flags")
+	}
 }
 
 // runApproved executes an approved script with the strongest containment the
@@ -3201,6 +3220,11 @@ func cmdApprove(args []string) error {
 	}
 	if decision == approvals.ApprovedUncontained && !uncontainedAllowed(cfg) {
 		return fmt.Errorf("no-container-fallback is 'fail' in %s — refusing to record an uncontained approval (it would never run anyway)", config.FileName)
+	}
+	if detectManager(dir) == "pip" {
+		// pip keys are PEP 503 names, as the sdist loop records them.
+		at := strings.LastIndex(key, "@")
+		key = pyver.NormalizeName(key[:at]) + key[at:]
 	}
 	appr, err := approvals.Load(dir)
 	if err != nil {

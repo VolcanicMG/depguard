@@ -50,8 +50,8 @@ const buildImage = "node:20.20.2@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2
 // change to obsDockerfile that isn't accompanied by a bump here would leave
 // every existing install silently running the old recipe. :2 added the
 // non-dumpable strace below; :3 tightened it from 0711 to 0111 so it holds for a
-// box run as root too.
-const obsImage = "depguard-box:3"
+// box run as root too; :4 added python3-pip/python3-venv for sdist trial builds.
+const obsImage = "depguard-box:4"
 
 // obsDockerfile builds obsImage. Kept in source (not a file) so the binary
 // stays self-contained and the recipe is reviewable right here.
@@ -76,7 +76,7 @@ const obsImage = "depguard-box:3"
 // cap-drop removes CAP_SYS_PTRACE, which ptrace_may_access would otherwise let
 // root use to reach a non-dumpable process's /proc entries.
 const obsDockerfile = `FROM ` + buildImage + `
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends strace && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends strace python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
 RUN chmod 0111 /usr/bin/strace
 `
 
@@ -424,10 +424,66 @@ func Run(runtime, image string, traced, strict bool, projectDir, relPath string)
 		}
 	}()
 
+	res, traceTruncated, err := execBox(runtime, npmSpec(image, traced, projectDir, relPath), traced)
+	if err != nil {
+		return res, err
+	}
+
+	// UNSAFE → the output is discarded: pre-run state comes back via rename.
+	if res.Unsafe {
+		res.Discarded = true
+		keep, err := restore(pkgDir, backupDir)
+		keepBackup = keep
+		return res, err
+	}
+	// We asked to observe this run and couldn't, fully. The script is not
+	// convicted — but unobserved output isn't accepted either.
+	if shouldDiscard(strict, traced, res.Traced, res.ObserverLost, traceTruncated) {
+		res.Discarded = true
+		keep, err := restore(pkgDir, backupDir)
+		keepBackup = keep
+		return res, err
+	}
+
+	// File diff: what did the script actually write? Build output in the
+	// package dir is expected; that's all it CAN write — everything else
+	// was never mounted.
+	after, err := snapshot(pkgDir)
+	if err != nil {
+		return res, err
+	}
+	for path, sig := range after {
+		old, existed := before[path]
+		switch {
+		case !existed:
+			res.NewFiles = append(res.NewFiles, path)
+		case old != sig:
+			res.Modified = append(res.Modified, path)
+		}
+	}
+	return res, nil
+}
+
+// runSpec is what differs between box runs (npm scripts vs an sdist trial
+// build). Everything else — the hardening flags, the seccomp profile, the trace
+// pipe, the resource limits and the timeout — is shared by runArgs/execBox.
+type runSpec struct {
+	name    string   // container name, so a timed-out run can be force-removed
+	tmpfs   []string // --tmpfs values
+	env     []string // -e values
+	mounts  []string // -v values
+	workdir string
+	image   string
+	script  string // already wrapped by tracedScript when traced
+}
+
+// npmSpec is the install-script run: the project's node_modules read-only (for
+// sibling resolution) and only the package's own dir writable.
+func npmSpec(image string, traced bool, projectDir, relPath string) runSpec {
+	pkgDir := filepath.Join(projectDir, relPath)
 	// Keep the node_modules dir name in the container path so Node's
 	// upward require() resolution finds siblings naturally.
 	workDir := "/app/" + filepath.ToSlash(relPath)
-
 	// Run every install-phase script that exists, in npm's own order, using
 	// npm itself inside the container so package.json semantics hold.
 	script := `cd "$WORK" && for s in preinstall install postinstall; do npm run "$s" --if-present --foreground-scripts || exit $?; done`
@@ -450,33 +506,87 @@ func Run(runtime, image string, traced, strict bool, projectDir, relPath string)
 	if traced {
 		script = tracedScript(script)
 	}
+	return runSpec{
+		name:  containerName(),
+		tmpfs: []string{"/tmp:size=512m", "/home/node:size=64m"}, // npm wants a writable HOME for its cache
+		env: []string{
+			"HOME=/home/node",
+			"WORK=" + workDir,
+			// Silence npm's own phone-home plumbing (update checks, audit,
+			// funding) so the benign baseline produces ZERO network syscalls —
+			// any DNS query that remains in the trace is the script's own doing.
+			"npm_config_update_notifier=false",
+			"npm_config_audit=false",
+			"npm_config_fund=false",
+			"CI=true",
+		},
+		mounts: []string{
+			// Whole dep tree readable (sibling resolution), nothing else.
+			filepath.Join(projectDir, "node_modules") + ":/app/node_modules:ro",
+			// The nested rw bind overrides the ro parent for this one subtree:
+			// the script can only write its own package.
+			pkgDir + ":" + workDir + ":rw",
+		},
+		workdir: workDir,
+		image:   image,
+		script:  script,
+	}
+}
 
-	// Name the container so a timed-out (SIGKILL'd) run can still be force-removed
-	// below — --rm only fires on a clean CLI exit, not when we kill it.
-	containerName := fmt.Sprintf("depguard-run-%d-%d", os.Getpid(), time.Now().UnixNano())
+// sdistNameRe is the only sdist filename shape guard hands to the box: it lands
+// inside a shell command, so anything else is refused, not quoted.
+var sdistNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz$`)
+
+// pySpec is the sdist trial build: the stash (the sdist + any build-dependency
+// wheels) read-only at /stash, everything writable on tmpfs, nothing from the
+// host writable at all. The wheel it produces is thrown away — only the verdict
+// matters, so the box's python never has to match the host's.
+func pySpec(image string, traced bool, stashDir, sdistName string) runSpec {
+	script := `cd /tmp && python3 -m pip wheel --no-index --find-links /stash --no-deps --no-cache-dir -w /tmp/out "/stash/` + sdistName + `"`
+	if traced {
+		script = tracedScript(script)
+	}
+	return runSpec{
+		name:  containerName(),
+		tmpfs: []string{"/tmp:size=1g", "/home/node:size=64m"},
+		env: []string{
+			"HOME=/home/node", // inside the trace's exempt scratch HOME
+			"PIP_NO_CACHE_DIR=1",
+			"PIP_DISABLE_PIP_VERSION_CHECK=1",
+			"PIP_NO_INDEX=1",
+			"PIP_FIND_LINKS=/stash", // build-isolation installs see the stash too
+		},
+		mounts:  []string{stashDir + ":/stash:ro"},
+		workdir: "/tmp",
+		image:   image,
+		script:  script,
+	}
+}
+
+func containerName() string {
+	return fmt.Sprintf("depguard-run-%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+// runArgs assembles the `docker run` argv for a spec: the spec's own pieces
+// inside the fixed hardening. seccompPath "" omits the profile (fail open on a
+// non-critical extra — the cage still holds without it).
+func runArgs(s runSpec, seccompPath string) []string {
 	args := []string{
-		"run", "--rm", "--name", containerName,
+		"run", "--rm", "--name", s.name,
 		"--network", "none", // no phone line
-		"--read-only",               // image is immutable
-		"--tmpfs", "/tmp:size=512m", // scratch space
-		"--tmpfs", "/home/node:size=64m", // npm wants a writable HOME for its cache
-		"-e", "HOME=/home/node",
-		"-e", "WORK=" + workDir,
-		// Silence npm's own phone-home plumbing (update checks, audit,
-		// funding) so the benign baseline produces ZERO network syscalls —
-		// any DNS query that remains in the trace is the script's own doing.
-		"-e", "npm_config_update_notifier=false",
-		"-e", "npm_config_audit=false",
-		"-e", "npm_config_fund=false",
-		"-e", "CI=true",
-		// Whole dep tree readable (sibling resolution), nothing else.
-		"-v", filepath.Join(projectDir, "node_modules") + ":/app/node_modules:ro",
-		// The nested rw bind overrides the ro parent for this one subtree:
-		// the script can only write its own package.
-		"-v", pkgDir + ":" + workDir + ":rw",
+		"--read-only", // image is immutable
+	}
+	for _, t := range s.tmpfs {
+		args = append(args, "--tmpfs", t)
+	}
+	for _, e := range s.env {
+		args = append(args, "-e", e)
+	}
+	for _, m := range s.mounts {
+		args = append(args, "-v", m)
 	}
 	args = append(args,
-		"-w", workDir,
+		"-w", s.workdir,
 		"--cap-drop", "ALL", // no special powers (own-child ptrace needs none); also drops CAP_DAC_OVERRIDE so even uid 0 cannot open the non-dumpable tracer's /proc fds — load-bearing for the trace-forgery defense
 		"--security-opt", "no-new-privileges", // setuid binaries can't escalate
 		"--pids-limit", "512", // fork bombs die at the fence
@@ -486,19 +596,21 @@ func Run(runtime, image string, traced, strict bool, projectDir, relPath string)
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 	)
 	// Block io_uring &c. so a script can't do I/O the strace observer can't see.
-	// Fail open if the profile can't be written — the cage still holds without it.
-	if prof := ensureSeccompProfile(); prof != "" {
-		args = append(args, "--security-opt", "seccomp="+prof)
+	if seccompPath != "" {
+		args = append(args, "--security-opt", "seccomp="+seccompPath)
 	}
-	args = append(args,
-		image, "sh", "-c", script,
-	)
+	return append(args, s.image, "sh", "-c", s.script)
+}
 
+// execBox runs one spec under the wall-clock kill with bounded sinks and returns
+// the result with the trace verdict applied. Nothing on the host is restored
+// here — that is Run's business; traceTruncated feeds shouldDiscard.
+func execBox(runtime string, s runSpec, traced bool) (res Result, traceTruncated bool, err error) {
 	// Wall-clock kill: a script that just spins (a miner) never exits on its
 	// own. On timeout the docker CLI is killed and the --rm container torn down.
 	ctx, cancel := context.WithTimeout(context.Background(), boxTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, runtime, args...)
+	cmd := exec.CommandContext(ctx, runtime, runArgs(s, ensureSeccompProfile())...)
 	// Both sinks are BOUNDED: a script that prints forever must not grow guard's
 	// heap without limit. When untraced there is no separate trace stream, so
 	// stdout and stderr both land in the output buffer as before.
@@ -513,10 +625,10 @@ func Run(runtime, image string, traced, strict bool, projectDir, relPath string)
 	if ctx.Err() == context.DeadlineExceeded {
 		fmt.Fprintf(outBuf, "\nguard: box killed after %s wall-clock limit\n", boxTimeout)
 		// The killed CLI may not have run --rm; make sure the container is gone.
-		_ = exec.Command(runtime, "rm", "-f", containerName).Run()
+		_ = exec.Command(runtime, "rm", "-f", s.name).Run()
 	}
 
-	res := Result{Output: outBuf.String(), Requested: traced}
+	res = Result{Output: outBuf.String(), Requested: traced}
 	if outBuf.truncated {
 		res.Truncated = append(res.Truncated, "output")
 	}
@@ -526,42 +638,28 @@ func Run(runtime, image string, traced, strict bool, projectDir, relPath string)
 	if exitErr, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = exitErr.ExitCode()
 	} else if runErr != nil {
-		return res, fmt.Errorf("container launch failed: %w", runErr)
+		return res, traceBuf.truncated, fmt.Errorf("container launch failed: %w", runErr)
 	}
-
 	res.Traced, res.Findings, res.Unsafe, res.ObserverLost = verdict(traceBuf.buf, traceBuf.truncated, traced, ctx.Err() == context.DeadlineExceeded)
+	return res, traceBuf.truncated, nil
+}
 
-	// UNSAFE → the output is discarded: pre-run state comes back via rename.
-	if res.Unsafe {
-		res.Discarded = true
-		keep, err := restore(pkgDir, backupDir)
-		keepBackup = keep
-		return res, err
+// RunPyBuild trial-builds one sdist in the box purely for a VERDICT: pip wheel
+// from the read-only stash (the sdist plus any build-dependency wheels), no
+// network, no index, output on tmpfs and thrown away. Nothing on the host is
+// touched, so there is nothing to restore: Discarded marks a run whose result
+// must not be trusted — unsafe, or unobserved under the same rules as Run.
+// sdistName must be a plain *.tar.gz filename inside stashDir.
+func RunPyBuild(runtime, image string, traced, strict bool, stashDir, sdistName string) (Result, error) {
+	if !sdistNameRe.MatchString(sdistName) {
+		return Result{}, fmt.Errorf("refusing sdist filename %q", sdistName)
 	}
-	// We asked to observe this run and couldn't, fully. The script is not
-	// convicted — but unobserved output isn't accepted either.
-	if shouldDiscard(strict, traced, res.Traced, res.ObserverLost, traceBuf.truncated) {
-		res.Discarded = true
-		keep, err := restore(pkgDir, backupDir)
-		keepBackup = keep
-		return res, err
-	}
-
-	// File diff: what did the script actually write? Build output in the
-	// package dir is expected; that's all it CAN write — everything else
-	// was never mounted.
-	after, err := snapshot(pkgDir)
+	res, traceTruncated, err := execBox(runtime, pySpec(image, traced, stashDir, sdistName), traced)
 	if err != nil {
 		return res, err
 	}
-	for path, sig := range after {
-		old, existed := before[path]
-		switch {
-		case !existed:
-			res.NewFiles = append(res.NewFiles, path)
-		case old != sig:
-			res.Modified = append(res.Modified, path)
-		}
+	if res.Unsafe || shouldDiscard(strict, traced, res.Traced, res.ObserverLost, traceTruncated) {
+		res.Discarded = true
 	}
 	return res, nil
 }

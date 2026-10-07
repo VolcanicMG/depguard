@@ -1,5 +1,6 @@
-// guard install for pip (PyPI phase 2): pip resolves through guard's ephemeral
-// PEP 691 index proxy. Offline: `pypi:` points at MockPyPI, whose file URLs are
+// guard install for pip (PyPI phases 2-3): pip resolves through guard's ephemeral
+// PEP 691 index proxy; sdists need --allow-sdist and a review (the boxed trial
+// build itself is in pip-sdist.test.mjs, gated on docker). Offline: `pypi:` points at MockPyPI, whose file URLs are
 // unfetchable, so pip always fails AFTER resolving — the assertions are on what
 // the proxy hid, and nothing is ever installed (`--target` a temp dir anyway).
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -7,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MockPyPI } from './helpers/pypi.mjs';
+import { MockPyPI, inTreeSdist } from './helpers/pypi.mjs';
 import { guard } from './helpers/run.mjs';
 
 const hasPip = (() => {
@@ -37,7 +38,7 @@ const dirs = [];
 beforeAll(async () => {
   pypi = await new MockPyPI().start();
   pypi.publish('mixed-pkg', '1.0.0', { ageDays: 100 }).publish('mixed-pkg', '2.0.0', { ageDays: 2 });
-  pypi.publish('src-only', '1.0.0', { ageDays: 100, sdist: true });
+  pypi.publish('src-only', '1.0.0', { ageDays: 100, files: inTreeSdist('src-only', '1.0.0') });
   pypi.publish('reqeusts', '1.0.0', { ageDays: 400 }); // one edit from "requests"
 });
 
@@ -72,24 +73,38 @@ describe.skipIf(!hasPip)('guard install (pip)', () => {
     expect(existsSync(join(dir, 'package-lock.json'))).toBe(false); // pip path, never npm
   });
 
-  it('sdist-only projects need --allow-sdist, which warns', async () => {
+  it('sdist-only projects need --allow-sdist, which asks for a review first', async () => {
     const dir = pipProject();
     const res = await guard(dir, ['install', 'src-only', '--target', join(dir, 't')], PIP_ENV);
     expect(res.code).not.toBe(0);
     expect(res.stderr).toContain('rerun with --allow-sdist');
 
+    // No one to answer the prompt: guard fetched + scanned the sdist, prints
+    // the report, records nothing, and names the command that approves it.
     const allowed = await guard(dir, ['install', '--allow-sdist', 'src-only', '--target', join(dir, 't')], PIP_ENV);
-    expect(allowed.code).not.toBe(0); // still unfetchable
-    expect(allowed.stderr).toContain('source distributions allowed');
-    expect(allowed.stdout + allowed.stderr).toContain('src_only-1.0.0.tar.gz');
+    expect(allowed.code).toBe(1);
+    expect(allowed.stdout).toContain('src-only@1.0.0 wants to run a source build');
+    expect(allowed.stdout).toContain('build backend: backend (in-tree)');
+    expect(allowed.stderr).toContain('guard approve src-only@1.0.0');
+    expect(existsSync(join(dir, '.guard-approvals'))).toBe(false);
   });
 
-  it('--allow-sdist also unlocks --no-binary', async () => {
+  it('with --allow-sdist, --no-binary / --only-binary are guard\'s call', async () => {
     const dir = pipProject();
-    const res = await guard(dir, ['install', '--allow-sdist', '--no-binary', ':all:', 'src-only', '--target', join(dir, 't')], PIP_ENV);
-    expect(res.code).not.toBe(0); // reached pip, then the download failed
-    expect(res.stderr).not.toContain('re-enables source builds');
-    expect(res.stdout + res.stderr).toContain('src_only-1.0.0.tar.gz');
+    const res = await guard(dir, ['install', '--allow-sdist', '--no-binary', ':all:', 'src-only'], PIP_ENV);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("--no-binary is guard's call");
+  });
+
+  it('an uncontained sdist approval is refused under no-container-fallback: fail', async () => {
+    const dir = pipProject('no-container-fallback: fail\n');
+    expect((await guard(dir, ['approve', 'src-only@1.0.0', '--uncontained'])).code).not.toBe(0);
+    // ...and one recorded elsewhere (a machine with the default policy) is not honored here.
+    writeFileSync(join(dir, '.guard-approvals'), JSON.stringify({ schema: 1, packages: { 'src-only@1.0.0': { decision: 'approved-uncontained', date: '2026-01-01T00:00:00Z' } } }));
+    const res = await guard(dir, ['install', '--allow-sdist', 'src-only', '--target', join(dir, 't')], PIP_ENV);
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("no-container-fallback is 'fail'");
+    expect(existsSync(join(dir, 't'))).toBe(false);
   });
 
   it('a typosquat name is hidden; allow: lets it through', async () => {

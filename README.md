@@ -199,6 +199,7 @@ bump them by hand, so a later `npm install` can't pull a freshly-compromised pat
 | Ignore-scripts (`guard` + `.npmrc`) | install-time code execution, the #1 npm attack vector — even via plain npm |
 | Static scan at approval | network, child_process, secret-path, and eval signals, **plus LLM/agent-injection** (prompt-injection prose, Trojan-Source bidi, zero-width hiding) for when an agent reviews your deps |
 | Boxed + traced script run | exfil from approved scripts — the container both **cages and watches** (detail below) |
+| pip: wheels only, sdists trial-built | a Python sdist's `setup.py` / build backend: never run by pip until guard has scanned it (Python set), you approved it once (bound to its sha256), and a **boxed + traced trial build** came back clean — `--allow-sdist` |
 
 When you approve a script, it runs in a **digest-pinned container**: no network, no
 secrets, no-new-privileges, pids-limited, and **seccomp**-filtered (io_uring, the
@@ -294,8 +295,8 @@ guard status                         # offline read: policy, hooks, sandbox, rec
 guard install <pkg>                  # protected install through the cooldown proxy
 guard ci                             # lockfile-exact install (npm ci), same protections
                                      #   pip repo: pip install via the PyPI index proxy, WHEELS ONLY
-                                     #   (ci = -r requirements.txt); --allow-sdist permits source
-                                     #   builds, which run UNBOXED on this host
+                                     #   (ci = -r requirements.txt); --allow-sdist admits sdists,
+                                     #   each scanned, approved once and trial-built in the box first
 
 # ── Audit ──────────────────────────────────────────────────
 guard check [--all] [--json] [--confirm] [--quiet] [--hook=pre-commit|pre-push]
@@ -366,7 +367,7 @@ attempt prompt injection. The MCP surface is **vetting-only**; state-changing ac
 
 ## Python (pip) — what's covered today
 
-**Phases 1–2: the check path and the install proxy.** `guard check` (so the hooks,
+**Phases 1–3: the check path, the install proxy, and boxed sdist builds.** `guard check` (so the hooks,
 CI, `--json` and the MCP `check_dependencies` tool) reads `requirements.txt` as the
 lockfile. `guard install <pkg>` / `guard ci` run pip against an ephemeral PEP 691
 index proxy that hides too-fresh, OSV-blocked and typosquat versions, with
@@ -381,7 +382,7 @@ index proxy that hides too-fresh, OSV-blocked and typosquat versions, with
 | Secret-file gate, waivers, `on-check-error` | ✅ ecosystem-agnostic |
 | `guard sbom` | ✅ `pkg:pypi/…` purls + one `--hash` (hashes are sorted, so a reordered list is not a conflict) |
 | Install-time cooldown + OSV + name gate (index proxy) | ✅ `guard install` / `guard ci` (JSON Simple API: pip ≥ 22.3) |
-| Install-time code | ⚠ **wheels only**; sdists need `--allow-sdist` and build **unboxed** |
+| Install-time code | ✅ wheels only by default; with `--allow-sdist` each sdist is scanned, **approved once** and **trial-built in the box** (strace, no network) before pip builds it on the host |
 | Provenance, maintainer, licenses, `guard why` | ❌ npm only (skipped silently for pip) |
 
 Only exact pins (`name==version` / `===`) are checked. Ranges, bare names, `-e`,
@@ -396,8 +397,11 @@ added (`pip freeze`) so `guard check` covers it. A `pip.conf` `extra-index-url` 
 still consulted **unfiltered** (guard strips only the `PIP_INDEX_URL` /
 `PIP_EXTRA_INDEX_URL` env vars), and the name gate's PyPI list is a small curated set.
 pip flags that would route around the proxy (`--index-url`/`-i`, `--extra-index-url`,
-`--find-links`/`-f`, `--no-index`) are refused (exit 2); so is `--no-binary` without
-`--allow-sdist`.
+`--find-links`/`-f`, `--no-index`) are refused (exit 2); `--no-binary` /
+`--only-binary=:none:` too — without `--allow-sdist` they'd skip the review, with it
+guard decides per package. The sdist trial build is a **double build**: the box run
+yields a verdict, then pip builds again on the host — code that behaves differently
+outside the box is the residual risk ([DESIGN §8](docs/DESIGN.md)).
 
 ## Honest limits
 
@@ -452,9 +456,10 @@ others leave.
 
 Directional, not commitments — depguard is **npm-first** today. On the radar:
 
-- **More ecosystems.** PyPI (Python) **phases 1–2 shipped: the check path over
-  `requirements.txt` and the install-time index proxy** ([details](#python-pip--whats-covered-today));
-  next (phase 3): boxing sdist builds, then following `-r` includes. After that NuGet (.NET / C#),
+- **More ecosystems.** PyPI (Python) **phases 1–3 shipped: the check path over
+  `requirements.txt`, the install-time index proxy, and sdists reviewed + trial-built
+  in the box** ([details](#python-pip--whats-covered-today)). Next (phase 3c):
+  PyPI attestations (PEP 740) and uv / poetry lockfiles, then following `-r` includes. After that NuGet (.NET / C#),
   Cargo (Rust), and RubyGems. The layered model
   (cooldown, name gate, scan, box, advisory re-check) is ecosystem-agnostic; each needs
   its own registry + lockfile adapter.

@@ -41,14 +41,16 @@ function header(name, size) {
 
 /**
  * Create a gzipped npm package tarball from a map of file contents.
- * @param {Record<string, string>} files - path (without "package/") → content
+ * @param {Record<string, string>} files - path (without the root dir) → content
+ * @param {string} [root='package'] - root dir every entry sits under (npm: "package";
+ *   a Python sdist: "<name>-<version>")
  * @returns {Buffer} .tgz bytes ready to serve
  */
-export function packTgz(files) {
+export function packTgz(files, root = 'package') {
   const parts = [];
   for (const [path, content] of Object.entries(files)) {
     const data = Buffer.from(content, 'utf8');
-    parts.push(header('package/' + path, data.length), data);
+    parts.push(header(`${root}/${path}`, data.length), data);
     const pad = (BLOCK - (data.length % BLOCK)) % BLOCK;
     if (pad) parts.push(Buffer.alloc(pad));
   }

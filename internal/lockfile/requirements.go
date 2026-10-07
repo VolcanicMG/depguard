@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"depguard/internal/pyver"
 )
 
 var (
@@ -20,7 +22,6 @@ var (
 	// The first whitespace-preceded option ends the requirement part.
 	reqOptStart = regexp.MustCompile(`\s-`)
 	reqHash     = regexp.MustCompile(`^(sha256|sha384|sha512):[0-9a-fA-F]+$`)
-	reqNameSep  = regexp.MustCompile(`[-_.]+`)
 )
 
 // reqSourceOpts are option lines that name a dependency source guard does not
@@ -32,9 +33,7 @@ var reqSourceOpts = map[string]bool{
 }
 
 // normalizePyName is PEP 503 normalization: lowercase, runs of -_. → "-".
-func normalizePyName(n string) string {
-	return reqNameSep.ReplaceAllString(strings.ToLower(n), "-")
-}
+func normalizePyName(n string) string { return pyver.NormalizeName(n) }
 
 // parseRequirements extracts exact pins from a requirements.txt. Each pinned
 // line yields a Pkg (FromRegistry, Ecosystem "pypi", Integrity = its --hash

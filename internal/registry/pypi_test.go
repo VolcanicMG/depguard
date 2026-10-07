@@ -191,27 +191,6 @@ func TestPyPIProxyOSV(t *testing.T) {
 	}
 }
 
-func TestPyFileVersion(t *testing.T) {
-	cases := map[string]string{
-		"requests-2.31.0-py3-none-any.whl":                  "2.31.0",
-		"numpy-1.26.4-1-cp312-cp312-manylinux_2_17_x86.whl": "1.26.4", // build tag
-		"torch-2.1.0+cpu-cp311-cp311-linux_x86_64.whl":      "2.1.0+cpu",
-		"my_pkg-1.0.post1.tar.gz":                           "1.0.post1",
-		"my-dashed-pkg-0.3.zip":                             "0.3",
-		"Pkg-1.0RC1.tar.bz2":                                "1.0rc1",
-	}
-	for fn, want := range cases {
-		if got, ok := pyFileVersion(fn); !ok || got != want {
-			t.Errorf("pyFileVersion(%q) = %q,%v want %q", fn, got, ok, want)
-		}
-	}
-	for _, bad := range []string{"pkg.egg", "pkg-1.0.exe", "pkg.tar.gz", "pkg-.zip", "a-b-c.whl", "x-1.0.tar.xz"} {
-		if _, ok := pyFileVersion(bad); ok {
-			t.Errorf("pyFileVersion(%q) parsed, want fail", bad)
-		}
-	}
-}
-
 // loopCfg is a config whose PyPI base is loopback, so rewrite() skips OSV.
 func loopCfg() config.Config {
 	return config.Config{PyPI: "http://127.0.0.1:1", Cooldown: 14 * 24 * time.Hour}

@@ -13,19 +13,17 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"depguard/internal/config"
+	"depguard/internal/pyver"
 	"depguard/internal/typosquat"
 )
 
 // pypiJSON is the PEP 691 media type — the only one this proxy speaks.
 const pypiJSON = "application/vnd.pypi.simple.v1+json"
-
-var pyNameSep = regexp.MustCompile(`[-_.]+`)
 
 // PyPIProxy is a single-command PyPI Simple-index filter.
 type PyPIProxy struct {
@@ -85,7 +83,7 @@ func (p *PyPIProxy) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "depguard's PyPI proxy serves "+pypiJSON+" only (PEP 691); upgrade pip to >= 22.3", http.StatusNotAcceptable)
 		return
 	}
-	name := pyNameSep.ReplaceAllString(strings.ToLower(strings.TrimSuffix(rest, "/")), "-")
+	name := pyver.NormalizeName(strings.TrimSuffix(rest, "/"))
 
 	req, err := http.NewRequest(http.MethodGet, p.cfg.PyPI+"/simple/"+name+"/", nil)
 	if err != nil {
@@ -152,7 +150,7 @@ func (p *PyPIProxy) rewrite(name string, raw []byte) ([]byte, error) {
 	for _, f := range files {
 		fm, _ := f.(map[string]any)
 		fn, _ := fm["filename"].(string)
-		v, ok := pyFileVersion(fn)
+		v, ok := pyver.FileVersion(fn)
 		if fm == nil || !ok {
 			if fn == "" {
 				fn = "(missing filename)"
@@ -238,27 +236,4 @@ func earliestUploadTime(files []map[string]any) time.Time {
 		}
 	}
 	return first
-}
-
-// pyFileVersion extracts the (lowercased) version from a distribution filename:
-// wheel {dist}-{ver}(-{build})?-{py}-{abi}-{plat}.whl, or an sdist
-// {name}-{ver}.tar.gz/.zip/.tar.bz2 (version after the LAST '-').
-func pyFileVersion(fn string) (string, bool) {
-	if base, ok := strings.CutSuffix(fn, ".whl"); ok {
-		parts := strings.Split(base, "-")
-		if (len(parts) != 5 && len(parts) != 6) || parts[1] == "" {
-			return "", false
-		}
-		return strings.ToLower(parts[1]), true
-	}
-	for _, ext := range []string{".tar.gz", ".zip", ".tar.bz2"} {
-		if base, ok := strings.CutSuffix(fn, ext); ok {
-			i := strings.LastIndexByte(base, '-')
-			if i <= 0 || i == len(base)-1 {
-				return "", false
-			}
-			return strings.ToLower(base[i+1:]), true
-		}
-	}
-	return "", false
 }

@@ -190,10 +190,16 @@ What pip gets in this version:
   (`ci` adds `-r requirements.txt`) against an ephemeral PyPI index proxy that hides
   too-fresh, OSV-blocked and typosquat versions. Needs pip ≥ 22.3 (PEP 691 JSON index;
   older pip gets a 406). Pass pip's own flags through as usual (`--target`, `--upgrade`, …).
-- **Wheels only.** A wheel runs no code at install; an sdist runs setup.py / a PEP 517
-  backend on your machine, and sdist boxing isn't built yet. When pip can't find a
-  wheel guard says so; `--allow-sdist` permits the source build, **unboxed**, with a
-  warning. Prefer pinning a version that ships a wheel.
+- **Wheels only by default.** A wheel runs no code at install; an sdist runs setup.py /
+  a PEP 517 backend. When pip needs an sdist guard says so; rerun with `--allow-sdist`:
+  guard fetches the sdist (sha256-checked), shows its scan + build facts, and asks once
+  (`guard approve <name@version>` records it ahead of time / for CI; it binds to the
+  sdist's hash on first use). An approved sdist is **trial-built in the box** first
+  (docker/podman, strace, no network); only a clean verdict lets pip build it on your
+  machine. A malicious build flips the approval to `denied` in `.guard-approvals`.
+  No container runtime? `guard approve <name@version> --uncontained` (policy permitting)
+  builds it unboxed, as for npm scripts. Run `guard prewarm` once so the first trial
+  build doesn't wait for the `depguard-box` image.
 - pip doesn't edit `requirements.txt` — pin what you installed (`pip freeze | grep -i <pkg>`)
   or `guard check` won't cover it.
 - guard strips `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` from pip's environment, but an
@@ -201,7 +207,8 @@ What pip gets in this version:
   as registry flags in `.npmrc`). Remove it, or run pip with `PIP_CONFIG_FILE=/dev/null`.
 - Refused pip flags (exit 2, before anything runs): `--index-url`/`-i`, `--extra-index-url`,
   `--find-links`/`-f`, `--no-index` — they route around the proxy; set `pypi:` instead.
-- `--no-binary` is refused unless you also pass `--allow-sdist`.
+- `--no-binary` / `--only-binary=:none:` are refused: without `--allow-sdist` they'd skip
+  the review; with it guard decides which packages may build from source.
 - No provenance, maintainer or license checks for pip yet; `guard why` is npm-only.
 - **Generate the file with hashes:** `pip-compile --generate-hashes` (pip-tools). Only
   exact pins (`name==version`) are checked; ranges, `-e`, paths, VCS/URL requirements

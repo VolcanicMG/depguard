@@ -414,7 +414,7 @@ func TestObsImageMakesTracerNonDumpable(t *testing.T) {
 	}
 	// EnsureObsImage reuses any local image with this tag, so a recipe change
 	// without a tag bump would leave every existing install on the old one.
-	for _, stale := range []string{"depguard-box:1", "depguard-box:2"} {
+	for _, stale := range []string{"depguard-box:1", "depguard-box:2", "depguard-box:3"} {
 		if obsImage == stale {
 			t.Errorf("obsImage still %s — existing installs would keep the old, forgeable image", stale)
 		}
@@ -487,5 +487,88 @@ func TestRunUncontainedBoundsOutput(t *testing.T) {
 	}
 	if len(res.Truncated) == 0 {
 		t.Error("output was cut but Truncated is empty — the human would never know")
+	}
+}
+
+// Characterizes the npm box invocation exactly as it was before Run's arg
+// assembly moved into runSpec/runArgs: every hardening flag, in order.
+func TestRunArgsNpmUnchanged(t *testing.T) {
+	s := npmSpec("img", false, "/proj", "node_modules/pkg")
+	s.name = "N"
+	got := runArgs(s, "/tmp/sec.json")
+	want := []string{
+		"run", "--rm", "--name", "N",
+		"--network", "none",
+		"--read-only",
+		"--tmpfs", "/tmp:size=512m",
+		"--tmpfs", "/home/node:size=64m",
+		"-e", "HOME=/home/node",
+		"-e", "WORK=/app/node_modules/pkg",
+		"-e", "npm_config_update_notifier=false",
+		"-e", "npm_config_audit=false",
+		"-e", "npm_config_fund=false",
+		"-e", "CI=true",
+		"-v", "/proj/node_modules:/app/node_modules:ro",
+		"-v", "/proj/node_modules/pkg:/app/node_modules/pkg:rw",
+		"-w", "/app/node_modules/pkg",
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--pids-limit", "512",
+		"--memory", boxMemory,
+		"--memory-swap", boxMemory,
+		"--cpus", boxCPUs,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"--security-opt", "seccomp=/tmp/sec.json",
+		"img", "sh", "-c", `cd "$WORK" && for s in preinstall install postinstall; do npm run "$s" --if-present --foreground-scripts || exit $?; done`,
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("npm args changed:\n got %q\nwant %q", got, want)
+	}
+	if s := npmSpec("img", true, "/proj", "node_modules/pkg"); !strings.HasPrefix(s.script, "exec strace ") {
+		t.Error("traced npm run is not wrapped in strace")
+	}
+	if a := runArgs(s, ""); strings.Contains(strings.Join(a, " "), "seccomp=") {
+		t.Error("an empty seccomp path must omit the flag")
+	}
+}
+
+// The sdist trial build: read-only stash, everything writable on tmpfs, no
+// index, same hardening as npm, traced through the same strace wrapper.
+func TestRunArgsPyBuild(t *testing.T) {
+	s := pySpec("img", true, "/host/stash", "pkg-1.0.tar.gz")
+	a := strings.Join(runArgs(s, "/tmp/sec.json"), " ")
+	for _, want := range []string{
+		"--network none", "--read-only", "--tmpfs /tmp:size=1g", "--tmpfs /home/node:size=64m",
+		"-e HOME=/home/node", "-e PIP_NO_INDEX=1", "-e PIP_NO_CACHE_DIR=1", "-e PIP_DISABLE_PIP_VERSION_CHECK=1",
+		"-v /host/stash:/stash:ro", "-w /tmp", "--cap-drop ALL", "--security-opt no-new-privileges",
+		"--pids-limit 512", "--security-opt seccomp=/tmp/sec.json",
+		`pip wheel --no-index --find-links /stash --no-deps --no-cache-dir -w /tmp/out "/stash/pkg-1.0.tar.gz"`,
+	} {
+		if !strings.Contains(a, want) {
+			t.Errorf("py build args missing %q:\n%s", want, a)
+		}
+	}
+	if !strings.HasPrefix(s.script, "exec strace ") || strings.Contains(a, ":rw") {
+		t.Errorf("py build must be traced and mount nothing writable: %s", a)
+	}
+}
+
+// The sdist filename lands inside a shell command, so only plain names pass.
+func TestRunPyBuildRefusesOddNames(t *testing.T) {
+	for _, bad := range []string{"x.zip", "../x.tar.gz", "a b.tar.gz", "a'b.tar.gz", "a\"$(id).tar.gz", "a;b.tar.gz", ".tar.gz", "a/b.tar.gz"} {
+		if _, err := RunPyBuild("docker", "img", true, false, "/s", bad); err == nil {
+			t.Errorf("RunPyBuild accepted %q", bad)
+		}
+	}
+	for _, ok := range []string{"pkg-1.0.tar.gz", "My_Pkg-2.0.post1+local.tar.gz"} {
+		if !sdistNameRe.MatchString(ok) {
+			t.Errorf("rejected plain name %q", ok)
+		}
+	}
+}
+
+func TestObsImageHasPip(t *testing.T) {
+	if !strings.Contains(obsDockerfile, "python3-pip") || !strings.Contains(obsDockerfile, "python3-venv") || obsImage != "depguard-box:4" {
+		t.Errorf("obs image recipe/tag: %s %q", obsImage, obsDockerfile)
 	}
 }

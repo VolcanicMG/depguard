@@ -13,6 +13,8 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  depguard/
  ├── main.go                     CLI dispatch + the install/check orchestration
  ├── mcp.go                      `guard mcp`: stdio JSON-RPC MCP server (zero-dep)
+ ├── pip_sdist.go                pip --allow-sdist: the sdist admission loop (scan →
+ │                               approve → boxed trial build) before pip builds
  ├── go.mod                      module def — ZERO dependencies, on purpose
  ├── .github/workflows/
  │   └── release.yml            CI: cross-compile + attest + publish binaries on a vX.Y.Z tag
@@ -28,8 +30,10 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │                               closed (500); artifacts never proxied
  │   ├── registry/proxy.go       ephemeral filtering proxy (cooldown + typosquat +
  │   │                           OSV + signature + dependency-confusion gates)
- │   ├── scanner/scanner.go      static scan: scripts + capability + LLM-injection
- │   ├── scanner/tarball.go      scan a published tarball → capability diff
+ │   ├── scanner/scanner.go      static scan: scripts + capability (JS set, Python set
+ │                               for .py, .pth fact) + LLM-injection
+ │   ├── scanner/tarball.go      scan a published tarball → capability diff;
+ │                               ScanSdist (root-stripped walk + build facts)
  │   ├── typosquat/typosquat.go  name-level filter: Damerau-1 + homoglyph
  │   ├── provenance/provenance.go npm ECDSA dist.signature verification (stdlib)
  │   ├── attestation/attestation.go npm build-provenance: Sigstore/SLSA DSSE + Fulcio chain + digest bind (flag:)
@@ -42,7 +46,9 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
  │   │                           Severities = per-vuln detail for tiering; Blocks;
  │   │                           BlockingVersions = severity-tiered resolve-time filter)
- │   ├── box/box.go              docker/podman sealed+traced+seccomp script runner
+ │   ├── box/box.go              docker/podman sealed+traced+seccomp runner: runSpec
+ │                               (npmSpec / pySpec) → runArgs → execBox, shared by
+ │                               Run (npm scripts) and RunPyBuild (sdist trial build)
  │   ├── trace/trace.go          strace-log → evidence + safe/unsafe verdict
  │   ├── hooks/hooks.go          git hooks (chains onto husky), .npmrc, CI writers
  │   ├── lockfile/lockfile.go    package-lock.json reader (source of truth);
@@ -67,6 +73,12 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │                               paths, URLs, -r/-c/-f count as skipped; option-only
  │                               lines are ignored. lockfileNames tries it LAST, so
  │                               a node lockfile wins in a mixed repo
+ │   ├── sdist/sdist.go          pip sdists without executing them: Fetch (sha256-
+ │                               verified, capped), BuildRequires ([build-system]
+ │                               mini-TOML), Satisfies (PEP 440 subset), NeedSdist
+ │                               (parses pip's "no matching distribution")
+ │   ├── pyver/pyver.go          PyPI NormalizeName / Stable / Compare / FileVersion
+ │                               (shared by freshness, registry/pypi, sdist)
  │   ├── lockfile/graph.go       package-lock graph rebuild for `guard why` (parent→child edges)
  │   ├── sbom/sbom.go            CycloneDX 1.5 / SPDX 2.3 SBOM renderer (`guard sbom`)
  │   ├── semver/semver.go        minimal version compare (dist-tag repointing)
@@ -83,10 +95,11 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   └── run.mjs                 narrates guard handling each, asserts outcomes
  └── test/                       vitest black-box e2e suite (runs the real binary)
      ├── helpers/registry.mjs    mock npm registry w/ fabricated publish ages
-     ├── helpers/pypi.mjs        mock PyPI (PEP 691 index + JSON API) w/ fabricated upload ages
+     ├── helpers/pypi.mjs        mock PyPI (PEP 691 index + JSON API) w/ fabricated upload ages;
+     │                           real sdists + inTreeSdist (in-tree PEP 517 backend fixture)
      ├── helpers/tar.mjs         hand-rolled USTAR+gzip (zero test deps)
      ├── helpers/run.mjs         temp projects + binary spawner
-     └── *.test.mjs              cooldown / additions / scripts / init / secrets / python / pip-check / pip-install suites
+     └── *.test.mjs              cooldown / additions / scripts / init / secrets / python / pip-check / pip-install / pip-sdist suites
 ```
 
 ## Flow: `guard install` (and `guard ci`)
@@ -98,9 +111,17 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    ├─ approvals.Load ───────── .guard-approvals
    │
    ├─ mgr == "pip" → installPip: registry.StartPyPI → pip install --index-url
-   │     <proxy>/simple/ --only-binary=:all: (dropped by --allow-sdist, with a
-   │     warning) → reportBlocked → installGates over requirements.txt; pipEnv
-   │     strips PIP_INDEX_URL/PIP_EXTRA_INDEX_URL; no script approval (npm-only)
+   │     <proxy>/simple/ --only-binary=:all: → reportBlocked → installGates over
+   │     requirements.txt; pipEnv strips PIP_INDEX_URL/PIP_EXTRA_INDEX_URL.
+   │     --allow-sdist → pip_sdist.go installPipSdists: loop { runPip download
+   │     wheels-only (+ --no-binary per admitted pkg) → sdist.NeedSdist → admit:
+   │     pickSdist via the proxy → sdist.Fetch → scanner.ScanSdist → approvals
+   │     (bound to sha256) → build deps as wheels (sdist.ValidRequirement first)
+   │     → box.RunPyBuild verdict → append name==ver to <stash>/guard-constraints.txt }
+   │     → verifyStash (every sdist approved for its sha256) → pip install --no-index
+   │     --find-links <stash> -c <constraints>. pickSdist honors requires-python
+   │     (hostPython seam). runPip / boxRuntime /
+   │     ensureObsImage / runPyBuild are vars (test seams)
    ├─ registry.Start ───────── proxy on 127.0.0.1:random, THIS command only
    │     └─ servePackument → rewrite():  allowlist bypass → typosquat/homoglyph
    │                          NAME gate (empties versions, fail closed) →
@@ -251,9 +272,12 @@ the shared history.
 | VS Code askpass argv shaping (why the question isn't a single argument there) | `main.go` `vscodeAskpassArgs` — called from `promptViaAskpass` when `VSCODE_GIT_ASKPASS_MAIN` is set |
 | New waiver-id kind | `main.go` `validWaiverID` + a `<kind>WaiverID` helper |
 | Append-to-a-list command | `config.AddSecretPath` / `AddAllow` (Load → dedup → SetValue); `main.go` `cmdSecretAdd` / `cmdAllow` + dispatch case |
-| Box hardening / seccomp | `box/box.go` `Run()` args + `seccompProfile` |
+| Box hardening / seccomp | `box/box.go` `runArgs()` (shared by Run + RunPyBuild) + `seccompProfile` |
 | New dynamic (syscall) signal | `trace/trace.go` — add a matcher; convict only on no-build-excuse behavior |
-| Box hardening / different runtime | `box/box.go` `Run()` arg list; image digest + obs Dockerfile at top |
+| Box hardening / different runtime | `box/box.go` `runArgs()`; image digest + obs Dockerfile at top (bump `obsImage` on any recipe change) |
+| New Python capability signal | `scanner/scanner.go` `pyCapabilityPatterns` |
+| pip sdist admission (what gets trial-built, refusals) | `pip_sdist.go` `resolve` / `admit` / `trialBuild`; box side `box.RunPyBuild` / `pySpec` |
+| pip builds only what was observed (version pin, stash re-check, build-requirement validation) | `pip_sdist.go` `constraintsFile` (+ `-c` on every pip call), `verifyStash`, `pickSdist` requires-python filter; `sdist.ValidRequirement` in `BuildRequires` |
 | Demo scenarios | `demo/packages.mjs` (entry + `expect` + `why`) |
 | Policy file keys | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | New CLI command | `main.go` dispatch switch + a `cmdX` func |

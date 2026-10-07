@@ -9,12 +9,15 @@ package scanner
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"depguard/internal/sdist"
 )
 
 // maxArchiveBytes caps TOTAL decompressed bytes across the whole tarball. The
@@ -49,6 +52,58 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // classification matches an installed layout. The stream is read under a total
 // decompression budget so a malicious tarball cannot exhaust memory/CPU.
 func ScanTarball(r io.Reader) (Report, error) {
+	return scanTar(r, func(name string) (string, bool) {
+		name = strings.TrimPrefix(name, "package/")
+		// Bundled deps get judged on their own.
+		return name, !strings.Contains(name, "node_modules/")
+	})
+}
+
+// ScanSdist scans a Python source distribution (.tar.gz) the same way: every
+// file through the shared sweeps (Python code gets the Python patterns), with the
+// "<name>-<version>/" root stripped. Report.Scripts carries the build facts a
+// reviewer approves — the backend, its requirements, a setup.py — since an sdist
+// runs that code at build time. A pyproject.toml guard can't read is a finding.
+func ScanSdist(tgz []byte) (Report, error) {
+	rep, err := scanTar(bytes.NewReader(tgz), func(name string) (string, bool) {
+		_, rel, ok := strings.Cut(strings.TrimPrefix(name, "./"), "/")
+		return rel, ok && rel != ""
+	})
+	if err != nil {
+		return rep, err
+	}
+	b, berr := sdist.BuildRequires(tgz)
+	if berr != nil {
+		rep.Findings = append(rep.Findings, Finding{Severity: Danger, What: "unreadable [build-system] table: " + berr.Error(), Where: "pyproject.toml"})
+	}
+	rep.Scripts = buildFacts(b)
+	return rep, nil
+}
+
+// buildFacts renders an sdist's build setup as the prompt's "scripts" lines.
+func buildFacts(b sdist.Build) map[string]string {
+	facts := map[string]string{}
+	switch {
+	case b.Backend != "" && b.InTree:
+		facts["build backend"] = b.Backend + " (in-tree)"
+	case b.Backend != "":
+		facts["build backend"] = b.Backend
+	default:
+		facts["build backend"] = "setuptools (legacy setup.py)"
+	}
+	facts["build requires"] = "(none)"
+	if len(b.Requires) > 0 {
+		facts["build requires"] = strings.Join(b.Requires, ", ")
+	}
+	if b.SetupPy {
+		facts["setup.py"] = "present (runs at build time)"
+	}
+	return facts
+}
+
+// scanTar walks a gzipped tar under the decompression budget, mapping each
+// entry name through rel (which may also skip it) before the shared sweep.
+func scanTar(r io.Reader, rel func(string) (string, bool)) (Report, error) {
 	rep := Report{}
 	gz, err := gzip.NewReader(r)
 	if err != nil {
@@ -90,9 +145,9 @@ func ScanTarball(r io.Reader) (Report, error) {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		name := strings.TrimPrefix(hdr.Name, "package/")
-		if strings.Contains(name, "node_modules/") {
-			continue // bundled deps get judged on their own
+		name, ok := rel(hdr.Name)
+		if !ok {
+			continue
 		}
 		// Stream the entry IN FULL through the shared sweep. The whole tar
 		// stream is already under maxArchiveBytes (via counted), and scanReader

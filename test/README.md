@@ -58,8 +58,8 @@ fails open by design, so tests pass either way).
 | File | Job |
 |---|---|
 | `helpers/registry.mjs` | `MockRegistry` — `publish(name, version, {ageDays, scripts, files})`, serves packuments + tarballs on a random port |
-| `helpers/pypi.mjs` | `MockPyPI` — `publish(name, version, {ageDays, sdist})`, serves PEP 691 JSON `/simple/<name>/` pages AND the JSON API (`/pypi/<name>/json`, `/pypi/<name>/<ver>/json`) from the same fabricated `upload-time`s, so both the install proxy and `guard check`'s cooldown run offline; file URLs point at a closed port |
-| `helpers/tar.mjs` | `packTgz(files)` — minimal USTAR+gzip encoder so fabricated tarballs need no tar dependency |
+| `helpers/pypi.mjs` | `MockPyPI` — `publish(name, version, {ageDays, sdist, files, requiresPython})` (`files` = a REAL sdist, served with its real sha256), serves PEP 691 JSON `/simple/<name>/` pages AND the JSON API (`/pypi/<name>/json`, `/pypi/<name>/<ver>/json`) from the same fabricated `upload-time`s, so both the install proxy and `guard check`'s cooldown run offline; other file URLs point at a closed port. `inTreeSdist(name, ver, {evil})` is the buildable fixture: `requires = []` + `backend-path = ["."]` and a `backend.py` that writes a minimal wheel with `zipfile` alone — so pip and the box build it with no build dependencies and no network; `evil` adds a connect to 203.0.113.1:80 in `build_wheel` |
+| `helpers/tar.mjs` | `packTgz(files, root='package')` — minimal USTAR+gzip encoder so fabricated tarballs (and sdists, rooted at `<name>-<version>`) need no tar dependency |
 | `helpers/run.mjs` | `makeProject(registryUrl, opts)` — temp dir with `package.json` + `.guardrc` pointed at the mock; `guard(dir, args)` — spawns the binary, resolves `{code, stdout, stderr}` (optional 3rd arg: extra env) |
 | `globalSetup.mjs` | builds the binary once per suite run |
 
@@ -83,7 +83,8 @@ Two deliberate harness choices:
 | `secrets.test.mjs` | 6 | the secret-file gate: staged `.env` blocked, untracked file ignored, `*.pem` basename glob, `guard ignore secret:<path>` waiver clears it, `--json` flips `ok` to false, `guard secret-add` appends a pattern |
 | `python.test.mjs` | 4 | pip / `requirements.txt` check path (offline — `pypi:` points at a closed loopback port): `guard init` writes no `.npmrc`; hashed pins pass; unhashed pins warn once (collapsed) and stay `ok`; a conflicting `--hash` pair gates |
 | `pip-check.test.mjs` | 7 | pip repos without pip, against `MockPyPI`'s JSON API: pre-commit cooldown judges only the staged addition and `guard ignore cooldown:` clears it; `--json` (`unhashedWarnings`, `conflicting` + `ok`); MCP `check_dependencies` on a pip dir; a mixed package-lock + requirements.txt repo is checked as npm; `guard sbom` / `--spdx` purls + SHA-256; `--extra-index-url` / `--no-binary` refused with exit 2; `guard why` exits 2 |
-| `pip-install.test.mjs` | 4 | `guard install` through real pip + the PyPI index proxy against `MockPyPI` (skipped when `pip` isn't on PATH): the too-fresh version is hidden and pip picks the old wheel; `PIP_EXTRA_INDEX_URL` is stripped; an sdist-only project gets the `--allow-sdist` hint, and the flag's unboxed warning; `--allow-sdist` unlocks `--no-binary`; a typosquat name is hidden (pip: "No matching distribution", guard: "see the hidden versions above") and `allow:` lets it through. File URLs are unfetchable, so pip always fails after resolving and nothing installs |
+| `pip-install.test.mjs` | 5 | `guard install` through real pip + the PyPI index proxy against `MockPyPI` (skipped when `pip` isn't on PATH): the too-fresh version is hidden and pip picks the old wheel; `PIP_EXTRA_INDEX_URL` is stripped; an sdist-only project gets the `--allow-sdist` hint, and with the flag but no one to answer, the scan report + `guard approve` line and nothing recorded; `--no-binary` is refused with `--allow-sdist`; an uncontained approval is refused under `no-container-fallback: fail`; a typosquat name is hidden and `allow:` lets it through |
+| `pip-sdist.test.mjs` | 2 | the boxed sdist trial build, gated on docker AND pip: a clean in-tree-backend sdist needs `guard approve`, then trial-builds in the box and pip installs it into a `--target` dir (`.dist-info` present, approval bound to the sha256) — a newer 2.0.0 with `requires-python: >=3.99` is NOT picked, so the approval key, the trial build and pip's install are all 1.0.0; an `evil` one is convicted by the trace (`203.0.113.1:80`), its approval flips to `denied`, nothing installs. First run builds `depguard-box:4` (~15s here) |
 
 ## Adding a test
 
@@ -110,7 +111,7 @@ or the `docker run` flags. Run as a non-root uid, with the same flags `box.Run`
 uses:
 
 ```sh
-IMG=depguard-box:2   # box.ObsImageName()
+IMG=depguard-box:4   # box.ObsImageName()
 docker run --rm --read-only --network none --tmpfs /tmp:size=64m \
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --user 1000:1000 \
   $IMG sh -c "exec strace -f -q -e trace=%network,execve,openat -s 512 -o /dev/stdout sh -c '
