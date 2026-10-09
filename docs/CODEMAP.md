@@ -22,7 +22,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  ├── internal/
  │   ├── config/config.go        .guardrc policy: parse, defaults, validation
  │   ├── approvals/approvals.go  .guard-approvals: ask-once script decisions
- │   ├── waivers/waivers.go      .guard-ignores: reviewed-finding waivers (suppress check gates)
+ │   ├── waivers/waivers.go      .guard-ignores: reviewed-finding waivers (check gates + install OSV filter); AdvisoryID
  │   ├── ui/ui.go                tiny NO_COLOR-aware ANSI color helper (status + check glyphs)
  │   ├── registry/pypi.go        PyPI twin: PEP 691 JSON /simple/<name>/ filter
  │                               (SuspicionPyPI name gate → cooldown by earliest
@@ -45,7 +45,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
  │   ├── license/license.go      license-deny/allow gate on installed deps' SPDX ids
  │   ├── advisory/osv.go         OSV.dev known-bad feed client (Check = batch ids;
  │   │                           Severities = per-vuln detail for tiering; Blocks;
- │   │                           BlockingVersions = severity-tiered resolve-time filter)
+ │   │                           BlockingVersions = severity-tiered resolve-time filter, all ids/version)
  │   ├── box/box.go              docker/podman sealed+traced+seccomp runner: runSpec
  │                               (npmSpec / pySpec) → runArgs → execBox, shared by
  │                               Run (npm scripts) and RunPyBuild (sdist trial build)
@@ -111,7 +111,7 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    ├─ approvals.Load ───────── .guard-approvals
    │
    ├─ mgr == "pip" → installPip: registry.StartPyPI → pip install --index-url
-   │     <proxy>/simple/ --only-binary=:all: → reportBlocked → installGates over
+   │     <proxy>/simple/ --only-binary=:all: → reportProxy → installGates over
    │     requirements.txt; pipEnv strips PIP_INDEX_URL/PIP_EXTRA_INDEX_URL.
    │     --allow-sdist → pip_sdist.go installPipSdists: loop { runPip download
    │     wheels-only (+ --no-binary per admitted pkg) → sdist.NeedSdist → admit:
@@ -122,14 +122,23 @@ Companion to [DESIGN.md](DESIGN.md) (the *why*) and [README.md](../README.md) (t
    │     --find-links <stash> -c <constraints>. pickSdist honors requires-python
    │     (hostPython seam). runPip / boxRuntime /
    │     ensureObsImage / runPyBuild are vars (test seams)
-   ├─ registry.Start ───────── proxy on 127.0.0.1:random, THIS command only
+   ├─ waivers.Load ─────────── .guard-ignores, injected into the proxy + installGates
+   ├─ registry.Start(cfg, wf)  proxy on 127.0.0.1:random, THIS command only
    │     └─ servePackument → rewrite():  allowlist bypass → typosquat/homoglyph
    │                          NAME gate (empties versions, fail closed) →
-   │                          cooldown filter + dist-tags.latest repoint
+   │                          cooldown filter → ledger.filterOSV (shared with
+   │                          pypi.go: keeps a version only if every blocking
+   │                          id has an active waivers.AdvisoryID waiver, never
+   │                          MAL-*; records a Waivable when nothing survives,
+   │                          .Cooldown = a newer cooldown-held version; ledger
+   │                          dedupes by name@version for pip's refetches) →
+   │                          signatures + dist-tags.latest repoint
    │                          (semver.MaxStable); fails CLOSED on rewrite errors
    │
    ├─ exec npm install/ci ──── --registry=proxy --ignore-scripts (flags win over .npmrc)
-   ├─ report proxy.BlockedVersions()
+   ├─ reportProxy ──────────── BlockedVersions + reportWaivers (kept-by-waiver lines,
+   │                           a `guard ignore` hint per AllFlagged package; upstream
+   │                           text via printable(), ids via shellQuote())
    │
    ├─ installGates ────────── advisories → integrity → cooldown, BEFORE any script
    │                           runs (node_modules is on disk, nothing has executed);
@@ -281,7 +290,7 @@ the shared history.
 | Demo scenarios | `demo/packages.mjs` (entry + `expect` + `why`) |
 | Policy file keys | `config/config.go` `Load()` switch + `WriteDefault` starter |
 | New CLI command | `main.go` dispatch switch + a `cmdX` func |
-| Waiver kind / ID scheme | `internal/waivers/waivers.go` + `main.go` `*WaiverID` helpers + `validWaiverID` |
+| Waiver kind / ID scheme | `internal/waivers/waivers.go` (`AdvisoryID`, shared with the proxy) + `main.go` `*WaiverID` helpers + `validWaiverID` |
 | `guard status` rows | `main.go` `cmdStatus` (+ `hooks.Installed`, `box.Runtime`) — read-only, OFFLINE |
 | Editable `.guardrc` key (allow/config) | `config/config.go` `canonicalValue` + `writeKeyLine`; surfaced by `cmdAllow`/`cmdConfig` |
 | Terminal color | `internal/ui/ui.go` (gate = NO_COLOR + both streams TTY) |

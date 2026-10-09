@@ -108,7 +108,7 @@ func newHarness(t *testing.T, u *pypiUpstream, cfg config.Config, pip func(args 
 	if cfg.Cooldown == 0 {
 		cfg.Cooldown = 14 * 24 * time.Hour
 	}
-	proxy, err := registry.StartPyPI(cfg)
+	proxy, err := registry.StartPyPI(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

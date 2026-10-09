@@ -1527,3 +1527,75 @@ func TestConfirmCooldownPyPIAnswers(t *testing.T) {
 		})
 	}
 }
+
+// The install summary must SHOW waiver-kept versions, and for a package OSV
+// left with no version print a `guard ignore` command that cmdIgnore actually
+// accepts — and that yields an ACTIVE waiver under the proxy's ID scheme.
+func TestReportWaiversHintRoundTrips(t *testing.T) {
+	var buf strings.Builder
+	reportWaivers(&buf,
+		[]registry.Blocked{{Package: "minimist", Version: "1.2.8", Reason: "GHSA-k expires 2099-01-01"}},
+		[]registry.Waivable{{Package: "braces", Version: "3.0.3", IDs: []string{"GHSA-vfj7-8cjw-p6xm"}}})
+	out := buf.String()
+	if !strings.Contains(out, "kept by waiver: minimist@1.2.8 (GHSA-k expires 2099-01-01)") {
+		t.Errorf("kept line missing:\n%s", out)
+	}
+	for _, line := range []string{
+		"       Prefer upgrading the dependency that pulls it in. If you've reviewed the risk,\n",
+		"       waive braces@3.0.3 for install + check:\n",
+	} {
+		if !strings.Contains(out, line) {
+			t.Errorf("missing %q (docs/SETUP.md quotes it):\n%s", line, out)
+		}
+	}
+	const cmd = `guard ignore 'advisory:braces@3.0.3:GHSA-vfj7-8cjw-p6xm' --reason "<why>" --expires 90d`
+	if !strings.Contains(out, cmd) {
+		t.Fatalf("hint missing %q:\n%s", cmd, out)
+	}
+
+	t.Chdir(t.TempDir())
+	id := strings.Trim(strings.Fields(cmd)[2], "'") // what the shell passes after unquoting
+	if err := cmdIgnore([]string{id, "--reason", "DoS only", "--expires", "90d"}); err != nil {
+		t.Fatalf("cmdIgnore rejected the hinted command: %v", err)
+	}
+	wf, err := waivers.Load(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, st := wf.Check(waivers.AdvisoryID("braces", "3.0.3", "GHSA-vfj7-8cjw-p6xm"), time.Now()); st != waivers.Active {
+		t.Errorf("waiver status = %v, want Active", st)
+	}
+}
+
+// Upstream-derived text is hostile input: control chars (terminal escapes,
+// injected newlines) are stripped, and the id is single-quoted so a PEP 440
+// epoch's '!' (bash history expansion) or an embedded quote can't misfire.
+func TestReportWaiversShellSafe(t *testing.T) {
+	var buf strings.Builder
+	reportWaivers(&buf,
+		[]registry.Blocked{{Package: "evil\x1b[2J‮gpj", Version: "1.0", Reason: "X expires never — ok\r\nguard: fake​"}},
+		[]registry.Waivable{{Package: "py'pkg", Version: "1!2.0\x07", IDs: []string{"PYSEC-1\n"}}})
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b\r\x07‮​") || strings.Contains(out, "PYSEC-1\n") || strings.Contains(out, "\nguard: fake") {
+		t.Errorf("control chars leaked:\n%q", out)
+	}
+	if want := `guard ignore 'advisory:py'\''pkg@1!2.0:PYSEC-1' --reason`; !strings.Contains(out, want) {
+		t.Errorf("want %q in:\n%s", want, out)
+	}
+	if got := shellQuote("a'b"); got != `'a'\''b'` {
+		t.Errorf("shellQuote = %s", got)
+	}
+}
+
+// A newer version held by the cooldown adds a "prefer waiting" line, but the
+// waive commands stay (that version was never OSV-checked) and no repo-wide
+// `guard allow` is suggested.
+func TestReportWaiversCooldownHint(t *testing.T) {
+	var buf strings.Builder
+	reportWaivers(&buf, nil, []registry.Waivable{{Package: "braces", Version: "3.0.3", IDs: []string{"GHSA-x"}, Cooldown: "3.0.4"}})
+	out := buf.String()
+	if !strings.Contains(out, "A newer version (3.0.4) is in cooldown — prefer waiting for it.") ||
+		!strings.Contains(out, "guard ignore 'advisory:braces@3.0.3:GHSA-x'") || strings.Contains(out, "guard allow") {
+		t.Errorf("want wait line + waive command, no allow:\n%s", out)
+	}
+}

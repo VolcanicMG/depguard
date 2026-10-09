@@ -43,7 +43,7 @@ func fetchPage(t *testing.T, cfg config.Config, upstream http.HandlerFunc, path,
 	if cfg.Cooldown == 0 {
 		cfg.Cooldown = 14 * 24 * time.Hour
 	}
-	p, err := StartPyPI(cfg)
+	p, err := StartPyPI(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,9 +170,9 @@ func TestPyPIProxyProtocolEdges(t *testing.T) {
 func TestPyPIProxyOSV(t *testing.T) {
 	old := osvBlockingVersions
 	var gotEco string
-	osvBlockingVersions = func(eco, name string, vs []string, _ advisory.Severity) (map[string]string, error) {
+	osvBlockingVersions = func(eco, name string, vs []string, _ advisory.Severity) (map[string][]string, error) {
 		gotEco = eco
-		return map[string]string{"1.0": "PYSEC-1"}, nil
+		return map[string][]string{"1.0": {"PYSEC-1"}}, nil
 	}
 	defer func() { osvBlockingVersions = old }()
 	p := &PyPIProxy{cfg: config.Config{PyPI: "https://pypi.example", Cooldown: time.Hour}}
@@ -219,7 +219,7 @@ func reasons(p *PyPIProxy) map[string]string {
 	return out
 }
 
-func stubOSV(t *testing.T, fn func(eco, name string, vs []string, _ advisory.Severity) (map[string]string, error)) {
+func stubOSV(t *testing.T, fn func(eco, name string, vs []string, _ advisory.Severity) (map[string][]string, error)) {
 	t.Helper()
 	old := osvBlockingVersions
 	osvBlockingVersions = fn
@@ -228,7 +228,7 @@ func stubOSV(t *testing.T, fn func(eco, name string, vs []string, _ advisory.Sev
 
 // An OSV lookup error fails OPEN: nothing dropped, nothing recorded.
 func TestPyPIProxyOSVErrorFailsOpen(t *testing.T) {
-	stubOSV(t, func(string, string, []string, advisory.Severity) (map[string]string, error) {
+	stubOSV(t, func(string, string, []string, advisory.Severity) (map[string][]string, error) {
 		return nil, fmt.Errorf("osv down")
 	})
 	p := &PyPIProxy{cfg: config.Config{PyPI: "https://pypi.example", Cooldown: time.Hour}}
@@ -240,8 +240,8 @@ func TestPyPIProxyOSVErrorFailsOpen(t *testing.T) {
 
 // OSV and the cooldown each drop their own version, with distinct reasons.
 func TestPyPIProxyOSVAndCooldownTogether(t *testing.T) {
-	stubOSV(t, func(_, _ string, vs []string, _ advisory.Severity) (map[string]string, error) {
-		return map[string]string{"1.0": "MAL-1"}, nil
+	stubOSV(t, func(_, _ string, vs []string, _ advisory.Severity) (map[string][]string, error) {
+		return map[string][]string{"1.0": {"MAL-1"}}, nil
 	})
 	p := &PyPIProxy{cfg: config.Config{PyPI: "https://pypi.example", Cooldown: 14 * 24 * time.Hour}}
 	doc := rewriteDoc(t, p, "pkg", simplePage("pkg", [][2]string{
@@ -424,7 +424,7 @@ func TestPyPIProxyConcurrent(t *testing.T) {
 	defer srv.Close()
 	cfg := loopCfg()
 	cfg.PyPI = srv.URL
-	p, err := StartPyPI(cfg)
+	p, err := StartPyPI(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

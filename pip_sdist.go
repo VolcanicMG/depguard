@@ -167,7 +167,7 @@ func installPipSdists(dir string, cfg config.Config, sub string, args []string, 
 	r := &sdistRun{dir: dir, cfg: cfg, appr: appr, index: proxy.URL(), blocked: proxy.BlockedVersions,
 		stash: stash, client: &http.Client{Timeout: 60 * time.Second}}
 	if err := r.resolve(pipDownloadArgs(sub, args)); err != nil {
-		reportBlocked(proxy.BlockedVersions())
+		reportProxy(proxy)
 		return err
 	}
 	if err := verifyStash(stash, appr); err != nil {
@@ -178,7 +178,7 @@ func installPipSdists(dir string, cfg config.Config, sub string, args []string, 
 		install = append(install, "-r", "requirements.txt")
 	}
 	_, code := runPip(append(install, args...))
-	reportBlocked(proxy.BlockedVersions())
+	reportProxy(proxy)
 	if code != 0 {
 		return &exitError{max(code, 1), ""}
 	}

@@ -50,6 +50,13 @@ type File struct {
 	Ignores map[string]Entry `json:"ignores"`
 }
 
+// AdvisoryID is the waiver ID for one OSV advisory on one exact version:
+// "advisory:<name>@<version>:<osv-id>". The single source of the format —
+// `guard check` and the install proxy must agree on it byte-for-byte.
+func AdvisoryID(name, version, osvID string) string {
+	return "advisory:" + name + "@" + version + ":" + osvID
+}
+
 // Load reads dir/.guard-ignores; a missing file is an empty (not error) state,
 // so every command works in a repo that has never waived anything.
 func Load(dir string) (*File, error) {

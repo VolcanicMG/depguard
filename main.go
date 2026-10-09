@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"depguard/internal/advisory"
 	"depguard/internal/approvals"
@@ -395,9 +396,14 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	if mgr == "pip" {
 		return installPip(dir, cfg, npmCmd, npmArgs)
 	}
+	// Waivers feed both the proxy's OSV filter and the post-install gates.
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
 
 	// 1. Ephemeral proxy: exists only for this command (§5).
-	proxy, err := registry.Start(cfg)
+	proxy, err := registry.Start(cfg, wf)
 	if err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}
@@ -416,7 +422,7 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 
 	// 3. Tell the human what the filter hid and why — even when npm failed,
 	// because "all versions in cooldown" IS the explanation for the failure.
-	reportBlocked(proxy.BlockedVersions())
+	reportProxy(proxy)
 	// Deprecated default-resolutions (informational, not a failure).
 	if dep := proxy.DeprecatedVersions(); len(dep) > 0 {
 		fmt.Fprintf(os.Stderr, "\nguard: %d package(s) resolve to a DEPRECATED version:\n", len(dep))
@@ -434,10 +440,6 @@ func cmdInstall(npmCmd string, npmArgs []string) error {
 	// Running these after the scripts (the old order) meant the gate reported on
 	// code that had already had its say. Scope is git-diff like the hook, so only
 	// versions THIS install introduced are cooldown-vetted.
-	wf, err := waivers.Load(dir)
-	if err != nil {
-		return err
-	}
 	if err := installGates(dir, cfg, wf); err != nil {
 		return err
 	}
@@ -492,8 +494,65 @@ func reportBlocked(blocked []registry.Blocked) {
 		// cooldown"), and blaming the wrong one misleads diagnosis.
 		ex := dominantBlocked(bs)
 		fmt.Fprintf(os.Stderr, "  %-30s %d version(s), e.g. %s (%s)\n",
-			n, len(bs), ex.Version, ex.Reason)
+			printable(n), len(bs), printable(ex.Version), printable(ex.Reason))
 	}
+}
+
+// proxyLedger is the install-summary view both registry proxies expose.
+type proxyLedger interface {
+	BlockedVersions() []registry.Blocked
+	WaivedVersions() []registry.Blocked
+	AllFlagged() []registry.Waivable
+}
+
+// reportProxy prints the whole proxy summary to stderr: what was hidden, what
+// a waiver kept, and how to unblock a package OSV left with no version at all.
+func reportProxy(p proxyLedger) {
+	reportBlocked(p.BlockedVersions())
+	reportWaivers(os.Stderr, p.WaivedVersions(), p.AllFlagged())
+}
+
+// reportWaivers prints the waiver-kept versions (a waiver silences the gate,
+// never hides the fact) and, for each package with every version advisory-
+// blocked, the exact `guard ignore` command(s) that would admit its newest
+// waivable version. MAL-* versions never get a hint — they can't be waived.
+// Names, versions and ids come from upstream registries/OSV: control chars are
+// stripped, and the printed id is single-quoted so it pastes safely (PEP 440
+// epochs like 1!2.0 would trigger bash history expansion unquoted).
+func reportWaivers(w io.Writer, kept []registry.Blocked, flagged []registry.Waivable) {
+	for _, k := range kept {
+		fmt.Fprintf(w, "guard: %s kept by waiver: %s@%s (%s)\n", ui.Waived(), printable(k.Package), printable(k.Version), printable(k.Reason))
+	}
+	for _, f := range flagged {
+		pkg, ver := printable(f.Package), printable(f.Version)
+		fmt.Fprintf(w, "\nguard: every version of %s is blocked by an advisory (nothing to resolve).\n", pkg)
+		if f.Cooldown != "" {
+			// Not OSV-checked (the cooldown dropped it first), so the waive path stays.
+			fmt.Fprintf(w, "       A newer version (%s) is in cooldown — prefer waiting for it.\n", printable(f.Cooldown))
+		}
+		fmt.Fprintf(w, "       Prefer upgrading the dependency that pulls it in. If you've reviewed the risk,\n"+
+			"       waive %s@%s for install + check:\n", pkg, ver)
+		for _, id := range f.IDs {
+			fmt.Fprintf(w, "         guard ignore %s --reason \"<why>\" --expires 90d\n", shellQuote(waivers.AdvisoryID(pkg, ver, printable(id))))
+		}
+	}
+}
+
+// printable drops control (Cc: ESC, CR, newlines…) and format (Cf: bidi
+// overrides like U+202E, zero-width) characters from upstream-derived text
+// before it reaches the terminal.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// shellQuote single-quotes s for POSIX shells (no expansion of any kind inside).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // installPip is cmdInstall for a pip project: pip resolves through the PyPI
@@ -508,7 +567,11 @@ func installPip(dir string, cfg config.Config, sub string, userArgs []string) er
 		fmt.Fprintln(os.Stderr, "guard install:", err)
 		os.Exit(2)
 	}
-	proxy, err := registry.StartPyPI(cfg)
+	wf, err := waivers.Load(dir)
+	if err != nil {
+		return err
+	}
+	proxy, err := registry.StartPyPI(cfg, wf)
 	if err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}
@@ -516,7 +579,7 @@ func installPip(dir string, cfg config.Config, sub string, userArgs []string) er
 
 	if onlyBinary {
 		out, code := runPip(buildInstall("pip", sub, args, proxy.URL(), true).args)
-		reportBlocked(proxy.BlockedVersions())
+		reportProxy(proxy)
 		if code != 0 {
 			if hint := pipFailHint(out, true, len(proxy.BlockedVersions())); hint != "" {
 				fmt.Fprintln(os.Stderr, "guard:", hint)
@@ -538,10 +601,6 @@ func installPip(dir string, cfg config.Config, sub string, userArgs []string) er
 		return err
 	}
 
-	wf, err := waivers.Load(dir)
-	if err != nil {
-		return err
-	}
 	if err := installGates(dir, cfg, wf); err != nil {
 		return err
 	}
@@ -1277,7 +1336,7 @@ type CheckResult struct {
 
 // advisoryWaiverID is "advisory:<name>@<version>:<osv-id>".
 func advisoryWaiverID(v advisory.Vuln) string {
-	return fmt.Sprintf("advisory:%s@%s:%s", v.Package, v.Version, v.ID)
+	return waivers.AdvisoryID(v.Package, v.Version, v.ID)
 }
 
 // cooldownWaiverID is "cooldown:<name>@<version>".
@@ -2039,7 +2098,7 @@ func confirmCooldown(dir string, cfg config.Config, eco string, active []freshne
 		fmt.Fprintf(out, "guard: recorded %d cooldown acceptance(s) in %s\n", len(active), waivers.FileName)
 		return true, true, nil
 	case "p", "pin":
-		if e := pinAndReinstall(dir, cfg, active, safe, out); e != nil {
+		if e := pinAndReinstall(dir, cfg, wf, active, safe, out); e != nil {
 			fmt.Fprintln(out, "guard: pin failed:", e)
 			return false, true, nil // failed pin = not resolved; caller aborts
 		}
@@ -2057,7 +2116,7 @@ func confirmCooldown(dir string, cfg config.Config, eco string, active []freshne
 // they're reported; the reinstall may still resolve them to an older survivor.
 // Errors if nothing could be pinned, the reinstall fails, or a violation
 // survives the reinstall.
-func pinAndReinstall(dir string, cfg config.Config, active []freshness.Violation, safe map[string]string, out io.Writer) error {
+func pinAndReinstall(dir string, cfg config.Config, wf *waivers.File, active []freshness.Violation, safe map[string]string, out io.Writer) error {
 	pinned, unpinnable, err := pinPackageJSON(dir, active, safe)
 	if err != nil {
 		return err
@@ -2073,7 +2132,7 @@ func pinAndReinstall(dir string, cfg config.Config, active []freshness.Violation
 	}
 	// Reinstall through the proxy so the (older) versions are fetched under the
 	// same cooldown/advisory protections; lifecycle scripts stay off.
-	proxy, err := registry.Start(cfg)
+	proxy, err := registry.Start(cfg, wf)
 	if err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}

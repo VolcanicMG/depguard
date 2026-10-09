@@ -14,12 +14,12 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"depguard/internal/config"
 	"depguard/internal/pyver"
 	"depguard/internal/typosquat"
+	"depguard/internal/waivers"
 )
 
 // pypiJSON is the PEP 691 media type — the only one this proxy speaks.
@@ -27,21 +27,23 @@ const pypiJSON = "application/vnd.pypi.simple.v1+json"
 
 // PyPIProxy is a single-command PyPI Simple-index filter.
 type PyPIProxy struct {
-	cfg     config.Config
-	server  *http.Server
-	addr    string
-	client  *http.Client
-	mu      sync.Mutex
-	blocked []Blocked
+	ledger
+	cfg    config.Config
+	wf     *waivers.File // .guard-ignores; nil = no waivers
+	server *http.Server
+	addr   string
+	client *http.Client
 }
 
-// StartPyPI binds the PyPI proxy to a random localhost port. Always pair with Stop.
-func StartPyPI(cfg config.Config) (*PyPIProxy, error) {
+// StartPyPI binds the PyPI proxy to a random localhost port. wf is the repo's
+// .guard-ignores (nil = none), applied to the OSV filter exactly as for npm.
+// Always pair with Stop.
+func StartPyPI(cfg config.Config, wf *waivers.File) (*PyPIProxy, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-	p := &PyPIProxy{cfg: cfg, client: &http.Client{Timeout: 60 * time.Second}}
+	p := &PyPIProxy{cfg: cfg, wf: wf, client: &http.Client{Timeout: 60 * time.Second}}
 	p.server = &http.Server{Handler: http.HandlerFunc(p.handle)}
 	p.addr = "http://" + ln.Addr().String()
 	go p.server.Serve(ln) //nolint:errcheck // closed via Stop
@@ -53,19 +55,6 @@ func (p *PyPIProxy) URL() string { return p.addr + "/simple/" }
 
 // Stop tears the proxy down.
 func (p *PyPIProxy) Stop() { p.server.Close() }
-
-// BlockedVersions returns everything the proxy filtered during this command.
-func (p *PyPIProxy) BlockedVersions() []Blocked {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]Blocked(nil), p.blocked...)
-}
-
-func (p *PyPIProxy) block(name, version, reason string) {
-	p.mu.Lock()
-	p.blocked = append(p.blocked, Blocked{name, version, reason})
-	p.mu.Unlock()
-}
 
 // handle serves GET /simple/<name>/ only; everything else is 404.
 func (p *PyPIProxy) handle(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +154,7 @@ func (p *PyPIProxy) rewrite(name string, raw []byte) ([]byte, error) {
 	}
 
 	drop := map[string]bool{}
-	var survivors []string
+	var survivors, held []string // held: too young, for the OSV hint
 	cutoff := time.Now().Add(-p.cfg.Cooldown)
 	for _, v := range order {
 		if allowed {
@@ -181,6 +170,7 @@ func (p *PyPIProxy) rewrite(name string, raw []byte) ([]byte, error) {
 			p.block(name, v, fmt.Sprintf("published %s ago, cooldown is %s",
 				humanDays(time.Since(pub)), humanDays(p.cfg.Cooldown)))
 			drop[v] = true
+			held = append(held, v)
 		default:
 			survivors = append(survivors, v)
 		}
@@ -188,14 +178,10 @@ func (p *PyPIProxy) rewrite(name string, raw []byte) ([]byte, error) {
 
 	// Known-bad drop, allowed names included; fails OPEN on lookup errors and is
 	// skipped for a loopback upstream (mock versions aren't in OSV's namespace).
+	// Waivers apply exactly as for npm (filterOSV).
 	if !isLoopbackHost(hostOf(p.cfg.PyPI)) && len(survivors) > 0 {
-		if flagged, err := osvBlockingVersions("pypi", name, survivors, p.cfg.AdvisoryThreshold); err == nil {
-			for _, v := range survivors {
-				if id, bad := flagged[v]; bad {
-					p.block(name, v, "OSV advisory "+id)
-					drop[v] = true
-				}
-			}
+		for v := range p.filterOSV("pypi", name, survivors, held, p.cfg.AdvisoryThreshold, p.wf, newestPy) {
+			drop[v] = true
 		}
 	}
 
@@ -221,6 +207,24 @@ func (p *PyPIProxy) rewrite(name string, raw []byte) ([]byte, error) {
 		doc["versions"] = out
 	}
 	return json.Marshal(doc)
+}
+
+// newestPy is the highest plain release in vs, else the highest by pyver's
+// numeric compare (pre/dev markers aren't ordered precisely — it's a hint).
+func newestPy(vs []string) string {
+	best, bestStable := "", ""
+	for _, v := range vs {
+		if best == "" || pyver.Less(best, v) {
+			best = v
+		}
+		if pyver.Stable(v) && (bestStable == "" || pyver.Less(bestStable, v)) {
+			bestStable = v
+		}
+	}
+	if bestStable != "" {
+		return bestStable
+	}
+	return best
 }
 
 // earliestUploadTime is a version's publish time: its FIRST file's PEP 700

@@ -673,6 +673,9 @@ agents.
                                     (§12a): only BLOCKING hits are hidden, so a
                                     moderate/low advisory with a wide range
                                     doesn't make every old version uninstallable.
+                                    A version whose EVERY blocking id has an
+                                    active .guard-ignores waiver is kept (and
+                                    shown as kept) — never a MAL-* (§13).
    → dependency confusion           internal-scopes: names that must come from a
                                     private registry are blocked from the public
                                     one (proxy, fail closed). Outranks allow: —
@@ -852,8 +855,11 @@ it hides only versions whose advisory blocks at the threshold, so a moderate/low
 advisory with a wide affected range doesn't turn into a wall of "no matching
 version" at install time — those versions install and `guard check` warns on them.
 A version blocked here was genuinely too risky to resolve under the policy (e.g. a
-HIGH advisory); the safe move is to pin a fixed version or, deliberately, lower the
-threshold / waive the specific hit.
+HIGH advisory); the safe move is to pin a fixed version or, deliberately, waive the
+specific hit on that exact version (`guard ignore advisory:<name>@<ver>:<id>`, §13)
+— the proxy honors it. Lowering the threshold is the repo-wide hammer; prefer the
+waiver. When every version of a package is blocked (no fix exists, npm fails with
+ENOVERSIONS), the install summary prints the exact waiver command for the newest one.
 
 **Interactive accept-and-record (`guard check --confirm`).** The git hooks pass
 `--confirm`. When the *only* findings are warn-tier and a controlling terminal
@@ -933,6 +939,33 @@ off-registry, unhashed) — the findings that hold up *events*. The install-time
 metadata is even served) keeps its existing escape hatch, `allow:` in `.guardrc`:
 clearing a fail-closed name block is a deliberately different decision from
 waiving a reviewed check finding.
+
+**Install-time advisory waivers.** The resolve-time OSV filter (§5,
+§12a) reads the same `.guard-ignores`, injected into the npm and PyPI proxies by
+`guard install` (one shared filter, so the rule is identical across ecosystems).
+It exists for the transitive dep with **no fixed version** (e.g. braces ≤ 3.0.3,
+GHSA-vfj7-8cjw-p6xm, under micromatch): without it the only lever was raising
+`advisory-threshold` for the whole repo.
+
+```
+ OSV blocking ids for name@ver ──► all have an ACTIVE advisory waiver
+                                   for THIS name@ver, none is MAL-* ?
+          yes ─► kept, printed "⊘ kept by waiver: name@ver (id expires … — reason)"
+          no  ─► dropped as before (partial cover, expired, other version,
+                 or a flagged version with no id at all)
+ nothing left ─► summary prints `guard ignore '<id>' …` for the newest one —
+                 plus "prefer waiting" when a NEWER version is only held by the
+                 cooldown (not OSV-checked yet, so the waiver stays on offer;
+                 `allow:` is never suggested — it's repo-wide, every version)
+```
+
+**MAL-\* is never waivable at install time** — a known-malicious version is not
+resolved, whatever `.guard-ignores` says, and gets no waiver hint. `guard check`
+is unchanged: it still lets a `MAL-*` waiver suppress (e.g. to acknowledge a
+reported package already removed from use). That asymmetry is deliberate —
+installing is where malicious code would run. Limit: "malicious" means an OSV
+id with the `MAL-` prefix — malware filed only under a GHSA id is waivable at
+install like any other advisory (accepted; the waiver is still explicit and shown).
 
 The ID scheme is the single source of truth shared by the human-prose path and
 the structured `--json` / MCP path (`CheckResult.waived`), so the two never

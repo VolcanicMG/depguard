@@ -449,6 +449,28 @@ How to think about it:
 - **Not for name blocks.** A typosquat/confusion block is cleared with `allow:` in
   `.guardrc`, not a waiver — clearing a fail-closed block is a different decision.
 
+### Unblocking a dep where EVERY version is flagged
+
+A transitive dep with no fixed release (e.g. `braces` ≤ 3.0.3 under
+`micromatch`) makes the install proxy hide every version, and npm fails with
+`ENOVERSIONS`. `guard install` then prints the exact command for the newest one:
+
+```sh
+guard: every version of braces is blocked by an advisory (nothing to resolve).
+       Prefer upgrading the dependency that pulls it in. If you've reviewed the risk,
+       waive braces@3.0.3 for install + check:
+         guard ignore 'advisory:braces@3.0.3:GHSA-vfj7-8cjw-p6xm' --reason "<why>" --expires 90d
+```
+
+First try upgrading whatever pulls it in. If you've reviewed the risk, run the
+command and re-run `guard install`. If a newer release exists but is still inside
+the cooldown, guard says so above the waiver commands — prefer waiting for it (it
+hasn't been OSV-checked yet, so the waiver stays on offer). Advisory waivers apply at install time too:
+the version is kept only when **every** blocking advisory on that exact version is
+waived and active (one per id — the hint lists each), and it's printed as
+`kept by waiver` on every install. `MAL-*` (known-malicious) is never waivable at
+install. Don't raise `advisory-threshold` for this — that loosens every package.
+
 ---
 
 ## 8. Agents / MCP

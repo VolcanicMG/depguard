@@ -170,7 +170,7 @@ The same layered defenses — but they don't all fire at once. Here they're grou
 | Typosquat / homoglyph name gate | impostor names: one-edit look-alikes (`lodahs`) and non-ASCII homoglyphs (`reаct`) |
 | Dependency-confusion gate | `internal-scopes` names resolving against the public registry |
 | Cooldown (default 14d) | freshly-published malicious versions (most are yanked within days) |
-| OSV at resolve time | known-bad versions — those carrying an advisory that **blocks** at `advisory-threshold` (MAL-*, unscored, or ≥ threshold) — dropped *before* npm resolves; moderate/low-only versions are left for `guard check` to warn on, same tiering as the check path |
+| OSV at resolve time | known-bad versions — those carrying an advisory that **blocks** at `advisory-threshold` (MAL-*, unscored, or ≥ threshold) — dropped *before* npm resolves; moderate/low-only versions are left for `guard check` to warn on, same tiering as the check path. A version whose every blocking advisory is waived in `.guard-ignores` is kept and listed as *kept by waiver*; `MAL-*` is never waivable here |
 | Registry signature verification | a present-but-invalid npm ECDSA signature on a version |
 | Exact version pinning (`.npmrc` `save-exact`) | silent `^`/`~` range drift on a later `npm install` |
 
@@ -311,7 +311,7 @@ guard sbom [--spdx]                  # write an SBOM (CycloneDX, or SPDX) to std
 
 # ── Decisions & waivers ────────────────────────────────────
 guard approve <name@version> [--uncontained|--deny]            # script decisions
-guard ignore <issue-id> [--reason ".."] [--expires 30d]        # waive a REVIEWED finding (--list, --remove)
+guard ignore <issue-id> [--reason ".."] [--expires 30d]        # waive a REVIEWED finding (--list, --remove); advisory: waivers also apply at install
 guard allow <pattern>...             # add a name/scope to .guardrc allow (bypass cooldown + typosquat ONLY; not OSV/signature/internal)
 guard secret-add <pattern>...        # append a file/dir pattern to secret-paths (never-commit gate)
 

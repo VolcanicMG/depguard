@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"depguard/internal/provenance"
 	"depguard/internal/semver"
 	"depguard/internal/typosquat"
+	"depguard/internal/waivers"
 )
 
 // maxPackumentBytes caps bytes read from an upstream packument. Real ones can
@@ -48,14 +50,172 @@ type Blocked struct {
 	Reason  string
 }
 
+// Waivable names a package whose every remaining version was dropped by OSV
+// advisories — the package manager will fail to resolve it (npm ENOVERSIONS).
+// Version is the newest one a waiver could unblock (no MAL-*); IDs are its
+// blocking advisories not yet actively waived. The install summary turns this
+// into the exact `guard ignore` command(s); a non-empty Cooldown names a NEWER
+// version the cooldown held back (maybe the fix, not yet OSV-checked), which
+// the summary suggests waiting for first.
+type Waivable struct {
+	Package  string
+	Version  string
+	IDs      []string
+	Cooldown string
+}
+
+// ledger is what a proxy records for the install summary. Shared by the npm
+// and PyPI proxies so both report — and filter OSV — the same way.
+type ledger struct {
+	mu      sync.Mutex
+	blocked []Blocked
+	waived  []Blocked // OSV-flagged but kept by waiver; Reason lists ids + expiry
+	flagged []Waivable
+}
+
+// block records one filtered version for the end-of-install summary.
+func (l *ledger) block(name, version, reason string) {
+	l.mu.Lock()
+	l.blocked = append(l.blocked, Blocked{name, version, reason})
+	l.mu.Unlock()
+}
+
+// BlockedVersions returns everything the proxy filtered during this command.
+func (l *ledger) BlockedVersions() []Blocked {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Blocked(nil), l.blocked...)
+}
+
+// WaivedVersions returns the OSV-flagged versions kept only because every
+// blocking advisory had an active waiver. A waiver silences the gate; it never
+// hides the fact.
+func (l *ledger) WaivedVersions() []Blocked {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Blocked(nil), l.waived...)
+}
+
+// AllFlagged returns the packages OSV left with no installable version.
+func (l *ledger) AllFlagged() []Waivable {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Waivable(nil), l.flagged...)
+}
+
+// filterOSV is the resolve-time known-bad filter for both ecosystems. It looks
+// survivors up in OSV (tiered by threshold) and returns the versions to drop.
+// A flagged version is KEPT only when EVERY blocking id for that exact version
+// has an ACTIVE waiver (waivers.AdvisoryID) and none is MAL-*: partial cover,
+// an expired waiver, or a waiver for another version keeps it blocked. When
+// nothing survives, the newest waivable version is recorded for the hint,
+// with Cooldown set when held (versions the cooldown dropped) has a newer one.
+// Records are deduped by name@version: pip refetches pages across invocations.
+// Fails OPEN on a lookup error — an OSV outage must not break every install.
+// newest picks the highest version in the ecosystem's ordering.
+func (l *ledger) filterOSV(eco, name string, survivors, held []string, threshold advisory.Severity, wf *waivers.File, newest func([]string) string) map[string]bool {
+	flagged, err := osvBlockingVersions(eco, name, survivors, threshold)
+	if err != nil || len(flagged) == 0 {
+		return nil
+	}
+	now := time.Now()
+	drop := map[string]bool{}
+	missing := map[string][]string{} // waivable version -> ids still unwaived
+	for _, v := range survivors {
+		ids, bad := flagged[v]
+		if !bad {
+			continue
+		}
+		uncovered, note, mal := waiverCover(wf, name, v, ids, now)
+		// len(ids) > 0: a flagged version with no ids is never "fully waived".
+		if len(ids) > 0 && len(uncovered) == 0 {
+			l.mu.Lock()
+			if !slices.ContainsFunc(l.waived, func(b Blocked) bool { return b.Package == name && b.Version == v }) {
+				l.waived = append(l.waived, Blocked{name, v, note})
+			}
+			l.mu.Unlock()
+			continue
+		}
+		reason := "OSV advisory " + strings.Join(ids, ", ")
+		if len(ids) == 0 {
+			reason = "OSV advisory (no id)"
+		}
+		l.block(name, v, reason)
+		drop[v] = true
+		if !mal && len(uncovered) > 0 {
+			missing[v] = uncovered
+		}
+	}
+	if len(drop) == len(survivors) && len(missing) > 0 {
+		vs := make([]string, 0, len(missing))
+		for v := range missing {
+			vs = append(vs, v)
+		}
+		if v := newest(vs); v != "" {
+			w := Waivable{Package: name, Version: v, IDs: missing[v]}
+			if h := newest(held); h != "" && h != v && newest([]string{v, h}) == h {
+				w.Cooldown = h
+			}
+			l.mu.Lock()
+			if !slices.ContainsFunc(l.flagged, func(f Waivable) bool { return f.Package == name }) {
+				l.flagged = append(l.flagged, w)
+			}
+			l.mu.Unlock()
+		}
+	}
+	return drop
+}
+
+// newestNpm is semver.MaxStable (stable first, then prerelease), falling back
+// to the lexical max when nothing parses — the hint must still name a version.
+func newestNpm(vs []string) string {
+	if v := semver.MaxStable(vs); v != "" || len(vs) == 0 {
+		return v
+	}
+	return slices.Max(vs)
+}
+
+// waiverCover splits name@version's blocking ids into those NOT covered by an
+// active waiver (MAL-* never counts as covered, even if waived) and, when all
+// are covered, a note for the summary ("GHSA-x expires 2027-01-01 — reason").
+// mal reports a MAL-* id — such a version is never waivable at install time.
+func waiverCover(wf *waivers.File, name, version string, ids []string, now time.Time) (uncovered []string, note string, mal bool) {
+	var parts []string
+	for _, id := range ids {
+		if strings.HasPrefix(id, "MAL-") {
+			mal = true
+			uncovered = append(uncovered, id)
+			continue
+		}
+		if wf == nil {
+			uncovered = append(uncovered, id)
+			continue
+		}
+		e, st := wf.Check(waivers.AdvisoryID(name, version, id), now)
+		if st != waivers.Active {
+			uncovered = append(uncovered, id)
+			continue
+		}
+		exp := "never expires"
+		if e.Expires != "" {
+			exp = "expires " + e.Expires
+		}
+		if e.Reason != "" {
+			exp += " — " + e.Reason
+		}
+		parts = append(parts, id+" "+exp)
+	}
+	return uncovered, strings.Join(parts, "; "), mal
+}
+
 // Proxy is a single-command npm registry filter.
 type Proxy struct {
+	ledger
 	cfg        config.Config
+	wf         *waivers.File // .guard-ignores; nil = no waivers
 	server     *http.Server
 	addr       string
 	client     *http.Client
-	mu         sync.Mutex
-	blocked    []Blocked
 	deprecated []Blocked         // reuses Blocked: Reason holds the deprecation message
 	packuCac   map[string][]byte // per-command packument cache: npm re-asks during resolution
 
@@ -80,14 +240,17 @@ func (p *Proxy) keys() *provenance.Keyring {
 }
 
 // Start binds the proxy to a random localhost port and begins serving.
+// wf is the repo's .guard-ignores (nil = none): an OSV-flagged version whose
+// every blocking advisory is actively waived is kept, and reported as such.
 // Always pair with Stop (defer p.Stop()).
-func Start(cfg config.Config) (*Proxy, error) {
+func Start(cfg config.Config, wf *waivers.File) (*Proxy, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	p := &Proxy{
 		cfg: cfg,
+		wf:  wf,
 		// Generous timeout: packuments for huge packages (types/node) are MBs.
 		client:   &http.Client{Timeout: 60 * time.Second},
 		packuCac: map[string][]byte{},
@@ -105,13 +268,6 @@ func (p *Proxy) URL() string { return p.addr }
 
 // Stop tears the proxy down. The box is ephemeral by design.
 func (p *Proxy) Stop() { p.server.Close() }
-
-// BlockedVersions returns everything the proxy filtered during this command.
-func (p *Proxy) BlockedVersions() []Blocked {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]Blocked(nil), p.blocked...)
-}
 
 // handle routes the two request shapes npm sends a registry:
 //   - GET /<name>            → packument (metadata)  → filter + rewrite
@@ -239,7 +395,7 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 	// Cooldown: drop versions too young to trust (or with no provable age).
 	// SKIPPED for allowed names (fresh-on-purpose) — they still fall through to
 	// the OSV + signature filters below.
-	var survivors []string
+	var survivors, held []string // held: too young (waiting fixes it), for the OSV hint
 	if allowed {
 		for v := range versions {
 			survivors = append(survivors, v)
@@ -257,6 +413,7 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 				p.block(name, v, fmt.Sprintf("published %s ago, cooldown is %s",
 					humanDays(time.Since(published)), humanDays(p.cfg.Cooldown)))
 				delete(versions, v)
+				held = append(held, v)
 			default:
 				survivors = append(survivors, v)
 			}
@@ -273,13 +430,13 @@ func (p *Proxy) rewrite(name string, raw []byte) ([]byte, error) {
 	// uninstallable). Only meaningful against the real public registry (a
 	// local/mock registry's versions aren't in OSV's npm namespace), and fails
 	// OPEN on lookup errors: an OSV outage must not break every install (the
-	// cooldown layer still stands).
+	// cooldown layer still stands). A .guard-ignores waiver covering EVERY
+	// blocking id of a version keeps it (never MAL-*) — see filterOSV.
 	if !isLoopbackHost(hostOf(p.cfg.Registry)) && len(survivors) > 0 {
-		if flagged, err := osvBlockingVersions("npm", name, survivors, p.cfg.AdvisoryThreshold); err == nil && len(flagged) > 0 {
+		if drop := p.filterOSV("npm", name, survivors, held, p.cfg.AdvisoryThreshold, p.wf, newestNpm); len(drop) > 0 {
 			kept := survivors[:0]
 			for _, v := range survivors {
-				if id, bad := flagged[v]; bad {
-					p.block(name, v, "OSV advisory "+id)
+				if drop[v] {
 					delete(versions, v)
 				} else {
 					kept = append(kept, v)
@@ -364,13 +521,6 @@ func (p *Proxy) streamTarball(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body) //nolint:errcheck
-}
-
-// block records one filtered version for the end-of-install summary.
-func (p *Proxy) block(name, version, reason string) {
-	p.mu.Lock()
-	p.blocked = append(p.blocked, Blocked{name, version, reason})
-	p.mu.Unlock()
 }
 
 // note records a non-blocking advisory (deprecation) for the install summary.

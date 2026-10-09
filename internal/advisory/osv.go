@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -141,7 +142,8 @@ func CheckVersions(eco, name string, versions []string) (map[string]string, erro
 // BlockingVersions queries OSV for several versions of ONE package, scores each
 // hit's severity, and returns only the versions carrying an advisory that BLOCKS
 // under the given threshold (MAL-*, unscored/unknown, or severity >= threshold),
-// mapped to the first blocking hit's id. It is the resolve-time sibling of
+// mapped to EVERY blocking id for that version (deduped, OSV order) — the proxy
+// keeps a version only when all of them are waived, so one id is not enough. It is the resolve-time sibling of
 // CheckVersions: the proxy uses it to drop known-bad versions BEFORE npm
 // resolves, applying the SAME severity tiering as `guard check` (DESIGN.md §12a).
 // Without tiering a single moderate/low advisory with a wide affected range
@@ -152,7 +154,7 @@ func CheckVersions(eco, name string, versions []string) (map[string]string, erro
 // id: a fetch that can't score an id leaves it SevUnknown, which blocks — a flaky
 // detail fetch can only make the filter stricter, never leak a hit through.
 // eco picks the OSV namespace ("npm" or "pypi"), so the PyPI proxy shares it.
-func BlockingVersions(eco, name string, versions []string, threshold Severity) (map[string]string, error) {
+func BlockingVersions(eco, name string, versions []string, threshold Severity) (map[string][]string, error) {
 	pkgs := make([]lockfile.Pkg, len(versions))
 	for i, v := range versions {
 		pkgs[i] = lockfile.Pkg{Name: name, Version: v, Ecosystem: eco}
@@ -162,22 +164,20 @@ func BlockingVersions(eco, name string, versions []string, threshold Severity) (
 		return nil, err
 	}
 	if len(vulns) == 0 {
-		return map[string]string{}, nil
+		return map[string][]string{}, nil
 	}
 	ids := make([]string, len(vulns))
 	for i, vu := range vulns {
 		ids[i] = vu.ID
 	}
 	sevs := Severities(ids)
-	out := map[string]string{}
+	out := map[string][]string{}
 	for _, vu := range vulns {
 		vu.Severity = sevs[vu.ID] // absent => SevUnknown => Blocks() (fail closed)
-		if !vu.Blocks(threshold) {
+		if !vu.Blocks(threshold) || slices.Contains(out[vu.Version], vu.ID) {
 			continue
 		}
-		if _, ok := out[vu.Version]; !ok {
-			out[vu.Version] = vu.ID
-		}
+		out[vu.Version] = append(out[vu.Version], vu.ID)
 	}
 	return out, nil
 }

@@ -300,6 +300,35 @@ func TestBlockingVersionsTiersBySeverity(t *testing.T) {
 	}
 }
 
+// BlockingVersions must return EVERY blocking id per version (deduped, in OSV
+// order), not just the first — the proxy keeps a version only when all of them
+// are waived. A below-threshold id on the same version is not listed.
+func TestBlockingVersionsReturnsAllIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id, ok := strings.CutPrefix(r.URL.Path, "/vulns/"); ok {
+			if id == "GHSA-MOD" {
+				w.Write([]byte(`{"database_specific":{"severity":"MODERATE"}}`))
+			} else {
+				w.Write([]byte(`{"database_specific":{"severity":"HIGH"}}`))
+			}
+			return
+		}
+		w.Write([]byte(`{"results":[{"vulns":[{"id":"GHSA-A"},{"id":"GHSA-MOD"},{"id":"GHSA-B"},{"id":"GHSA-A"}]}]}`))
+	}))
+	defer srv.Close()
+	ob, ov := osvBatchURL, osvVulnURL
+	osvBatchURL, osvVulnURL = srv.URL+"/querybatch", srv.URL+"/vulns/"
+	defer func() { osvBatchURL, osvVulnURL = ob, ov }()
+
+	got, err := BlockingVersions("npm", "pkg", []string{"1.0.0"}, SevHigh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"GHSA-A", "GHSA-B"}; !reflect.DeepEqual(got["1.0.0"], want) {
+		t.Errorf("ids = %v, want %v", got["1.0.0"], want)
+	}
+}
+
 // OSV results are positional. A response with FEWER results than queries would
 // silently score the omitted packages clean; MORE would index past the chunk
 // and panic. Both must be a loud error.
